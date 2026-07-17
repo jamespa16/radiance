@@ -1,0 +1,64 @@
+# W&B sweep over configs/tinystories.yaml, targeting the looped-block mechanism
+# (model.loop_count) and FFN size/depth (model.ffn_dim, model.ffn_depth). All other
+# hyperparameters are pinned to reasonable constants (tinystories.yaml's tuned values)
+# so the sweep isolates the effect of these three fields.
+#
+# Usage:
+#   uv run wandb sweep configs/sweep_loop_ffn.yaml
+#   uv run wandb agent <sweep-id-printed-above>
+#
+# Each agent run loads configs/tinystories.yaml as a base config, then
+# radiance.sweep overwrites the fields below with this run's sampled values
+# (see apply_sweep_overrides in src/radiance/sweep.py) before calling
+# radiance.train.train().
+
+program: src/radiance/sweep.py
+method: bayes
+project: radiance
+
+metric:
+  name: val/loss
+  goal: minimize
+
+# No ${args} — sweep-sampled parameters are read from wandb.config inside
+# sweep.py rather than passed as CLI flags, since radiance's Config loader
+# only takes a single --config path (see CLAUDE.md: "no CLI overrides").
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - "--config"
+  - "configs/tinystories.yaml"
+
+parameters:
+  train:
+    parameters:
+      lr:
+        value: 3.0e-4
+      weight_decay:
+        value: 0.01
+      batch_size:
+        value: 32
+
+  model:
+    parameters:
+      d_model:
+        value: 256
+      n_heads:
+        value: 8
+      n_layers:
+        value: 6
+      dropout:
+        value: 0.1
+      loop_count:
+        min: 1
+        max: 4
+        distribution: int_uniform
+      ffn_dim:
+        min: 256
+        max: 2048
+        distribution: int_uniform
+      ffn_depth:
+        min: 1
+        max: 6
+        distribution: int_uniform

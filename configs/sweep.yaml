@@ -1,0 +1,63 @@
+# W&B sweep over configs/tinystories.yaml.
+#
+# Usage:
+#   uv run wandb sweep configs/sweep.yaml
+#   uv run wandb agent <sweep-id-printed-above>
+#
+# Each agent run loads configs/tinystories.yaml as a base config, then
+# radiance.sweep overwrites the fields below with this run's sampled values
+# (see apply_sweep_overrides in src/radiance/sweep.py) before calling
+# radiance.train.train().
+
+program: src/radiance/sweep.py
+method: bayes
+project: radiance
+
+metric:
+  name: val/loss
+  goal: minimize
+
+# No ${args} — sweep-sampled parameters are read from wandb.config inside
+# sweep.py rather than passed as CLI flags, since radiance's Config loader
+# only takes a single --config path (see CLAUDE.md: "no CLI overrides").
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - "--config"
+  - "configs/tinystories.yaml"
+
+parameters:
+  train:
+    parameters:
+      lr:
+        distribution: log_uniform_values
+        min: 1.0e-5
+        max: 1.0e-3
+      weight_decay:
+        distribution: log_uniform_values
+        min: 1.0e-4
+        max: 1.0e-2
+      batch_size:
+        value: 32
+      
+  model:
+    parameters:
+      d_model:
+        values: [128, 384, 512, 768, 1024]
+      n_layers:
+        min: 2
+        max: 16
+        distribution: int_uniform
+      ffn_dim:
+        min: 256
+        max: 2048
+        distribution: int_uniform
+      ffn_depth:
+        min: 1
+        max: 6
+        distribution: int_uniform
+      dropout:
+        distribution: uniform
+        min: 0.0
+        max: 0.05
