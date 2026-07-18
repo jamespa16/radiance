@@ -32,6 +32,7 @@ train:
   seed: 42
   device: auto
   compile: true
+  dtype: bf16
 
 wandb:
   project: radiance

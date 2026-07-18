@@ -69,7 +69,11 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   causal LM loss), gradient clipping, periodic W&B logging (`train/loss`, `train/lr`, `val/loss`), periodic
   checkpointing to `cfg.train.output_dir` (raw `torch.save` of state dict + config), and periodic `evaluate()` against
   the validation split. The loop is step-based (`cfg.train.max_steps`), not epoch-based, and cycles the train
-  `DataLoader` via manual `StopIteration` handling rather than epochs.
+  `DataLoader` via manual `StopIteration` handling rather than epochs. `cfg.train.dtype` (`"fp32"`, `"fp16"`, or
+  `"bf16"`, resolved via `resolve_dtype`) controls precision: the forward/loss pass runs under `torch.autocast` in
+  that dtype while master weights and the optimizer state stay fp32; a `torch.amp.GradScaler` is enabled only for
+  `fp16` (its narrow exponent range can underflow small gradients — `bf16` has fp32's exponent range so it needs no
+  scaling).
 
 - **`generate.py`** — `load_checkpoint(path, device)` reconstructs a `DenseTransformer` + tokenizer from a saved
   checkpoint (`torch.load(..., weights_only=False)`, since the checkpoint pickles the full `Config` object, not just

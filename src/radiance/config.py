@@ -43,6 +43,7 @@ class TrainConfig:
     seed: int = 42
     device: str = "auto"
     compile: bool = True
+    dtype: str = "fp32"
 
 
 @dataclass
@@ -70,6 +71,16 @@ def resolve_device(device: str) -> str:
     if torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+_DTYPES = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
+
+
+def resolve_dtype(dtype: str) -> torch.dtype:
+    """Map a config dtype string ("fp32", "fp16", "bf16") to its torch.dtype."""
+    if dtype not in _DTYPES:
+        raise ValueError(f"Unknown train.dtype {dtype!r}, expected one of {sorted(_DTYPES)}")
+    return _DTYPES[dtype]
 
 
 def load_config(path: str) -> Config:

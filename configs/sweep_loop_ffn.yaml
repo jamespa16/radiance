@@ -38,7 +38,7 @@ parameters:
       weight_decay:
         value: 0.01
       batch_size:
-        value: 32
+        value: 16
 
   model:
     parameters:
@@ -51,14 +51,6 @@ parameters:
       dropout:
         value: 0.1
       loop_count:
-        min: 1
-        max: 4
-        distribution: int_uniform
-      ffn_dim:
-        min: 256
-        max: 2048
-        distribution: int_uniform
-      ffn_depth:
         min: 1
         max: 6
         distribution: int_uniform

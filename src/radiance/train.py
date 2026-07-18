@@ -12,7 +12,7 @@ import wandb
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
-from radiance.config import Config, load_config, resolve_device
+from radiance.config import Config, load_config, resolve_device, resolve_dtype
 from radiance.data import build_dataloaders, build_tokenizer
 from radiance.model import DenseTransformer
 
@@ -44,13 +44,14 @@ def compute_loss(logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def evaluate(model: DenseTransformer, val_loader, device: str) -> float:
+def evaluate(model: DenseTransformer, val_loader, device: str, device_type: str, dtype: torch.dtype) -> float:
     model.eval()
     losses = []
     for batch in val_loader:
         input_ids = batch["input_ids"].to(device)
-        logits = model(input_ids)
-        loss = compute_loss(logits, input_ids)
+        with torch.autocast(device_type=device_type, dtype=dtype, enabled=dtype != torch.float32):
+            logits = model(input_ids)
+            loss = compute_loss(logits, input_ids)
         losses.append(loss.item())
     model.train()
     return sum(losses) / len(losses) if losses else float("nan")
@@ -62,6 +63,11 @@ def train(cfg: Config) -> None:
     # small precision tradeoff; PyTorch defaults this off, so opt in explicitly.
     torch.set_float32_matmul_precision("high")
     device = resolve_device(cfg.train.device)
+    device_type = device.split(":")[0]
+    dtype = resolve_dtype(cfg.train.dtype)
+    # Only fp16 needs loss scaling (its exponent range is narrow enough to underflow small
+    # gradients); bf16 has fp32's exponent range so it trains fine unscaled.
+    scaler = torch.amp.GradScaler(device_type, enabled=(dtype == torch.float16))
 
     tokenizer = build_tokenizer(cfg)
     train_loader, val_loader = build_dataloaders(cfg, tokenizer)
@@ -102,13 +108,16 @@ def train(cfg: Config) -> None:
 
         try:
             input_ids = batch["input_ids"].to(device)
-            logits = model(input_ids)
-            loss = compute_loss(logits, input_ids)
+            with torch.autocast(device_type=device_type, dtype=dtype, enabled=dtype != torch.float32):
+                logits = model(input_ids)
+                loss = compute_loss(logits, input_ids)
 
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
             step += 1
 
@@ -122,7 +131,7 @@ def train(cfg: Config) -> None:
                 )
 
             if val_loader is not None and step % cfg.train.eval_every == 0:
-                val_loss = evaluate(model, val_loader, device)
+                val_loss = evaluate(model, val_loader, device, device_type, dtype)
                 wandb.log({"val/loss": val_loss}, step=step)
 
             if step % cfg.train.save_every == 0:
