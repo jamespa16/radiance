@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import torch
 import yaml
 
 
@@ -40,7 +41,7 @@ class TrainConfig:
     save_every: int = 1000
     output_dir: str = "checkpoints/run"
     seed: int = 42
-    device: str = "cuda"
+    device: str = "auto"
     compile: bool = True
 
 
@@ -58,6 +59,17 @@ class Config:
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
+
+
+def resolve_device(device: str) -> str:
+    """Resolve "auto" to whatever accelerator is actually available, cuda > mps > cpu."""
+    if device != "auto":
+        return device
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 def load_config(path: str) -> Config:

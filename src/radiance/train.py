@@ -12,7 +12,7 @@ import wandb
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
-from radiance.config import Config, load_config
+from radiance.config import Config, load_config, resolve_device
 from radiance.data import build_dataloaders, build_tokenizer
 from radiance.model import DenseTransformer
 
@@ -61,7 +61,7 @@ def train(cfg: Config) -> None:
     # TF32 matmuls run at full tensor-core throughput on Ampere/Hopper/Blackwell with a
     # small precision tradeoff; PyTorch defaults this off, so opt in explicitly.
     torch.set_float32_matmul_precision("high")
-    device = cfg.train.device if torch.cuda.is_available() else "cpu"
+    device = resolve_device(cfg.train.device)
 
     tokenizer = build_tokenizer(cfg)
     train_loader, val_loader = build_dataloaders(cfg, tokenizer)

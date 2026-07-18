@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from transformers import PreTrainedTokenizerBase
 
-from radiance.config import Config
+from radiance.config import Config, resolve_device
 from radiance.data import build_tokenizer
 from radiance.model import DenseTransformer
 
@@ -65,14 +65,15 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=200)
     parser.add_argument("--temperature", type=float, default=0.8, help="0 for greedy decoding")
     parser.add_argument("--top-k", type=int, default=50, help="0 to disable top-k filtering")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
+    device = resolve_device(args.device)
 
     if args.seed is not None:
         torch.manual_seed(args.seed)
 
-    model, _, tokenizer = load_checkpoint(args.checkpoint, args.device)
+    model, _, tokenizer = load_checkpoint(args.checkpoint, device)
     text = generate(
         model,
         tokenizer,
@@ -80,7 +81,7 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_k=args.top_k,
-        device=args.device,
+        device=device,
     )
     print(text)
 

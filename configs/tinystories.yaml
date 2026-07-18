@@ -30,7 +30,7 @@ train:
   save_every: 100
   output_dir: checkpoints/tinystories/run2
   seed: 42
-  device: cuda
+  device: auto
   compile: true
 
 wandb:
