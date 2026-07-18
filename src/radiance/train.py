@@ -73,9 +73,11 @@ def train(cfg: Config) -> None:
     train_loader, val_loader = build_dataloaders(cfg, tokenizer)
 
     raw_model = DenseTransformer(cfg.model, vocab_size=len(tokenizer)).to(device)
-    model = torch.compile(raw_model) if cfg.train.compile else raw_model
+    model = torch.compile(raw_model, mode="reduce-overhead") if cfg.train.compile else raw_model
 
-    optimizer = AdamW(model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
+    optimizer = AdamW(
+        model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay, fused=(device_type == "cuda")
+    )
     scheduler = build_lr_scheduler(optimizer, cfg)
 
     if wandb.run is None:
