@@ -35,6 +35,12 @@ train:
   grad_accum_steps: 1 # bump this (not batch_size) to grow the effective batch beyond what fits in VRAM;
   # effective_batch_size = batch_size * grad_accum_steps, and tokens_per_param's derived max_steps
   # scales with effective_batch_size.
+  # Alternative to hand-tuning batch_size/grad_accum_steps above: let radiance estimate a
+  # conservative micro-batch size from free VRAM + model size, and derive grad_accum_steps to hit
+  # the target effective batch size. See CLAUDE.md's train.py section for the formula.
+  # auto_batch_size: true
+  # target_effective_batch_size: 32
+  # vram_safety_margin: 0.5
   lr: 2.5e-4
   weight_decay: 0.01
   warmup_ratio: 0.1

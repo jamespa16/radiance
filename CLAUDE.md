@@ -141,8 +141,23 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   single forward/backward pass; each micro-batch's loss is divided by `grad_accum_steps` before `.backward()` so
   the accumulated gradient matches training on one `effective_batch_size`-sized batch, and `step`/W&B
   logging/`eval_every`/`save_every` all stay in accumulated-step units, unaffected by the setting. See
-  `configs/fineweb_500m.yaml` for a worked example. `cfg.train.dtype` (`"fp32"`, `"fp16"`, or `"bf16"`, resolved
-  via `resolve_dtype`)
+  `configs/fineweb_500m.yaml` for a worked example. Setting `cfg.train.auto_batch_size: true` (opt-in, CUDA-only)
+  overwrites the configured `batch_size`/`grad_accum_steps` at startup with values computed from free VRAM and
+  model size (`estimate_batch_size` in `train.py`) — a deliberately conservative closed-form estimate (params/
+  gradients/optimizer state sized exactly, activation memory from a hand-derived, intentionally-overestimating
+  per-token formula on `DenseTransformer.activation_bytes_per_token`) rather than an expensive live probe against
+  the real model; `cfg.train.target_effective_batch_size` (required when `auto_batch_size` is on) sets the desired
+  `effective_batch_size`, and `cfg.train.vram_safety_margin` (default `0.5`) scales how much of the estimated
+  budget is actually used. Because the estimate is approximate by construction, `auto_batch_size` also enables OOM
+  backoff in the training loop: a CUDA OOM halves an internal `micro_chunk_size` (starts equal to `batch_size`,
+  monotonically shrinks, floor `1`) that further splits each already-fetched micro-batch along the batch dimension
+  and retries the same accumulated step, rather than ending the run — `batch_size`/`grad_accum_steps`/
+  `effective_batch_size` (and therefore `tokens_per_param` accounting) are untouched by this, since backoff never
+  rebuilds the DataLoader, only how many forward/backward calls it takes to process one already-fetched
+  micro-batch. This backoff is scoped to `auto_batch_size` — with it off (the default), a CUDA OOM always ends the
+  run cleanly as before, so a manually-chosen or W&B-swept `batch_size` behaves exactly as configured. See
+  `configs/fineweb_500m.yaml`'s commented-out block for a worked example. `cfg.train.dtype` (`"fp32"`, `"fp16"`,
+  or `"bf16"`, resolved via `resolve_dtype`)
   controls precision: the forward/loss pass runs under `torch.autocast` in that dtype while master weights and the
   optimizer state stay fp32; a `torch.amp.GradScaler` is enabled only for `fp16` (its narrow exponent range can
   underflow small gradients — `bf16` has fp32's exponent range so it needs no scaling). The training loss is

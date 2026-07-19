@@ -61,6 +61,16 @@ class TrainConfig:
     tokens_per_param: float | None = None  # opt-in: derive max_steps from model size instead of a fixed step
     # count — max_steps = round(tokens_per_param * num_parameters / (effective_batch_size * data.seq_len)),
     # computed in train.py once the model is built. Chinchilla-optimal is ~20 tokens/param.
+    auto_batch_size: bool = False  # opt-in: overwrite batch_size/grad_accum_steps at startup, computed from
+    # free VRAM + model size (see train.py's estimate_batch_size) instead of the values configured above.
+    # CUDA-only; requires target_effective_batch_size to be set. Also enables OOM backoff during training:
+    # a CUDA OOM shrinks the internal per-forward-pass chunk size and retries the step instead of ending the
+    # run (see train.py's main loop) — this backoff never fires when auto_batch_size is False, so a manually
+    # chosen/swept batch_size always behaves exactly as configured.
+    target_effective_batch_size: int | None = None  # required when auto_batch_size is True: grad_accum_steps
+    # is derived as ceil(target_effective_batch_size / computed batch_size).
+    vram_safety_margin: float = 0.5  # only used when auto_batch_size is True: fraction of the (already
+    # conservative) estimated max token budget to actually use. Lower = more conservative.
     grad_clip: float = 1.0
     log_every: int = 10
     eval_every: int = 500

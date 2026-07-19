@@ -193,3 +193,34 @@ class DenseTransformer(nn.Module):
 
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
+
+    def activation_bytes_per_token(self, activation_dtype_bytes: int) -> int:
+        """Conservative (deliberately over-, not under-, estimated) activation memory per token,
+        for sizing a training batch to available VRAM (see train.py's estimate_batch_size).
+
+        No gradient checkpointing exists anywhere in this model, so every one of blocks[1:]'s loop
+        passes retains its own activations for backward — loop_count (fixed mode) or max_loops
+        (router mode, which always runs the dense compute for every iteration regardless of
+        per-token halting) full passes over blocks[1:], plus one unlooped pass over blocks[0].
+        Per-block cost is approximated as attention's fused-QKV/out_proj/pre-norm activations
+        (~8 * d_model) plus the FFN's hidden-layer activations (~ffn_depth * ffn_dim) — this
+        ignores SDPA's memory-efficient backward (no O(seq_len^2) term) and doesn't itemize every
+        temporary buffer (dropout masks, LayerNorm stats), so it already overestimates before the
+        caller's own safety margin is applied. The lm_head logits (batch, seq, vocab_size) are
+        counted separately since they can dominate for a large vocab relative to a small d_model,
+        and always at fp32 width regardless of activation_dtype_bytes: PyTorch's autocast policy
+        upcasts log_softmax (used internally by compute_loss's F.cross_entropy) to fp32 even under
+        bf16/fp16 autocast, so this term doesn't shrink with a lower compute dtype the way the rest
+        of the activations do.
+        """
+        cfg = self.cfg
+        block_units = 8 * cfg.d_model + cfg.ffn_depth * cfg.ffn_dim
+        loop_multiplier = cfg.max_loops if cfg.use_router else cfg.loop_count
+        total_block_units = block_units * (1 + loop_multiplier * (cfg.n_layers - 1))
+        embedding_units = cfg.d_model
+        block_bytes = activation_dtype_bytes * (total_block_units + embedding_units)
+        # fp32, x3: logits + their gradient buffer + log_softmax's internal fp32 upcast working
+        # buffer (empirically confirmed via a real OOM sized almost exactly to a 2x estimate during
+        # GPU verification — cross_entropy's fp32 upcast needs more headroom than just logits+grad).
+        logits_bytes = 4 * 3 * self.token_emb.num_embeddings
+        return block_bytes + logits_bytes
