@@ -1,7 +1,6 @@
 # W&B sweep over configs/tinystories.yaml, targeting the looped-block mechanism
-# (model.loop_count) and FFN size/depth (model.ffn_dim, model.ffn_depth). All other
-# hyperparameters are pinned to reasonable constants (tinystories.yaml's tuned values)
-# so the sweep isolates the effect of these three fields.
+# (model.loop_count). All other hyperparameters are pinned to reasonable constants
+# (tinystories.yaml's tuned values) so the sweep isolates the effect of this field.
 #
 # Usage:
 #   uv run wandb sweep configs/sweep_loop_ffn.yaml
@@ -31,25 +30,8 @@ command:
   - "configs/tinystories.yaml"
 
 parameters:
-  train:
-    parameters:
-      lr:
-        value: 3.0e-4
-      weight_decay:
-        value: 0.01
-      batch_size:
-        value: 16
-
   model:
     parameters:
-      d_model:
-        value: 256
-      n_heads:
-        value: 8
-      n_layers:
-        value: 6
-      dropout:
-        value: 0.1
       loop_count:
         min: 1
         max: 6

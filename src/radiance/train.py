@@ -50,7 +50,7 @@ def evaluate(model: DenseTransformer, val_loader, device: str, device_type: str,
     for batch in val_loader:
         input_ids = batch["input_ids"].to(device)
         with torch.autocast(device_type=device_type, dtype=dtype, enabled=dtype != torch.float32):
-            logits = model(input_ids)
+            logits, _, _ = model(input_ids)
             loss = compute_loss(logits, input_ids)
         losses.append(loss.item())
     model.train()
@@ -74,6 +74,15 @@ def train(cfg: Config) -> None:
 
     raw_model = DenseTransformer(cfg.model, vocab_size=len(tokenizer)).to(device)
     model = torch.compile(raw_model, mode="reduce-overhead") if cfg.train.compile else raw_model
+
+    if cfg.train.tokens_per_param is not None:
+        tokens_per_step = cfg.train.batch_size * cfg.data.seq_len
+        target_tokens = cfg.train.tokens_per_param * raw_model.num_parameters()
+        cfg.train.max_steps = max(1, round(target_tokens / tokens_per_step))
+        print(
+            f"[radiance] tokens_per_param={cfg.train.tokens_per_param} over {raw_model.num_parameters():,} params "
+            f"-> max_steps={cfg.train.max_steps:,} ({target_tokens:,.0f} tokens at {tokens_per_step:,} tokens/step)"
+        )
 
     optimizer = AdamW(
         model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay, fused=(device_type == "cuda")
@@ -111,8 +120,9 @@ def train(cfg: Config) -> None:
         try:
             input_ids = batch["input_ids"].to(device)
             with torch.autocast(device_type=device_type, dtype=dtype, enabled=dtype != torch.float32):
-                logits = model(input_ids)
-                loss = compute_loss(logits, input_ids)
+                logits, ponder_cost, mean_loop_depth = model(input_ids)
+                lm_loss = compute_loss(logits, input_ids)
+                loss = lm_loss + cfg.model.ponder_weight * ponder_cost
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -127,6 +137,9 @@ def train(cfg: Config) -> None:
                 wandb.log(
                     {
                         "train/loss": loss.item(),
+                        "train/lm_loss": lm_loss.item(),
+                        "train/ponder_cost": ponder_cost.item(),
+                        "train/mean_loop_depth": mean_loop_depth.item(),
                         "train/lr": scheduler.get_last_lr()[0],
                     },
                     step=step,

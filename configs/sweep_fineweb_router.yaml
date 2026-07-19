@@ -1,0 +1,71 @@
+# W&B sweep over configs/fineweb_router.yaml, targeting the ACT router's own hyperparameters
+# (model.max_loops, model.ponder_weight, model.halt_epsilon) to test the new router-based
+# looping architecture. All other hyperparameters (model size, batch_size, lr, ...) are pinned
+# to fineweb_router.yaml's tuned/VRAM-verified values so the sweep isolates the effect of these
+# three fields, mirroring configs/sweep_loop_ffn.yaml's approach for the fixed-loop_count model.
+#
+# model.max_loops is swept up to 8; configs/fineweb_router.yaml's batch_size was empirically
+# verified to fit VRAM at max_loops=8 (this sweep's worst case for activation memory), so every
+# sampled run in this sweep is safe regardless of which max_loops value gets sampled.
+#
+# Usage:
+#   uv run wandb sweep configs/sweep_fineweb_router.yaml
+#   uv run wandb agent <sweep-id-printed-above>
+#
+# Each agent run loads configs/fineweb_router.yaml as a base config, then
+# radiance.sweep overwrites the fields below with this run's sampled values
+# (see apply_sweep_overrides in src/radiance/sweep.py) before calling
+# radiance.train.train().
+
+program: src/radiance/sweep.py
+method: bayes
+project: radiance
+
+metric:
+  name: val/loss
+  goal: minimize
+
+# No ${args} — sweep-sampled parameters are read from wandb.config inside
+# sweep.py rather than passed as CLI flags, since radiance's Config loader
+# only takes a single --config path (see CLAUDE.md: "no CLI overrides").
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - "--config"
+  - "configs/fineweb_router.yaml"
+
+parameters:
+  model:
+    parameters:
+      max_loops:
+        min: 2
+        max: 8
+        distribution: int_uniform
+      ponder_weight:
+        min: 1.0e-4
+        max: 1.0e-1
+        distribution: log_uniform_values
+      halt_epsilon:
+        min: 0.001
+        max: 0.05
+        distribution: log_uniform_values
+
+  train:
+    parameters:
+      lr:
+        distribution: log_uniform_values
+        min: 1.0e-6
+        max: 1.0e-2
+      weight_decay:
+        distribution: log_uniform_values
+        min: 1.0e-6
+        max: 1.0e-2
+      grad_clip:
+        distribution: uniform
+        min: 0.8
+        max: 3.0
+      weight_decay:
+        distribution: log_uniform_values
+        min: 1.0e-6
+        max: 1.0e-2

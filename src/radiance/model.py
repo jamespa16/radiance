@@ -67,6 +67,23 @@ class TransformerBlock(nn.Module):
         return x
 
 
+class ACTRouter(nn.Module):
+    """Per-token halting-probability head for ACT (Graves 2016) adaptive looping.
+
+    LayerNorm precedes the projection because this reads the pre-LN residual stream, whose norm
+    grows with iteration count — without it the halting unit's calibration would drift across loop
+    iterations.
+    """
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        self.norm = nn.LayerNorm(cfg.d_model)
+        self.proj = nn.Linear(cfg.d_model, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(self.proj(self.norm(x))).squeeze(-1)  # (batch, seq)
+
+
 class DenseTransformer(nn.Module):
     def __init__(self, cfg: ModelConfig, vocab_size: int):
         super().__init__()
@@ -81,7 +98,16 @@ class DenseTransformer(nn.Module):
         self.lm_head = nn.Linear(cfg.d_model, vocab_size, bias=False)
         self.lm_head.weight = self.token_emb.weight  # weight tying
 
+        self.router = None
+        if cfg.use_router:
+            assert cfg.max_loops >= 1
+            self.router = ACTRouter(cfg)
+
         self.apply(self._init_weights)
+        if self.router is not None:
+            # Bias the halting unit against halting immediately (Graves ACT): sigmoid(-1) ≈ 0.27,
+            # encouraging some early pondering rather than collapsing to a single pass at init.
+            nn.init.constant_(self.router.proj.bias, -1.0)
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -91,7 +117,9 @@ class DenseTransformer(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns (logits, ponder_cost, mean_loop_depth). The latter two are zero scalar tensors
+        when cfg.use_router is False, so callers have one contract regardless of mode."""
         batch, seq_len = input_ids.shape
         assert seq_len <= self.cfg.max_seq_len, "sequence length exceeds max_seq_len"
 
@@ -99,14 +127,69 @@ class DenseTransformer(nn.Module):
         x = self.token_emb(input_ids) + self.pos_emb(positions)
         x = self.dropout(x)
 
-        # first block runs once; remaining n_layers - 1 blocks are looped loop_count times, sharing weights across iterations
+        # first block runs once; remaining n_layers - 1 blocks form the loop body
         x = self.blocks[0](x)
-        for _ in range(self.cfg.loop_count):
-            for block in self.blocks[1:]:
-                x = block(x)
 
-        x = self.ln_f(x)
-        return self.lm_head(x)
+        if not self.cfg.use_router:
+            # remaining n_layers - 1 blocks are looped loop_count times, sharing weights across iterations
+            for _ in range(self.cfg.loop_count):
+                for block in self.blocks[1:]:
+                    x = block(x)
+            x = self.ln_f(x)
+            logits = self.lm_head(x)
+            zero = x.new_zeros(())
+            return logits, zero, zero
+
+        return self._forward_act(x)
+
+    def _forward_act(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Adaptive Computation Time (Graves 2016) over the loop body (blocks[1:]): each token
+        position gets its own halting probability per iteration, halts once its cumulative
+        probability crosses 1 - halt_epsilon (or max_loops is reached), and the output is a
+        probability-weighted sum of per-iteration hidden states rather than just the final one.
+
+        Once a position halts, its state is frozen and carried forward unchanged on later
+        iterations: still-running positions' causal attention keeps reading a stable key/value for
+        it, and its own (recomputed but discarded) update never contributes to the output again.
+        Compute is not actually skipped for halted positions (dense batched ops, no gather/scatter)
+        — the adaptivity is in the loss signal and output composition, not wall-clock cost.
+        """
+        batch, seq_len, d_model = x.shape
+
+        cum_prob = x.new_zeros(batch, seq_len)
+        n_updates = x.new_zeros(batch, seq_len)
+        remainder_sum = x.new_zeros(batch, seq_len)
+        still_running = torch.ones(batch, seq_len, dtype=torch.bool, device=x.device)
+        accum_output = torch.zeros_like(x)
+        frozen_x = x
+
+        for n in range(1, self.cfg.max_loops + 1):
+            new_x = frozen_x
+            for block in self.blocks[1:]:
+                new_x = block(new_x)
+            p_n = self.router(new_x)
+
+            is_last_step = n == self.cfg.max_loops
+            would_exceed = (cum_prob + p_n) >= (1.0 - self.cfg.halt_epsilon)
+            halts_now = still_running & (would_exceed | is_last_step)
+
+            remainder = 1.0 - cum_prob
+            weight = torch.where(halts_now, remainder, p_n)
+            weight = torch.where(still_running, weight, torch.zeros_like(weight))
+            accum_output = accum_output + weight.unsqueeze(-1) * new_x
+
+            n_updates = n_updates + still_running.float()
+            remainder_sum = torch.where(halts_now, remainder, remainder_sum)
+            cum_prob = torch.where(still_running & ~halts_now, cum_prob + p_n, cum_prob)
+
+            frozen_x = torch.where(still_running.unsqueeze(-1), new_x, frozen_x)
+            still_running = still_running & ~halts_now
+
+        x = self.ln_f(accum_output)
+        logits = self.lm_head(x)
+        ponder_cost = (n_updates + remainder_sum).mean()
+        mean_loop_depth = n_updates.mean()
+        return logits, ponder_cost, mean_loop_depth
 
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())

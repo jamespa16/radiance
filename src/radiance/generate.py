@@ -38,7 +38,8 @@ def generate(
 
     for _ in range(max_new_tokens):
         context = input_ids[:, -model.cfg.max_seq_len :]
-        logits = model(context)[:, -1, :]
+        logits, _, _ = model(context)
+        logits = logits[:, -1, :]
 
         if temperature == 0:
             next_token = logits.argmax(dim=-1, keepdim=True)

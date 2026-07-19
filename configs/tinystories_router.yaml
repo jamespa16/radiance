@@ -1,4 +1,4 @@
-run_name: tinystories-dense-transformer
+run_name: tinystories-dense-transformer-router
 
 data:
   dataset: roneneldan/TinyStories
@@ -12,7 +12,11 @@ model:
   d_model: 256
   head_dim: 64
   n_layers: 6
-  loop_count: 1
+  loop_count: 1 # unused while use_router: true
+  use_router: true
+  max_loops: 6
+  ponder_weight: 1.0e-2
+  halt_epsilon: 0.01
   ffn_mult: 4.0
   ffn_depth: 3
   dropout: 0.03
@@ -28,10 +32,10 @@ train:
   log_every: 10
   eval_every: 50
   save_every: 100
-  output_dir: checkpoints/tinystories/run2
+  output_dir: checkpoints/tinystories/router
   seed: 42
   device: auto
-  compile: true
+  compile: true # verified: ACT loop compiles cleanly under torch.compile("reduce-overhead"), zero graph breaks
   dtype: bf16
 
 wandb:

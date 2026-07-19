@@ -14,18 +14,38 @@ class DataConfig:
     seq_len: int = 512
     num_workers: int = 4
     cache_dir: str = ".cache/radiance/tokenized"
+    streaming: bool = False
+    shuffle_buffer_size: int = 1000
+    disk_cache_max_gb: float | None = None
+    disk_cache_shard_size: int = 100
+    prefetch_factor: int = 2
+    eval_split_size: int = 0
 
 
 @dataclass
 class ModelConfig:
     d_model: int = 256
-    n_heads: int = 8
+    head_dim: int = 32  # n_heads = d_model // head_dim; d_model must divide evenly
     n_layers: int = 6
     loop_count: int = 1
-    ffn_dim: int = 1024
+    use_router: bool = False  # opt-in: replace fixed loop_count with per-token ACT halting
+    max_loops: int = 6  # hard cap on loop iterations when use_router=True; independent of loop_count
+    ponder_weight: float = 1.0e-2  # tau: coefficient on the ponder-cost loss term
+    halt_epsilon: float = 0.01  # ACT epsilon: a position halts once cumulative halting prob >= 1 - halt_epsilon
+    ffn_mult: float = 4.0  # ffn_dim = round(d_model * ffn_mult)
     ffn_depth: int = 2
     dropout: float = 0.1
     max_seq_len: int = 512
+
+    @property
+    def n_heads(self) -> int:
+        if self.d_model % self.head_dim != 0:
+            raise ValueError(f"model.d_model ({self.d_model}) must be divisible by model.head_dim ({self.head_dim})")
+        return self.d_model // self.head_dim
+
+    @property
+    def ffn_dim(self) -> int:
+        return round(self.d_model * self.ffn_mult)
 
 
 @dataclass
@@ -33,8 +53,11 @@ class TrainConfig:
     batch_size: int = 32
     lr: float = 3.0e-4
     weight_decay: float = 0.01
-    warmup_steps: int = 200
-    max_steps: int = 5000
+    warmup_ratio: float = 0.04  # warmup_steps = round(max_steps * warmup_ratio)
+    max_steps: int = 5000  # ignored (overwritten once the model is built) if tokens_per_param is set
+    tokens_per_param: float | None = None  # opt-in: derive max_steps from model size instead of a fixed step
+    # count — max_steps = round(tokens_per_param * num_parameters / (batch_size * data.seq_len)), computed in
+    # train.py once the model is built. Chinchilla-optimal is ~20 tokens/param.
     grad_clip: float = 1.0
     log_every: int = 10
     eval_every: int = 500
@@ -44,6 +67,10 @@ class TrainConfig:
     device: str = "auto"
     compile: bool = True
     dtype: str = "fp32"
+
+    @property
+    def warmup_steps(self) -> int:
+        return round(self.max_steps * self.warmup_ratio)
 
 
 @dataclass

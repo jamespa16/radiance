@@ -49,10 +49,10 @@ parameters:
         min: 2
         max: 16
         distribution: int_uniform
-      ffn_dim:
-        min: 256
-        max: 2048
-        distribution: int_uniform
+      ffn_mult: # ffn_dim = round(d_model * ffn_mult); covers ~1-8x expansion across the d_model sweep above
+        min: 1.0
+        max: 8.0
+        distribution: uniform
       ffn_depth:
         min: 1
         max: 6

@@ -1,0 +1,52 @@
+run_name: fineweb-dense-transformer-500m
+
+data:
+  dataset: HuggingFaceFW/fineweb # ~15TB, train split only (no validation split exists)
+  text_column: text
+  tokenizer: gpt2
+  seq_len: 1024
+  num_workers: 4
+  cache_dir: .cache/radiance/tokenized
+  streaming: true # required: fineweb is far too large to tokenize/cache to disk up front
+  shuffle_buffer_size: 10000
+  # fineweb has no validation split, so carve a deterministic 2000-example held-out slice off
+  # the front of train instead (excluded from training) — see CLAUDE.md's "Extending" section.
+  eval_split_size: 2000
+  # Uncomment to also avoid re-fetching/re-tokenizing already-streamed data across repeated
+  # short runs (e.g. while iterating on this config) — see CLAUDE.md's "Extending" section.
+  disk_cache_max_gb: 50
+  disk_cache_shard_size: 100
+  prefetch_factor: 2
+
+model:
+  d_model: 1280
+  head_dim: 64
+  n_layers: 22
+  loop_count: 2
+  ffn_mult: 2.0
+  ffn_depth: 2
+  dropout: 0.01
+  max_seq_len: 1024
+  # ~498.5M parameters (verified via DenseTransformer(...).num_parameters() with the gpt2
+  # tokenizer's 50257-token vocab). Scale n_layers up/down to retarget a different size.
+
+train:
+  batch_size: 4 # tune to available VRAM at seq_len=1024, bf16 (500M params + fp32 optimizer state)
+  lr: 2.5e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  tokens_per_param: 20 # Chinchilla-optimal; max_steps is derived from this and printed/logged at run start
+  grad_clip: 1.0
+  log_every: 10
+  eval_every: 100
+  save_every: 100
+  output_dir: checkpoints/fineweb_500m
+  seed: 42
+  device: auto
+  compile: true
+  dtype: bf16
+
+wandb:
+  project: radiance
+  entity: null
+  mode: online
