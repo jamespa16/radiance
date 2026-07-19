@@ -135,7 +135,14 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   `max_steps` hand-recomputed. `warmup_ratio` (see `TrainConfig`) is read as a live property off whatever
   `max_steps` ends up being, so warmup scales automatically along with it. See `configs/fineweb_500m.yaml` for a
   worked example; leave `tokens_per_param: null` and set `max_steps` directly for quick/pinned runs (e.g.
-  `configs/tinystories.yaml`). `cfg.train.dtype` (`"fp32"`, `"fp16"`, or `"bf16"`, resolved via `resolve_dtype`)
+  `configs/tinystories.yaml`). `cfg.train.grad_accum_steps` (default `1`, opt-in) accumulates gradients over that
+  many `batch_size`-sized micro-batches before calling `optimizer.step()`/`scheduler.step()`, so the effective
+  training batch (`effective_batch_size = batch_size * grad_accum_steps`) can exceed what fits in memory for a
+  single forward/backward pass; each micro-batch's loss is divided by `grad_accum_steps` before `.backward()` so
+  the accumulated gradient matches training on one `effective_batch_size`-sized batch, and `step`/W&B
+  logging/`eval_every`/`save_every` all stay in accumulated-step units, unaffected by the setting. See
+  `configs/fineweb_500m.yaml` for a worked example. `cfg.train.dtype` (`"fp32"`, `"fp16"`, or `"bf16"`, resolved
+  via `resolve_dtype`)
   controls precision: the forward/loss pass runs under `torch.autocast` in that dtype while master weights and the
   optimizer state stay fp32; a `torch.amp.GradScaler` is enabled only for `fp16` (its narrow exponent range can
   underflow small gradients — `bf16` has fp32's exponent range so it needs no scaling). The training loss is

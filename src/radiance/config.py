@@ -50,14 +50,17 @@ class ModelConfig:
 
 @dataclass
 class TrainConfig:
-    batch_size: int = 32
+    batch_size: int = 32  # micro-batch size: what one forward/backward pass consumes
+    grad_accum_steps: int = 1  # micro-batches (of batch_size each) accumulated per optimizer.step();
+    # effective_batch_size = batch_size * grad_accum_steps. Raise this instead of batch_size to grow the
+    # effective batch beyond what fits in VRAM.
     lr: float = 3.0e-4
     weight_decay: float = 0.01
     warmup_ratio: float = 0.04  # warmup_steps = round(max_steps * warmup_ratio)
     max_steps: int = 5000  # ignored (overwritten once the model is built) if tokens_per_param is set
     tokens_per_param: float | None = None  # opt-in: derive max_steps from model size instead of a fixed step
-    # count — max_steps = round(tokens_per_param * num_parameters / (batch_size * data.seq_len)), computed in
-    # train.py once the model is built. Chinchilla-optimal is ~20 tokens/param.
+    # count — max_steps = round(tokens_per_param * num_parameters / (effective_batch_size * data.seq_len)),
+    # computed in train.py once the model is built. Chinchilla-optimal is ~20 tokens/param.
     grad_clip: float = 1.0
     log_every: int = 10
     eval_every: int = 500
@@ -71,6 +74,10 @@ class TrainConfig:
     @property
     def warmup_steps(self) -> int:
         return round(self.max_steps * self.warmup_ratio)
+
+    @property
+    def effective_batch_size(self) -> int:
+        return self.batch_size * self.grad_accum_steps
 
 
 @dataclass

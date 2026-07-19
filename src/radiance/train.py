@@ -76,12 +76,14 @@ def train(cfg: Config) -> None:
     model = torch.compile(raw_model, mode="reduce-overhead") if cfg.train.compile else raw_model
 
     if cfg.train.tokens_per_param is not None:
-        tokens_per_step = cfg.train.batch_size * cfg.data.seq_len
+        tokens_per_step = cfg.train.effective_batch_size * cfg.data.seq_len
         target_tokens = cfg.train.tokens_per_param * raw_model.num_parameters()
         cfg.train.max_steps = max(1, round(target_tokens / tokens_per_step))
         print(
             f"[radiance] tokens_per_param={cfg.train.tokens_per_param} over {raw_model.num_parameters():,} params "
-            f"-> max_steps={cfg.train.max_steps:,} ({target_tokens:,.0f} tokens at {tokens_per_step:,} tokens/step)"
+            f"-> max_steps={cfg.train.max_steps:,} ({target_tokens:,.0f} tokens at {tokens_per_step:,} tokens/step, "
+            f"batch_size={cfg.train.batch_size} x grad_accum_steps={cfg.train.grad_accum_steps} "
+            f"= effective_batch_size={cfg.train.effective_batch_size})"
         )
 
     optimizer = AdamW(
@@ -110,22 +112,39 @@ def train(cfg: Config) -> None:
     model.train()
     data_iter = iter(train_loader)
 
+    grad_accum_steps = cfg.train.grad_accum_steps
+
     while step < cfg.train.max_steps:
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            data_iter = iter(train_loader)
-            batch = next(data_iter)
+        will_log = (step + 1) % cfg.train.log_every == 0
+        if will_log:
+            accum_loss = torch.zeros((), device=device)
+            accum_lm_loss = torch.zeros((), device=device)
+            accum_ponder_cost = torch.zeros((), device=device)
+            accum_mean_loop_depth = torch.zeros((), device=device)
 
         try:
-            input_ids = batch["input_ids"].to(device)
-            with torch.autocast(device_type=device_type, dtype=dtype, enabled=dtype != torch.float32):
-                logits, ponder_cost, mean_loop_depth = model(input_ids)
-                lm_loss = compute_loss(logits, input_ids)
-                loss = lm_loss + cfg.model.ponder_weight * ponder_cost
-
             optimizer.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
+            for _ in range(grad_accum_steps):
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(train_loader)
+                    batch = next(data_iter)
+
+                input_ids = batch["input_ids"].to(device)
+                with torch.autocast(device_type=device_type, dtype=dtype, enabled=dtype != torch.float32):
+                    logits, ponder_cost, mean_loop_depth = model(input_ids)
+                    lm_loss = compute_loss(logits, input_ids)
+                    micro_loss = lm_loss + cfg.model.ponder_weight * ponder_cost
+
+                scaler.scale(micro_loss / grad_accum_steps).backward()
+
+                if will_log:
+                    accum_loss += micro_loss.detach()
+                    accum_lm_loss += lm_loss.detach()
+                    accum_ponder_cost += ponder_cost.detach()
+                    accum_mean_loop_depth += mean_loop_depth.detach()
+
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
             scaler.step(optimizer)
@@ -133,13 +152,13 @@ def train(cfg: Config) -> None:
             scheduler.step()
             step += 1
 
-            if step % cfg.train.log_every == 0:
+            if will_log:
                 wandb.log(
                     {
-                        "train/loss": loss.item(),
-                        "train/lm_loss": lm_loss.item(),
-                        "train/ponder_cost": ponder_cost.item(),
-                        "train/mean_loop_depth": mean_loop_depth.item(),
+                        "train/loss": (accum_loss / grad_accum_steps).item(),
+                        "train/lm_loss": (accum_lm_loss / grad_accum_steps).item(),
+                        "train/ponder_cost": (accum_ponder_cost / grad_accum_steps).item(),
+                        "train/mean_loop_depth": (accum_mean_loop_depth / grad_accum_steps).item(),
                         "train/lr": scheduler.get_last_lr()[0],
                     },
                     step=step,

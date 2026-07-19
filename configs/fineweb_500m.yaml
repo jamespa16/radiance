@@ -32,6 +32,9 @@ model:
 
 train:
   batch_size: 4 # tune to available VRAM at seq_len=1024, bf16 (500M params + fp32 optimizer state)
+  grad_accum_steps: 1 # bump this (not batch_size) to grow the effective batch beyond what fits in VRAM;
+  # effective_batch_size = batch_size * grad_accum_steps, and tokens_per_param's derived max_steps
+  # scales with effective_batch_size.
   lr: 2.5e-4
   weight_decay: 0.01
   warmup_ratio: 0.1
