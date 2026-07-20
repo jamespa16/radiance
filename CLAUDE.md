@@ -37,8 +37,11 @@ uv run radiance-generate --checkpoint checkpoints/tinystories/step_1000.pt --pro
 
 Loads the `Config` embedded in the checkpoint, rebuilds
 the model and tokenizer from it, and autoregressively samples (`--temperature`, `--top-k`; `--temperature 0` for
-greedy decoding). No KV cache — each step re-runs the full forward pass over the (truncated-to-`max_seq_len`) context,
-which is fine at these model sizes but is the first thing to optimize if generation needs to get faster.
+greedy decoding). Uses a KV-cache (`model.py`'s `KVCache`/`DenseTransformer.new_kv_cache`): the prompt is prefilled
+once, then each subsequent step forwards only the newly sampled token against cached past keys/values, instead of
+re-running the full forward pass over the whole context every step. An overlong prompt is still truncated to the
+trailing `max_seq_len` tokens once at the start, same as before; once generation would push the *total* sequence
+length past `max_seq_len` it raises a clear error instead of silently sliding the context window forever.
 
 There is no test suite yet. To sanity-check changes to the model or data pipeline, run a tiny config (small
 `seq_len`, `d_model`, `max_steps`) through `radiance.train` end-to-end on CPU before trusting a full run — see the
@@ -94,6 +97,13 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
 - **`model.py`** — `DenseTransformer`: token + learned positional embeddings, a stack of `n_layers` pre-norm
   `TransformerBlock`s, final LayerNorm, and a weight-tied LM head. Each block is `CausalSelfAttention` (uses
   `F.scaled_dot_product_attention` with `is_causal=True`, no manual mask construction) followed by `FeedForward`.
+  `CausalSelfAttention` supports GQA via `model.n_kv_heads` (default `None` = standard multi-head attention, one
+  K/V head per query head; when set, `n_heads` must be evenly divisible by it — see `ModelConfig.n_kv_heads_resolved`
+  — and `F.scaled_dot_product_attention` is called with `enable_gqa=True`, hence this project's `torch>=2.5` floor).
+  It also applies `model.qk_norm` (an `RMSNorm` over each head's `head_dim`, applied to q and k before RoPE) for
+  training stability across `blocks[1:]`'s weight-shared loop iterations (see below); unlike most toggles in this
+  config, `qk_norm` defaults to `True` — a deliberate behavior change for every existing config, not the usual
+  default-`False` opt-in convention (contrast `use_router: bool = False`).
   Several `ModelConfig`/`TrainConfig` fields are stored as ratios rather than absolute values and expose the
   absolute quantity as a read-only derived property of the same name minus the ratio suffix, so the rest of the
   codebase (and `vars(cfg.model)`/`vars(cfg.train)` used for W&B logging) never needs to distinguish the two:
@@ -167,10 +177,17 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
 
 - **`generate.py`** — `load_checkpoint(path, device)` reconstructs a `DenseTransformer` + tokenizer from a saved
   checkpoint (`torch.load(..., weights_only=False)`, since the checkpoint pickles the full `Config` object, not just
-  tensors). `generate(...)` runs naive autoregressive sampling (temperature/top-k, no caching of past activations).
-  Because there's no KV cache, the whole (truncated) context is recomputed every generation step — in router mode
-  this means a given token's effective loop depth before halting can shift slightly across generation steps as
-  surrounding context changes, which is expected, not a bug.
+  tensors). `generate(...)` runs autoregressive sampling (temperature/top-k) using a `KVCache`
+  (`DenseTransformer.new_kv_cache()`): the (possibly truncated) prompt is prefilled once, then each later step
+  forwards only the newly sampled token. Because `blocks[1:]` is a weight-shared loop body re-invoked `loop_count`
+  (or, in ACT mode, `max_loops`) times per forward call — always the full iteration count regardless of per-token
+  halting, since attention is unconditionally dense every iteration — a single K/V-per-layer cache isn't enough:
+  the same block produces different K/V on each iteration since it's fed an evolving hidden state, so `KVCache` has
+  one slot per (block, iteration) pair actually executed (`1 + loop_multiplier * (n_layers - 1)` slots), assigned
+  implicitly by call order (`KVCache.begin_step()`/`write()`) rather than an explicit index threaded through every
+  call. `RotaryEmbedding.forward` takes an `offset` so a cached token's RoPE position reflects its true absolute
+  position rather than always starting from 0. If generation would push the total sequence length past
+  `model.cfg.max_seq_len`, `generate()` raises a clear error rather than silently sliding the context window.
 
 Entry points: `radiance.train:main` (`--config`) and `radiance.generate:main` (`--checkpoint`, `--prompt`, ...) —
 `radiance-train` / `radiance-generate` console scripts after install.
@@ -188,6 +205,6 @@ Entry points: `radiance.train:main` (`--config`) and `radiance.generate:main` (`
   `TransformerBlock` I/O contract so `train.py` and `data.py` stay untouched. `ACTRouter` /
   `DenseTransformer._forward_act` (the learned per-token loop-halting mechanism, opt-in via `cfg.model.use_router`)
   is the reference example for a variant that changes `DenseTransformer.forward`'s control flow rather than just
-  swapping in a different block.
+  swapping in a different block. See `configs/tinystories_gqa.yaml` for a worked example of GQA (`model.n_kv_heads`).
 - New training behavior (e.g. different scheduler, mixed precision): changes belong in `train.py`; keep the loop
   step-based and keep config-driven values in `TrainConfig` rather than hardcoding.

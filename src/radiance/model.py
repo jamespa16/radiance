@@ -36,8 +36,8 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("cos_cached", emb.cos(), persistent=False)
         self.register_buffer("sin_cached", emb.sin(), persistent=False)
 
-    def forward(self, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
+    def forward(self, seq_len: int, offset: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.cos_cached[offset : offset + seq_len], self.sin_cached[offset : offset + seq_len]
 
 
 class RMSNorm(nn.Module):
@@ -59,26 +59,61 @@ class CausalSelfAttention(nn.Module):
         assert cfg.d_model % cfg.n_heads == 0
         assert cfg.head_dim % 2 == 0, "model.head_dim must be even for RoPE's pairwise rotation"
         self.n_heads = cfg.n_heads
+        self.n_kv_heads = cfg.n_kv_heads_resolved
         self.head_dim = cfg.d_model // cfg.n_heads
+        kv_dim = self.n_kv_heads * self.head_dim
 
-        self.qkv_proj = nn.Linear(cfg.d_model, 3 * cfg.d_model)
+        self.qkv_proj = nn.Linear(cfg.d_model, cfg.d_model + 2 * kv_dim)
         self.out_proj = nn.Linear(cfg.d_model, cfg.d_model)
         self.dropout = cfg.dropout
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        self.qk_norm = cfg.qk_norm
+        if self.qk_norm:
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        kv_cache: "KVCache | None" = None,
+    ) -> torch.Tensor:
         batch, seq_len, d_model = x.shape
 
         qkv = self.qkv_proj(x)
-        q, k, v = qkv.split(d_model, dim=-1)
+        kv_dim = self.n_kv_heads * self.head_dim
+        q, k, v = qkv.split([d_model, kv_dim, kv_dim], dim=-1)
         q = q.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+
+        if self.qk_norm:
+            # Must precede RoPE: RMSNorm's learned per-channel weight is not rotation-invariant,
+            # so normalizing after rotation would scale the rotated pairs asymmetrically.
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
         q = apply_rope(q, cos[None, None, :, :], sin[None, None, :, :])
         k = apply_rope(k, cos[None, None, :, :], sin[None, None, :, :])
 
+        if kv_cache is None:
+            is_causal = True
+        else:
+            # A non-empty cache means this call is decoding exactly one new token against
+            # already-committed positions, which needs no mask (every cached key is causally
+            # valid for it); an empty cache means this is the initial prefill, which needs the
+            # usual triangular mask.
+            is_causal = kv_cache.seq_len == 0
+            k, v = kv_cache.write(k, v)
+
         attn_out = F.scaled_dot_product_attention(
-            q, k, v, dropout_p=self.dropout if self.training else 0.0, is_causal=True
+            q,
+            k,
+            v,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=is_causal,
+            enable_gqa=(self.n_kv_heads != self.n_heads),
         )
         attn_out = attn_out.transpose(1, 2).contiguous().view(batch, seq_len, d_model)
         return self.out_proj(attn_out)
@@ -115,10 +150,53 @@ class TransformerBlock(nn.Module):
         self.ln2 = RMSNorm(cfg.d_model)
         self.ffn = FeedForward(cfg)
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x), cos, sin)
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        kv_cache: "KVCache | None" = None,
+    ) -> torch.Tensor:
+        x = x + self.attn(self.ln1(x), cos, sin, kv_cache)
         x = x + self.ffn(self.ln2(x))
         return x
+
+
+class KVCache:
+    """Per-forward-call-order cache of attention K/V for incremental (one-token-at-a-time)
+    generation.
+
+    Slot count matches the number of CausalSelfAttention calls a single DenseTransformer.forward
+    call makes: 1 for blocks[0] plus one per (block, loop-iteration) pair in the shared-weight
+    loop body (blocks[1:] run loop_count or, in ACT mode, max_loops times — always the full
+    iteration count, since attention is unconditionally dense every iteration regardless of
+    per-token halting). Because blocks[1:] are weight-shared but fed an evolving hidden state,
+    the same block produces different K/V on each iteration, so each (block, iteration) pair
+    needs its own slot — one slot per layer is not enough once loop_count/max_loops > 1.
+
+    Slot assignment is implicit call order, not an explicit index: begin_step() resets the
+    cursor at the top of a forward call, and each write() claims the next slot. This only works
+    because block execution order is identical on every call (never data-dependent).
+    """
+
+    def __init__(self, num_slots: int):
+        self._k: list[torch.Tensor | None] = [None] * num_slots
+        self._v: list[torch.Tensor | None] = [None] * num_slots
+        self._cursor = 0
+        self.seq_len = 0
+
+    def begin_step(self) -> None:
+        self._cursor = 0
+
+    def write(self, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        slot = self._cursor
+        self._cursor += 1
+        if self._k[slot] is None:
+            self._k[slot], self._v[slot] = k, v
+        else:
+            self._k[slot] = torch.cat([self._k[slot], k], dim=2)
+            self._v[slot] = torch.cat([self._v[slot], v], dim=2)
+        return self._k[slot], self._v[slot]
 
 
 class ACTRouter(nn.Module):
@@ -175,6 +253,7 @@ def _run_loop_body(
     sin: torch.Tensor,
     still_running: torch.Tensor | None = None,
     capacity: int | None = None,
+    kv_cache: "KVCache | None" = None,
 ) -> torch.Tensor:
     """Runs `blocks` once. Attention is always fully dense. When still_running/capacity are given,
     each block's FFN is dispatched through the fixed-capacity sparse path (_sparse_ffn_delta)
@@ -182,9 +261,9 @@ def _run_loop_body(
     """
     for block in blocks:
         if still_running is None:
-            x = block(x, cos, sin)
+            x = block(x, cos, sin, kv_cache)
         else:
-            x = x + block.attn(block.ln1(x), cos, sin)
+            x = x + block.attn(block.ln1(x), cos, sin, kv_cache)
             x = x + _sparse_ffn_delta(block.ffn, block.ln2(x), still_running, capacity)
     return x
 
@@ -222,33 +301,60 @@ class DenseTransformer(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def new_kv_cache(self) -> KVCache:
+        """Builds an empty KVCache sized for this model/config: one slot for blocks[0] plus one
+        per (block, loop-iteration) pair the loop body (blocks[1:]) executes each forward call."""
+        loop_multiplier = self.cfg.max_loops if self.cfg.use_router else self.cfg.loop_count
+        num_slots = 1 + loop_multiplier * (self.cfg.n_layers - 1)
+        return KVCache(num_slots)
+
+    def forward(
+        self, input_ids: torch.Tensor, kv_cache: KVCache | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Returns (logits, ponder_cost, mean_loop_depth). The latter two are zero scalar tensors
-        when cfg.use_router is False, so callers have one contract regardless of mode."""
+        when cfg.use_router is False, so callers have one contract regardless of mode.
+
+        kv_cache is optional and defaults to None (the training/full-sequence path, unchanged).
+        When given, input_ids is the *new* chunk only (the whole prompt on the first call, one
+        token per call thereafter) and attention is computed against cached past K/V plus this
+        chunk; see KVCache and CausalSelfAttention.forward."""
         batch, seq_len = input_ids.shape
-        assert seq_len <= self.cfg.max_seq_len, "sequence length exceeds max_seq_len"
+        offset = kv_cache.seq_len if kv_cache is not None else 0
+        assert offset + seq_len <= self.cfg.max_seq_len, "sequence length exceeds max_seq_len"
 
         x = self.token_emb(input_ids)
         x = self.dropout(x)
-        cos, sin = self.rope(seq_len)
+        cos, sin = self.rope(seq_len, offset)
+
+        if kv_cache is not None:
+            kv_cache.begin_step()
 
         # first block runs once; remaining n_layers - 1 blocks form the loop body
-        x = self.blocks[0](x, cos, sin)
+        x = self.blocks[0](x, cos, sin, kv_cache)
 
         if not self.cfg.use_router:
             # remaining n_layers - 1 blocks are looped loop_count times, sharing weights across iterations
             for _ in range(self.cfg.loop_count):
                 for block in self.blocks[1:]:
-                    x = block(x, cos, sin)
+                    x = block(x, cos, sin, kv_cache)
             x = self.ln_f(x)
             logits = self.lm_head(x)
             zero = x.new_zeros(())
+            if kv_cache is not None:
+                kv_cache.seq_len += seq_len
             return logits, zero, zero
 
-        return self._forward_act(x, cos, sin)
+        result = self._forward_act(x, cos, sin, kv_cache)
+        if kv_cache is not None:
+            kv_cache.seq_len += seq_len
+        return result
 
     def _forward_act(
-        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        kv_cache: KVCache | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Adaptive Computation Time (Graves 2016) over the loop body (blocks[1:]): each token
         position gets its own halting probability per iteration, halts once its cumulative
@@ -287,9 +393,11 @@ class DenseTransformer(nn.Module):
         for n in range(1, self.cfg.max_loops + 1):
             is_first_or_last = n == 1 or n == self.cfg.max_loops
             if not sparse_enabled or is_first_or_last:
-                new_x = _run_loop_body(self.blocks[1:], frozen_x, cos, sin)
+                new_x = _run_loop_body(self.blocks[1:], frozen_x, cos, sin, kv_cache=kv_cache)
             else:
-                new_x = _run_loop_body(self.blocks[1:], frozen_x, cos, sin, still_running, capacity)
+                new_x = _run_loop_body(
+                    self.blocks[1:], frozen_x, cos, sin, still_running, capacity, kv_cache
+                )
             p_n = self.router(new_x)
 
             is_last_step = n == self.cfg.max_loops

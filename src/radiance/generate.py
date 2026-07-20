@@ -35,10 +35,15 @@ def generate(
     device: str = "cpu",
 ) -> str:
     input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
+    next_input = input_ids[:, -model.cfg.max_seq_len :]
+    kv_cache = model.new_kv_cache()
 
     for _ in range(max_new_tokens):
-        context = input_ids[:, -model.cfg.max_seq_len :]
-        logits, _, _ = model(context)
+        assert kv_cache.seq_len + next_input.shape[1] <= model.cfg.max_seq_len, (
+            f"generation would exceed model.cfg.max_seq_len ({model.cfg.max_seq_len}); "
+            "reduce --max-new-tokens or use a checkpoint trained with a larger max_seq_len"
+        )
+        logits, _, _ = model(next_input, kv_cache=kv_cache)
         logits = logits[:, -1, :]
 
         if temperature == 0:
@@ -52,6 +57,7 @@ def generate(
             next_token = torch.multinomial(probs, num_samples=1)
 
         input_ids = torch.cat([input_ids, next_token], dim=-1)
+        next_input = next_token  # every step after the first decodes a single new token
 
         if tokenizer.eos_token_id is not None and next_token.item() == tokenizer.eos_token_id:
             break

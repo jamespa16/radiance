@@ -26,6 +26,12 @@ class DataConfig:
 class ModelConfig:
     d_model: int = 256
     head_dim: int = 32  # n_heads = d_model // head_dim; d_model must divide evenly
+    n_kv_heads: int | None = None  # number of K/V heads for GQA; None = n_heads (standard MHA, the
+    # default). Each K/V head is shared by n_heads // n_kv_heads_resolved query heads. Must evenly
+    # divide n_heads — see n_kv_heads_resolved.
+    qk_norm: bool = True  # RMSNorm applied per-head to q/k (over head_dim) before RoPE, for training
+    # stability across blocks[1:]'s weight-shared loop iterations. Defaults to True (a behavior change
+    # for every existing config) unlike this file's usual opt-in-False convention — see CLAUDE.md.
     n_layers: int = 6
     loop_count: int = 1
     use_router: bool = False  # opt-in: replace fixed loop_count with per-token ACT halting
@@ -47,6 +53,14 @@ class ModelConfig:
         if self.d_model % self.head_dim != 0:
             raise ValueError(f"model.d_model ({self.d_model}) must be divisible by model.head_dim ({self.head_dim})")
         return self.d_model // self.head_dim
+
+    @property
+    def n_kv_heads_resolved(self) -> int:
+        n_heads = self.n_heads  # triggers d_model % head_dim validation
+        n_kv_heads = self.n_kv_heads if self.n_kv_heads is not None else n_heads
+        if n_heads % n_kv_heads != 0:
+            raise ValueError(f"model.n_heads ({n_heads}) must be divisible by model.n_kv_heads ({n_kv_heads})")
+        return n_kv_heads
 
     @property
     def ffn_dim(self) -> int:
