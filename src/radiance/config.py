@@ -32,10 +32,15 @@ class ModelConfig:
     max_loops: int = 6  # hard cap on loop iterations when use_router=True; independent of loop_count
     ponder_weight: float = 1.0e-2  # tau: coefficient on the ponder-cost loss term
     halt_epsilon: float = 0.01  # ACT epsilon: a position halts once cumulative halting prob >= 1 - halt_epsilon
+    act_ffn_capacity_ratio: float = 1.0  # fraction of batch*seq_len tokens the FFN sublayer actually
+    # processes per interior ACT loop iteration (first/last iteration always run fully dense — see
+    # DenseTransformer._forward_act). 1.0 (default) disables the fixed-capacity sparse-FFN path
+    # entirely, so the loop is byte-for-byte identical to the fully-dense implementation.
     ffn_mult: float = 4.0  # ffn_dim = round(d_model * ffn_mult)
     ffn_depth: int = 2
     dropout: float = 0.1
     max_seq_len: int = 512
+    rope_theta: float = 10000.0  # RoPE base frequency (Su et al. 2021)
 
     @property
     def n_heads(self) -> int:
