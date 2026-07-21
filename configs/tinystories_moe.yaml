@@ -1,0 +1,47 @@
+run_name: tinystories-dense-transformer-moe
+
+data:
+  dataset: roneneldan/TinyStories
+  text_column: text
+  tokenizer: gpt2
+  seq_len: 512
+  num_workers: 4
+  cache_dir: .cache/radiance/tokenized
+
+model:
+  d_model: 256
+  head_dim: 64
+  n_layers: 6
+  use_router: true
+  max_loops: 16
+  use_moe: true
+  n_experts: 4              # small expert count for a tiny worked example
+  moe_top_k: 2               # Mixtral-style: weighted combination of each token's top-2 experts
+  moe_capacity_factor: 1.25  # standard default; raise if the expert-drop rate looks high
+  moe_aux_loss_weight: 1.0e-2  # load-balancing aux loss weight, mirrors ponder_weight's role
+  moe_dense_every: 3          # every 3rd block in blocks[1:] stays a plain dense FeedForward
+  ffn_mult: 4.0
+  ffn_depth: 2                # each expert (and every dense block) is a full FeedForward at this depth/width
+  dropout: 0.03
+  max_seq_len: 512
+
+train:
+  batch_size: 32
+  lr: 3.0e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.2
+  max_steps: 1000
+  grad_clip: 1.0
+  log_every: 10
+  eval_every: 50
+  save_every: 100
+  output_dir: checkpoints/tinystories/moe
+  seed: 42
+  device: auto
+  compile: true
+  dtype: bf16
+
+wandb:
+  project: radiance
+  entity: null
+  mode: online

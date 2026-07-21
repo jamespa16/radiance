@@ -71,6 +71,112 @@ def estimate_batch_size(raw_model: DenseTransformer, cfg: Config, device: str, d
     return batch_size, grad_accum_steps
 
 
+class CPUOffloadAdamW(torch.optim.Optimizer):
+    """AdamW with exp_avg/exp_avg_sq kept in pinned CPU memory instead of on `device`, freeing the
+    ~2x num_params fp32 moment-buffer VRAM cost for the rest of the run. Params/grads stay
+    GPU-resident the whole time — only a grad copy (down) and the resulting update (up) cross PCIe,
+    once per step() call rather than once per forward/backward — so this only touches optimizer
+    bookkeeping, never the forward path or torch.compile's captured graph. Used as auto_batch_size's
+    second OOM-recovery tier once chunk-size backoff (micro_chunk_size == 1) is exhausted — see
+    migrate_optimizer_to_cpu_offload and the OOM handler in train()."""
+
+    def __init__(
+        self,
+        params,
+        lr: float,
+        weight_decay: float,
+        device: str,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1.0e-8,
+    ) -> None:
+        super().__init__(params, dict(lr=lr, weight_decay=weight_decay, betas=betas, eps=eps))
+        self._device = device
+        self._is_cuda = device.split(":")[0] == "cuda"
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = closure() if closure is not None else None
+
+        for group in self.param_groups:
+            lr, weight_decay = group["lr"], group["weight_decay"]
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+
+            params, grads_cpu, exp_avgs, exp_avg_sqs, steps = [], [], [], [], []
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                if "exp_avg" not in state:
+                    state["exp_avg"] = torch.zeros_like(p, device="cpu", dtype=torch.float32).pin_memory()
+                    state["exp_avg_sq"] = torch.zeros_like(p, device="cpu", dtype=torch.float32).pin_memory()
+                    state["grad_cpu"] = torch.empty_like(p, device="cpu", dtype=torch.float32).pin_memory()
+                    state["step"] = 0
+                state["grad_cpu"].copy_(p.grad, non_blocking=True)
+                state["step"] += 1
+                params.append(p)
+                grads_cpu.append(state["grad_cpu"])
+                exp_avgs.append(state["exp_avg"])
+                exp_avg_sqs.append(state["exp_avg_sq"])
+                steps.append(state["step"])
+
+            if not params:
+                continue
+
+            # Every grad copy above was issued non_blocking against a pinned buffer; sync once here
+            # (rather than per-param) before touching them on the CPU side.
+            if self._is_cuda:
+                torch.cuda.synchronize(self._device)
+
+            torch._foreach_mul_(exp_avgs, beta1)
+            torch._foreach_add_(exp_avgs, grads_cpu, alpha=1 - beta1)
+            torch._foreach_mul_(exp_avg_sqs, beta2)
+            torch._foreach_addcmul_(exp_avg_sqs, grads_cpu, grads_cpu, value=1 - beta2)
+
+            for p, exp_avg, exp_avg_sq, step in zip(params, exp_avgs, exp_avg_sqs, steps):
+                bias_correction1 = 1 - beta1**step
+                bias_correction2 = 1 - beta2**step
+                denom = (exp_avg_sq / bias_correction2).sqrt_().add_(eps)
+                update = (exp_avg / bias_correction1) / denom
+                if weight_decay != 0:
+                    p.data.mul_(1 - lr * weight_decay)
+                p.data.add_(update.to(p.device, non_blocking=True), alpha=-lr)
+
+            if self._is_cuda:
+                torch.cuda.synchronize(self._device)
+
+        return loss
+
+
+def migrate_optimizer_to_cpu_offload(
+    optimizer: torch.optim.Optimizer, model: torch.nn.Module, cfg: Config, device: str
+) -> CPUOffloadAdamW:
+    """Swap a live AdamW for CPUOffloadAdamW, migrating any existing exp_avg/exp_avg_sq/step per
+    param onto pinned CPU tensors instead of resetting momentum. Params with no prior state (e.g.
+    training OOM'd before its first successful step) are left to lazy-init on first step(), matching
+    fresh-AdamW behavior."""
+    new_optimizer = CPUOffloadAdamW(
+        model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay, device=device
+    )
+    # LambdaLR.__init__ requires 'initial_lr' already present in param_groups whenever it's
+    # constructed with last_epoch != -1 (its "resuming a schedule" path) — copy it over from the old
+    # optimizer so the caller can rebuild the scheduler against new_optimizer at the current step.
+    for old_group, new_group in zip(optimizer.param_groups, new_optimizer.param_groups):
+        if "initial_lr" in old_group:
+            new_group["initial_lr"] = old_group["initial_lr"]
+    for p, old_state in optimizer.state.items():
+        if "exp_avg" not in old_state:
+            continue
+        step = old_state["step"]
+        new_optimizer.state[p] = {
+            "exp_avg": old_state["exp_avg"].detach().to("cpu", dtype=torch.float32).pin_memory(),
+            "exp_avg_sq": old_state["exp_avg_sq"].detach().to("cpu", dtype=torch.float32).pin_memory(),
+            "grad_cpu": torch.empty_like(p, device="cpu", dtype=torch.float32).pin_memory(),
+            "step": step.item() if torch.is_tensor(step) else step,
+        }
+    return new_optimizer
+
+
 def compute_loss(logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
     shift_logits = logits[:, :-1, :].contiguous()
     shift_labels = input_ids[:, 1:].contiguous()
@@ -84,7 +190,7 @@ def evaluate(model: DenseTransformer, val_loader, device: str, device_type: str,
     for batch in val_loader:
         input_ids = batch["input_ids"].to(device)
         with torch.autocast(device_type=device_type, dtype=dtype, enabled=dtype != torch.float32):
-            logits, _, _ = model(input_ids)
+            logits, _, _, _ = model(input_ids)
             loss = compute_loss(logits, input_ids)
         losses.append(loss.item())
     model.train()
@@ -109,6 +215,8 @@ def train(cfg: Config) -> None:
 
     if cfg.train.auto_batch_size:
         if device_type == "cuda":
+            if cfg.train.target_effective_batch_size is None:
+                cfg.train.target_effective_batch_size = cfg.train.effective_batch_size
             cfg.train.batch_size, cfg.train.grad_accum_steps = estimate_batch_size(
                 raw_model, cfg, device, device_type
             )
@@ -125,10 +233,14 @@ def train(cfg: Config) -> None:
 
     if cfg.train.tokens_per_param is not None:
         tokens_per_step = cfg.train.effective_batch_size * cfg.data.seq_len
-        target_tokens = cfg.train.tokens_per_param * raw_model.num_parameters()
+        # Active (not flat) param count: Chinchilla-style scaling assumes every parameter multiplies
+        # against every token, which is false for MoE — most expert params aren't touched by most
+        # tokens. num_active_parameters() equals num_parameters() when no MoE layers exist.
+        target_tokens = cfg.train.tokens_per_param * raw_model.num_active_parameters()
         cfg.train.max_steps = max(1, round(target_tokens / tokens_per_step))
         print(
-            f"[radiance] tokens_per_param={cfg.train.tokens_per_param} over {raw_model.num_parameters():,} params "
+            f"[radiance] tokens_per_param={cfg.train.tokens_per_param} over "
+            f"{raw_model.num_active_parameters():,} active params ({raw_model.num_parameters():,} total) "
             f"-> max_steps={cfg.train.max_steps:,} ({target_tokens:,.0f} tokens at {tokens_per_step:,} tokens/step, "
             f"batch_size={cfg.train.batch_size} x grad_accum_steps={cfg.train.grad_accum_steps} "
             f"= effective_batch_size={cfg.train.effective_batch_size})"
@@ -138,6 +250,20 @@ def train(cfg: Config) -> None:
         model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay, fused=(device_type == "cuda")
     )
     scheduler = build_lr_scheduler(optimizer, cfg)
+
+    if cfg.train.compile:
+        # mode="reduce-overhead" captures the backward pass as a CUDA graph. If a param's .grad is
+        # still None going into the first compiled backward (optimizer.zero_grad(set_to_none=True)'s
+        # default), that backward allocates the .grad tensor *inside* the graph's own memory pool
+        # during capture; any later replay within the same accumulated step (grad_accum_steps > 1, or
+        # OOM-driven micro_chunk splitting) then legally reuses/overwrites that pool before the prior
+        # chunk's contribution has been consumed, corrupting the accumulated gradient. Preallocating
+        # stable, zeroed .grad buffers here — before any compiled backward runs — keeps them outside
+        # the graph's pool for the rest of the run; zero_grad below is switched to zero them in place
+        # instead of freeing them back to None, so they stay stable across every step too.
+        for p in model.parameters():
+            if p.requires_grad:
+                p.grad = torch.zeros_like(p)
 
     if wandb.run is None:
         wandb.init(
@@ -154,6 +280,7 @@ def train(cfg: Config) -> None:
     wandb.log(
         {
             "num_parameters": raw_model.num_parameters(),
+            "num_active_parameters": raw_model.num_active_parameters(),
             "train/auto_batch_size": cfg.train.auto_batch_size,
             "train/batch_size": cfg.train.batch_size,
             "train/grad_accum_steps": cfg.train.grad_accum_steps,
@@ -177,6 +304,9 @@ def train(cfg: Config) -> None:
     # forward/backward calls it takes to process the same data.
     micro_chunk_size = cfg.train.batch_size
     give_up = False
+    # Sticky, like micro_chunk_size: once an OOM forces the optimizer's moment buffers to pinned CPU
+    # memory (see the OOM handler below), it stays there for the rest of the run.
+    cpu_offload_active = False
 
     while step < cfg.train.max_steps and not give_up:
         will_log = (step + 1) % cfg.train.log_every == 0
@@ -188,9 +318,13 @@ def train(cfg: Config) -> None:
                 accum_lm_loss = torch.zeros((), device=device)
                 accum_ponder_cost = torch.zeros((), device=device)
                 accum_mean_loop_depth = torch.zeros((), device=device)
+                accum_moe_aux_loss = torch.zeros((), device=device)
 
             try:
-                optimizer.zero_grad(set_to_none=True)
+                # set_to_none=False when compiled: keeps .grad buffers stable/preallocated (see the
+                # warmup above) rather than freeing them back to None, which would reintroduce the
+                # CUDA-graph-pool allocation bug on the next step's first backward.
+                optimizer.zero_grad(set_to_none=not cfg.train.compile)
                 for _ in range(grad_accum_steps):
                     try:
                         batch = next(data_iter)
@@ -207,9 +341,13 @@ def train(cfg: Config) -> None:
                         with torch.autocast(
                             device_type=device_type, dtype=dtype, enabled=dtype != torch.float32
                         ):
-                            logits, ponder_cost, mean_loop_depth = model(chunk)
+                            logits, ponder_cost, mean_loop_depth, moe_aux_loss = model(chunk)
                             lm_loss = compute_loss(logits, chunk)
-                            chunk_loss = lm_loss + cfg.model.ponder_weight * ponder_cost
+                            chunk_loss = (
+                                lm_loss
+                                + cfg.model.ponder_weight * ponder_cost
+                                + cfg.model.moe_aux_loss_weight * moe_aux_loss
+                            )
 
                         scaler.scale(chunk_loss * chunk_weight).backward()
 
@@ -218,6 +356,7 @@ def train(cfg: Config) -> None:
                             accum_lm_loss += lm_loss.detach() * chunk_weight
                             accum_ponder_cost += ponder_cost.detach() * chunk_weight
                             accum_mean_loop_depth += mean_loop_depth.detach() * chunk_weight
+                            accum_moe_aux_loss += moe_aux_loss.detach() * chunk_weight
 
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
@@ -234,6 +373,7 @@ def train(cfg: Config) -> None:
                             "train/lm_loss": accum_lm_loss.item(),
                             "train/ponder_cost": accum_ponder_cost.item(),
                             "train/mean_loop_depth": accum_mean_loop_depth.item(),
+                            "train/moe_aux_loss": accum_moe_aux_loss.item(),
                             "train/lr": scheduler.get_last_lr()[0],
                             "train/micro_chunk_size": micro_chunk_size,
                         },
@@ -256,6 +396,21 @@ def train(cfg: Config) -> None:
                         f"{micro_chunk_size} and retrying."
                     )
                     wandb.log({"train/oom_backoff": micro_chunk_size}, step=step)
+                elif cfg.train.auto_batch_size and not cpu_offload_active:
+                    # Chunk-size backoff alone can't help once it's already at its floor: that tier
+                    # only attacks activation memory, which scales with batch size, not the fixed
+                    # cost of AdamW's exp_avg/exp_avg_sq. Move those to pinned CPU memory instead.
+                    optimizer = migrate_optimizer_to_cpu_offload(optimizer, model, cfg, device)
+                    # Reconstructed (not resumed) against the new optimizer so the LR trajectory
+                    # continues exactly as if training had never paused - LambdaLR only needs the
+                    # lambda(s) it was built with and the step to resume from.
+                    scheduler = LambdaLR(optimizer, scheduler.lr_lambdas[0], last_epoch=step - 1)
+                    # Only reclaims anything once the old optimizer (holding the GPU-resident
+                    # exp_avg/exp_avg_sq we just migrated off of) has lost its last reference above.
+                    torch.cuda.empty_cache()
+                    cpu_offload_active = True
+                    print(f"[radiance] CUDA OOM at step {step}, offloading optimizer state to CPU and retrying.")
+                    wandb.log({"train/cpu_offload": True}, step=step)
                 else:
                     # Exit cleanly instead of raising, so a W&B sweep records this run as
                     # finished (e.g. loss/mem too high for this config) rather than crashed.

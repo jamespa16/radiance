@@ -44,6 +44,19 @@ class ModelConfig:
     # entirely, so the loop is byte-for-byte identical to the fully-dense implementation.
     ffn_mult: float = 4.0  # ffn_dim = round(d_model * ffn_mult)
     ffn_depth: int = 2
+    use_moe: bool = False  # opt-in: blocks[1:] (the shared loop body) use MoEFeedForward instead of
+    # FeedForward; blocks[0] is unaffected and always stays dense — see moe_dense_every for keeping
+    # some of blocks[1:] dense too.
+    n_experts: int = 8  # experts per MoE FFN layer; only used when use_moe=True
+    moe_top_k: int = 2  # experts activated per token (Mixtral-style weighted top-k, not Switch top-1)
+    moe_capacity_factor: float = 1.25  # per-expert capacity = round(capacity_factor * n_tokens *
+    # moe_top_k / n_experts); tokens routed to an already-full expert are dropped (zero contribution
+    # from that expert — see MoEFeedForward).
+    moe_aux_loss_weight: float = 1.0e-2  # coefficient on the load-balancing aux loss term; mirrors
+    # ponder_weight's role/placement for ACT's ponder cost.
+    moe_dense_every: int | None = None  # opt-in: every Nth block (1-indexed by position within
+    # blocks[1:]) uses a plain dense FeedForward instead of MoEFeedForward even when use_moe=True.
+    # None (default) means every block in blocks[1:] is MoE.
     dropout: float = 0.1
     max_seq_len: int = 512
     rope_theta: float = 10000.0  # RoPE base frequency (Su et al. 2021)
@@ -78,16 +91,26 @@ class TrainConfig:
     warmup_ratio: float = 0.04  # warmup_steps = round(max_steps * warmup_ratio)
     max_steps: int = 5000  # ignored (overwritten once the model is built) if tokens_per_param is set
     tokens_per_param: float | None = None  # opt-in: derive max_steps from model size instead of a fixed step
-    # count — max_steps = round(tokens_per_param * num_parameters / (effective_batch_size * data.seq_len)),
-    # computed in train.py once the model is built. Chinchilla-optimal is ~20 tokens/param.
-    auto_batch_size: bool = False  # opt-in: overwrite batch_size/grad_accum_steps at startup, computed from
-    # free VRAM + model size (see train.py's estimate_batch_size) instead of the values configured above.
-    # CUDA-only; requires target_effective_batch_size to be set. Also enables OOM backoff during training:
-    # a CUDA OOM shrinks the internal per-forward-pass chunk size and retries the step instead of ending the
-    # run (see train.py's main loop) — this backoff never fires when auto_batch_size is False, so a manually
-    # chosen/swept batch_size always behaves exactly as configured.
-    target_effective_batch_size: int | None = None  # required when auto_batch_size is True: grad_accum_steps
-    # is derived as ceil(target_effective_batch_size / computed batch_size).
+    # count — max_steps = round(tokens_per_param * num_active_parameters / (effective_batch_size *
+    # data.seq_len)), computed in train.py once the model is built (num_active_parameters excludes
+    # unused MoE expert params when model.use_moe is set). Chinchilla-optimal is ~20 tokens/param.
+    auto_batch_size: bool = True  # overwrite batch_size/grad_accum_steps at startup, computed from free
+    # VRAM + model size (see train.py's estimate_batch_size) instead of the values configured above.
+    # Defaults to True — a deliberate behavior change for every existing config, not the usual
+    # default-False opt-in convention (contrast use_router/use_moe) — since it only ever makes the
+    # actual micro-batch size *safer* than a hand-picked one, never bigger, and it's what gates the OOM
+    # backoff below. Set to False for a manually-chosen/swept batch_size to behave exactly as configured
+    # (e.g. a sweep that's already tuning batch_size itself). CUDA-only: on CPU/MPS it's a no-op (prints
+    # a note and keeps the configured batch_size/grad_accum_steps) since estimate_batch_size only knows
+    # how to read free VRAM. Also enables OOM backoff during training: a CUDA OOM shrinks the internal
+    # per-forward-pass chunk size and retries the step instead of ending the run (see train.py's main
+    # loop) — this backoff never fires when auto_batch_size is False.
+    target_effective_batch_size: int | None = None  # the effective batch size auto_batch_size solves
+    # for (grad_accum_steps = ceil(target_effective_batch_size / computed batch_size)). None (default)
+    # falls back to whatever effective_batch_size the configured batch_size/grad_accum_steps already
+    # imply, so an existing config's effective batch size is preserved even as auto_batch_size splits it
+    # differently across batch_size/grad_accum_steps to fit VRAM. Set explicitly to target a different
+    # effective batch size than batch_size * grad_accum_steps would otherwise imply.
     vram_safety_margin: float = 0.5  # only used when auto_batch_size is True: fraction of the (already
     # conservative) estimated max token budget to actually use. Lower = more conservative.
     grad_clip: float = 1.0

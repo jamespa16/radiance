@@ -43,7 +43,7 @@ def generate(
             f"generation would exceed model.cfg.max_seq_len ({model.cfg.max_seq_len}); "
             "reduce --max-new-tokens or use a checkpoint trained with a larger max_seq_len"
         )
-        logits, _, _ = model(next_input, kv_cache=kv_cache)
+        logits, _, _, _ = model(next_input, kv_cache=kv_cache)
         logits = logits[:, -1, :]
 
         if temperature == 0:

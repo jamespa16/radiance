@@ -142,13 +142,107 @@ class FeedForward(nn.Module):
         return self.dropout(self.down_proj(h))
 
 
-class TransformerBlock(nn.Module):
+class MoERouter(nn.Module):
+    """Per-token expert-routing head for MoEFeedForward. Mirrors ACTRouter's RMSNorm -> Linear
+    shape, but projects to n_experts logits (softmaxed over experts) instead of a single halting
+    probability, and is instantiated once per MoE FFN layer (not a model-level singleton like
+    DenseTransformer.router, which is ACT's halting router — different concept, different name).
+    """
+
     def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        self.norm = RMSNorm(cfg.d_model)
+        self.proj = nn.Linear(cfg.d_model, cfg.n_experts)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # fp32 for a stable softmax under bf16/fp16 autocast, mirroring cross_entropy's own fp32
+        # upcast (see activation_bytes_per_token's docstring).
+        return F.softmax(self.proj(self.norm(x)).float(), dim=-1)  # (n_tokens, n_experts)
+
+
+def _moe_capacity(cfg: ModelConfig, n_tokens: int) -> int:
+    # Capped at n_tokens: a per-expert capacity above the token count is never meaningful (there
+    # aren't enough tokens to fill it) and would make torch.topk's k exceed the dimension size.
+    return max(1, min(n_tokens, round(cfg.moe_capacity_factor * n_tokens * cfg.moe_top_k / cfg.n_experts)))
+
+
+class MoEFeedForward(nn.Module):
+    """Top-k routed MoE FFN, drop-in replacement for FeedForward: (*, d_model) -> (*, d_model),
+    shape-agnostic over leading dims so it works both from TransformerBlock.forward's (batch,
+    seq_len, d_model) path and from ACT's _sparse_ffn_delta gather path's flat (capacity, d_model)
+    path with no special-casing in either.
+
+    Router weights are Mixtral-style: full softmax over all experts, top-k selected, renormalized
+    to sum to 1 over just the selected k. Dispatch mirrors _sparse_ffn_delta's gather/compute/
+    scatter idiom, generalized to n_experts writers with per-expert fixed capacity (_moe_capacity)
+    and drop-on-overflow (same "assigned + random tiebreak" topk priority trick as
+    _sparse_ffn_delta, applied per-expert).
+
+    Uses index_add, not _sparse_ffn_delta's index_copy, to accumulate per-expert writes into a
+    shared output buffer: with top_k >= 1, a token can receive nonzero contributions from more than
+    one expert (top_k=2 by default), and even with top_k=1, capacity padding for one expert can
+    land on a token index another expert legitimately wrote to. index_copy would let a later
+    expert's zero padding silently clobber an earlier expert's real output at that index;
+    index_add sums correctly because unassigned/padding slots are explicitly zeroed by `valid`
+    before being added.
+    """
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        if cfg.moe_top_k > cfg.n_experts:
+            raise ValueError(f"model.moe_top_k ({cfg.moe_top_k}) must be <= model.n_experts ({cfg.n_experts})")
+        self.cfg = cfg
+        self.router = MoERouter(cfg)
+        self.experts = nn.ModuleList([FeedForward(cfg) for _ in range(cfg.n_experts)])
+        self.aux_loss_accum: torch.Tensor | None = None
+        self._aux_loss_calls = 0
+
+    def reset_aux_loss(self) -> None:
+        self.aux_loss_accum = None
+        self._aux_loss_calls = 0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_shape = x.shape
+        d_model = orig_shape[-1]
+        flat_x = x.reshape(-1, d_model)
+        n_tokens = flat_x.shape[0]
+
+        probs = self.router(flat_x)  # (n_tokens, n_experts) fp32
+        topk_probs, topk_idx = probs.topk(self.cfg.moe_top_k, dim=-1)
+        topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True)  # renormalize over selected k
+        weight = probs.new_zeros(n_tokens, self.cfg.n_experts).scatter_(1, topk_idx, topk_probs)
+
+        assigned = weight > 0  # (n_tokens, n_experts)
+        f_i = assigned.float().mean(dim=0).detach()  # fraction of tokens routed to expert i (non-diff)
+        p_i = probs.mean(dim=0)  # mean full-softmax prob mass on expert i (differentiable)
+        aux_loss = self.cfg.n_experts * (f_i * p_i).sum()
+        self.aux_loss_accum = aux_loss if self.aux_loss_accum is None else self.aux_loss_accum + aux_loss
+        self._aux_loss_calls += 1
+
+        capacity = _moe_capacity(self.cfg, n_tokens)
+        delta = flat_x.new_zeros(n_tokens, d_model)
+        for e, expert in enumerate(self.experts):
+            expert_weight = weight[:, e]
+            assigned_e = expert_weight > 0
+            priority = assigned_e.float() + torch.rand(n_tokens, device=x.device, dtype=torch.float32)
+            token_idx = torch.topk(priority, k=capacity).indices
+            valid = assigned_e.index_select(0, token_idx)
+
+            gathered = flat_x.index_select(0, token_idx)
+            expert_out = expert(gathered) * valid.unsqueeze(-1).to(x.dtype)
+            w = (expert_weight.index_select(0, token_idx) * valid.to(expert_weight.dtype)).to(x.dtype)
+            delta = delta.index_add(0, token_idx, w.unsqueeze(-1) * expert_out)
+
+        return delta.view(orig_shape)
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, cfg: ModelConfig, use_moe_ffn: bool = False):
         super().__init__()
         self.ln1 = RMSNorm(cfg.d_model)
         self.attn = CausalSelfAttention(cfg)
         self.ln2 = RMSNorm(cfg.d_model)
-        self.ffn = FeedForward(cfg)
+        self.ffn = MoEFeedForward(cfg) if use_moe_ffn else FeedForward(cfg)
 
     def forward(
         self,
@@ -276,7 +370,17 @@ class DenseTransformer(nn.Module):
         self.rope = RotaryEmbedding(cfg.head_dim, cfg.max_seq_len, cfg.rope_theta)
         self.dropout = nn.Dropout(cfg.dropout)
 
-        self.blocks = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.n_layers)])
+        # blocks[0] always stays dense (it runs once per forward, not part of the recursive loop
+        # body); blocks[1:] use MoEFeedForward when use_moe is set, except every moe_dense_every-th
+        # position (1-indexed within blocks[1:]), which stays dense too.
+        self.blocks = nn.ModuleList([TransformerBlock(cfg, use_moe_ffn=False)])
+        for i in range(cfg.n_layers - 1):
+            is_dense_override = cfg.use_moe and cfg.moe_dense_every and (i + 1) % cfg.moe_dense_every == 0
+            self.blocks.append(TransformerBlock(cfg, use_moe_ffn=cfg.use_moe and not is_dense_override))
+
+        # Plain Python list, not a second nn.ModuleList — these modules are already registered via
+        # self.blocks; wrapping them again risks confusing state_dict/double-registration.
+        self._moe_layers = [m for m in self.modules() if isinstance(m, MoEFeedForward)]
 
         self.ln_f = RMSNorm(cfg.d_model)
         self.lm_head = nn.Linear(cfg.d_model, vocab_size, bias=False)
@@ -308,11 +412,26 @@ class DenseTransformer(nn.Module):
         num_slots = 1 + loop_multiplier * (self.cfg.n_layers - 1)
         return KVCache(num_slots)
 
+    def _reset_moe_aux_loss(self) -> None:
+        for moe_ffn in self._moe_layers:
+            moe_ffn.reset_aux_loss()
+
+    def _collect_moe_aux_loss(self, x: torch.Tensor) -> torch.Tensor:
+        if not self._moe_layers:
+            return x.new_zeros(())
+        # Averaged per-layer over its call count (once for loop_count/non-router mode, up to
+        # max_loops times for ACT mode) so the aux loss magnitude doesn't scale with loop depth,
+        # consistent with ponder_cost/mean_loop_depth also being mean-reduced, not summed.
+        return sum(
+            moe_ffn.aux_loss_accum / moe_ffn._aux_loss_calls for moe_ffn in self._moe_layers
+        )
+
     def forward(
         self, input_ids: torch.Tensor, kv_cache: KVCache | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns (logits, ponder_cost, mean_loop_depth). The latter two are zero scalar tensors
-        when cfg.use_router is False, so callers have one contract regardless of mode.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns (logits, ponder_cost, mean_loop_depth, moe_aux_loss). The latter three are zero
+        scalar tensors when the corresponding feature (use_router / use_moe) is off, so callers
+        have one contract regardless of mode.
 
         kv_cache is optional and defaults to None (the training/full-sequence path, unchanged).
         When given, input_ids is the *new* chunk only (the whole prompt on the first call, one
@@ -329,6 +448,8 @@ class DenseTransformer(nn.Module):
         if kv_cache is not None:
             kv_cache.begin_step()
 
+        self._reset_moe_aux_loss()
+
         # first block runs once; remaining n_layers - 1 blocks form the loop body
         x = self.blocks[0](x, cos, sin, kv_cache)
 
@@ -340,9 +461,10 @@ class DenseTransformer(nn.Module):
             x = self.ln_f(x)
             logits = self.lm_head(x)
             zero = x.new_zeros(())
+            moe_aux_loss = self._collect_moe_aux_loss(x)
             if kv_cache is not None:
                 kv_cache.seq_len += seq_len
-            return logits, zero, zero
+            return logits, zero, zero, moe_aux_loss
 
         result = self._forward_act(x, cos, sin, kv_cache)
         if kv_cache is not None:
@@ -355,7 +477,7 @@ class DenseTransformer(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         kv_cache: KVCache | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Adaptive Computation Time (Graves 2016) over the loop body (blocks[1:]): each token
         position gets its own halting probability per iteration, halts once its cumulative
         probability crosses 1 - halt_epsilon (or max_loops is reached), and the output is a
@@ -420,10 +542,22 @@ class DenseTransformer(nn.Module):
         logits = self.lm_head(x)
         ponder_cost = (n_updates + remainder_sum).mean()
         mean_loop_depth = n_updates.mean()
-        return logits, ponder_cost, mean_loop_depth
+        moe_aux_loss = self._collect_moe_aux_loss(x)
+        return logits, ponder_cost, mean_loop_depth, moe_aux_loss
 
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
+
+    def num_active_parameters(self) -> int:
+        """Like num_parameters(), but counts only moe_top_k experts' worth of FFN parameters per
+        MoE layer instead of all n_experts — the parameter count actually multiplied against any
+        given token's activation, which is the right basis for Chinchilla-style tokens_per_param
+        sizing (see train.py). Identical to num_parameters() when no MoE layers exist."""
+        total = self.num_parameters()
+        for moe_ffn in self._moe_layers:
+            per_expert_params = sum(p.numel() for p in moe_ffn.experts[0].parameters())
+            total -= per_expert_params * (self.cfg.n_experts - self.cfg.moe_top_k)
+        return total
 
     def activation_bytes_per_token(self, activation_dtype_bytes: int) -> int:
         """Conservative (deliberately over-, not under-, estimated) activation memory per token,
@@ -446,12 +580,27 @@ class DenseTransformer(nn.Module):
         upcasts log_softmax (used internally by compute_loss's F.cross_entropy) to fp32 even under
         bf16/fp16 autocast, so this term doesn't shrink with a lower compute dtype the way the rest
         of the activations do.
+
+        When a block's FFN is MoE (see MoEFeedForward), the dense (depth + 1) * ffn_dim term above
+        is replaced by (depth + 1) * ffn_dim * moe_capacity_factor * moe_top_k + n_experts: total
+        FFN "slots" processed across all experts scales with capacity_factor * top_k (only the
+        capacity-limited, actually-dispatched tokens retain activations per expert), not n_experts
+        — using n_experts would repeat the double-counting mistake num_active_parameters() avoids
+        for parameter count. The + n_experts term is the router's own logits, retained for backward
+        through the softmax.
         """
         cfg = self.cfg
         depth = max(1, cfg.ffn_depth)
-        block_units = 10 * cfg.d_model + (depth + 1) * cfg.ffn_dim
+
+        def ffn_units(block: TransformerBlock) -> float:
+            if isinstance(block.ffn, MoEFeedForward):
+                return (depth + 1) * cfg.ffn_dim * cfg.moe_capacity_factor * cfg.moe_top_k + cfg.n_experts
+            return (depth + 1) * cfg.ffn_dim
+
+        block0_units = 10 * cfg.d_model + ffn_units(self.blocks[0])
+        loop_body_units = sum(10 * cfg.d_model + ffn_units(b) for b in self.blocks[1:])
         loop_multiplier = cfg.max_loops if cfg.use_router else cfg.loop_count
-        total_block_units = block_units * (1 + loop_multiplier * (cfg.n_layers - 1))
+        total_block_units = block0_units + loop_multiplier * loop_body_units
         embedding_units = cfg.d_model  # token embedding only (RoPE's cos/sin have no batch dim)
         block_bytes = activation_dtype_bytes * (total_block_units + embedding_units)
         # fp32, x3: logits + their gradient buffer + log_softmax's internal fp32 upcast working

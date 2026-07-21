@@ -1,0 +1,41 @@
+program: src/radiance/sweep.py
+method: bayes
+project: radiance
+
+metric:
+  name: val/loss
+  goal: minimize
+
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - "--config"
+  - "configs/tinystories_act-ffn.yaml"
+
+parameters:
+  model:
+    parameters:
+      max_loops:
+        min: 6
+        max: 16
+        distribution: int_uniform
+      ponder_weight:
+        min: 1.0e-5
+        max: 1.0e-4
+        distribution: log_uniform_values
+      halt_epsilon:
+        min: 1.0e-2
+        max: 1.0e-1
+        distribution: log_uniform_values
+
+  train:
+    parameters:
+      lr:
+        min: 2.0e-3
+        max: 4.0e-3
+        distribution: log_uniform_values
+      weight_decay:
+        min: 1.0e-4
+        max: 1.0e-2
+        distribution: log_uniform_values

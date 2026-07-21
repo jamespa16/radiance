@@ -128,9 +128,37 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   this is dense, fully-batched compute with no per-token gather/scatter, router mode does **not** save wall-clock
   compute over running `max_loops` iterations for every token — the adaptivity shows up in the loss signal
   (`ponder_cost`, see below) and in what gets accumulated into the output, not in runtime; that's the first thing to
-  optimize if router mode needs to get faster. `forward()` returns `(logits, ponder_cost, mean_loop_depth)` in both
-  modes — the latter two are zero scalar tensors when `use_router` is `False`, so callers have one contract either
-  way. See `configs/tinystories_router.yaml` for a worked example.
+  optimize if router mode needs to get faster. `forward()` returns
+  `(logits, ponder_cost, mean_loop_depth, moe_aux_loss)` in every mode — the latter three are zero scalar tensors
+  when the corresponding feature (`use_router` / `use_moe`) is off, so callers have one contract regardless of mode.
+  See `configs/tinystories_router.yaml` for a worked example.
+
+  `cfg.model.use_moe` replaces `blocks[1:]`'s `FeedForward` with `MoEFeedForward` — `n_experts` parallel
+  `FeedForward` instances plus an `MoERouter` (same `RMSNorm + Linear` shape as `ACTRouter`, but softmax over
+  `n_experts` logits instead of a single sigmoid). Routing is Mixtral-style top-`k` (`cfg.model.moe_top_k`,
+  default `2`): each token's router probabilities are renormalized over just its top-`k` selected experts, and
+  the FFN output is their weighted sum. Dispatch is capacity-based, mirroring `_sparse_ffn_delta`'s
+  gather/compute/scatter idiom (fixed `capacity = round(moe_capacity_factor * n_tokens * moe_top_k / n_experts)`
+  per expert, `torch.topk` priority selection, `index_select` gather) but generalized to `n_experts` writers
+  into one shared output buffer via `index_add` rather than `_sparse_ffn_delta`'s single-writer `index_copy` —
+  with more than one expert able to write a nonzero value for the same token, `index_copy` would let a later
+  expert's zero capacity-padding silently clobber an earlier expert's real output at that index. Tokens beyond
+  an expert's capacity are dropped (zero contribution from that expert, standard Switch-Transformer policy). A
+  load-balancing auxiliary loss (`n_experts * sum(f_i * P_i)`, the standard Switch-Transformer formulation)
+  keeps routing from collapsing onto a few experts; it's `forward()`'s `moe_aux_loss` return value, weighted by
+  `cfg.model.moe_aux_loss_weight` (mirrors `ponder_weight`'s role for ACT's ponder cost).
+
+  `blocks[0]` always stays dense (it runs once per forward, not part of the recursive loop body); within
+  `blocks[1:]`, `cfg.model.moe_dense_every` (opt-in) keeps every Nth block (1-indexed by position in the loop
+  body) dense too, for interleaving MoE and dense layers. Because `blocks[1:]` is weight-shared but fed an
+  evolving hidden state each loop iteration, a token's expert choice naturally changes across iterations as its
+  representation evolves — this "recursion picks different experts per pass" behavior falls out for free from
+  ordinary input-dependent routing, with no iteration-aware logic in `MoERouter`/`MoEFeedForward` itself.
+  `MoEFeedForward.forward` is shape-agnostic over its leading dims, so it satisfies the same
+  `(*, d_model) -> (*, d_model)` contract `FeedForward` does and composes with ACT's own `_sparse_ffn_delta`
+  FFN-capacity sparsity (`cfg.model.act_ffn_capacity_ratio < 1.0`) with no special-casing in either mechanism —
+  `_run_loop_body` calls `block.ffn` generically regardless of which FFN type it is. See
+  `configs/tinystories_moe.yaml` for a worked example.
 - **`train.py`** — plain PyTorch training loop (no HF `Trainer`): AdamW + cosine-with-warmup LR schedule
   (`build_lr_scheduler`), manual loss computation (`compute_loss` shifts logits/labels by one position for standard
   causal LM loss), gradient clipping, periodic W&B logging (`train/loss`, `train/lm_loss`, `train/ponder_cost`,
@@ -139,10 +167,15 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   step-based (`cfg.train.max_steps`), not epoch-based, and cycles the train `DataLoader` via manual `StopIteration`
   handling rather than epochs. Setting `cfg.train.tokens_per_param` (opt-in, default `null`) derives `max_steps`
   from model size instead of pinning it directly: once the model is built, `train()` overwrites `cfg.train.max_steps`
-  with `round(tokens_per_param * raw_model.num_parameters() / (effective_batch_size * data.seq_len))` — e.g. `20`
-  for a Chinchilla-optimal token budget — and prints/logs the resulting step count, so the same config keeps
-  tracking the "right" number of steps as `model.*` fields (and therefore param count) change instead of needing
-  `max_steps` hand-recomputed. `warmup_ratio` (see `TrainConfig`) is read as a live property off whatever
+  with `round(tokens_per_param * raw_model.num_active_parameters() / (effective_batch_size * data.seq_len))` —
+  e.g. `20` for a Chinchilla-optimal token budget — and prints/logs the resulting step count, so the same config
+  keeps tracking the "right" number of steps as `model.*` fields (and therefore param count) change instead of
+  needing `max_steps` hand-recomputed. `num_active_parameters()` differs from the flat `num_parameters()` only
+  when `cfg.model.use_moe` is set, excluding each MoE layer's inactive (non-top-`k`) expert parameters — Chinchilla
+  -style scaling assumes every parameter multiplies against every token, which is false for MoE, so using the flat
+  count there would inflate `max_steps` by roughly `n_experts / moe_top_k`; `estimate_batch_size`'s optimizer-state
+  sizing below still uses the flat count, since every expert parameter gets a gradient and optimizer state
+  regardless of activation frequency. `warmup_ratio` (see `TrainConfig`) is read as a live property off whatever
   `max_steps` ends up being, so warmup scales automatically along with it. See `configs/fineweb_500m.yaml` for a
   worked example; leave `tokens_per_param: null` and set `max_steps` directly for quick/pinned runs (e.g.
   `configs/tinystories.yaml`). `cfg.train.grad_accum_steps` (default `1`, opt-in) accumulates gradients over that
@@ -151,29 +184,51 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   single forward/backward pass; each micro-batch's loss is divided by `grad_accum_steps` before `.backward()` so
   the accumulated gradient matches training on one `effective_batch_size`-sized batch, and `step`/W&B
   logging/`eval_every`/`save_every` all stay in accumulated-step units, unaffected by the setting. See
-  `configs/fineweb_500m.yaml` for a worked example. Setting `cfg.train.auto_batch_size: true` (opt-in, CUDA-only)
-  overwrites the configured `batch_size`/`grad_accum_steps` at startup with values computed from free VRAM and
-  model size (`estimate_batch_size` in `train.py`) — a deliberately conservative closed-form estimate (params/
-  gradients/optimizer state sized exactly, activation memory from a hand-derived, intentionally-overestimating
-  per-token formula on `DenseTransformer.activation_bytes_per_token`) rather than an expensive live probe against
-  the real model; `cfg.train.target_effective_batch_size` (required when `auto_batch_size` is on) sets the desired
-  `effective_batch_size`, and `cfg.train.vram_safety_margin` (default `0.5`) scales how much of the estimated
-  budget is actually used. Because the estimate is approximate by construction, `auto_batch_size` also enables OOM
-  backoff in the training loop: a CUDA OOM halves an internal `micro_chunk_size` (starts equal to `batch_size`,
-  monotonically shrinks, floor `1`) that further splits each already-fetched micro-batch along the batch dimension
-  and retries the same accumulated step, rather than ending the run — `batch_size`/`grad_accum_steps`/
-  `effective_batch_size` (and therefore `tokens_per_param` accounting) are untouched by this, since backoff never
-  rebuilds the DataLoader, only how many forward/backward calls it takes to process one already-fetched
-  micro-batch. This backoff is scoped to `auto_batch_size` — with it off (the default), a CUDA OOM always ends the
-  run cleanly as before, so a manually-chosen or W&B-swept `batch_size` behaves exactly as configured. See
-  `configs/fineweb_500m.yaml`'s commented-out block for a worked example. `cfg.train.dtype` (`"fp32"`, `"fp16"`,
+  `configs/fineweb_500m.yaml` for a worked example. `cfg.train.auto_batch_size` (CUDA-only) overwrites the
+  configured `batch_size`/`grad_accum_steps` at startup with values computed from free VRAM and model size
+  (`estimate_batch_size` in `train.py`) — a deliberately conservative closed-form estimate (params/gradients/
+  optimizer state sized exactly, activation memory from a hand-derived, intentionally-overestimating per-token
+  formula on `DenseTransformer.activation_bytes_per_token`) rather than an expensive live probe against the real
+  model. It defaults to `True` — a deliberate behavior change for every existing config, not the usual
+  default-`False` opt-in convention (contrast `use_router`/`use_moe`; see `qk_norm` for the other precedent of this)
+  — since on CUDA it only ever makes the actual micro-batch size *safer* than a hand-picked one, never bigger, and
+  it's what gates the OOM backoff described below; set it to `False` for a manually-chosen or W&B-swept
+  `batch_size` to behave exactly as configured (e.g. a sweep that's already tuning `batch_size` itself). On
+  CPU/MPS it's a no-op (prints a note and keeps the configured `batch_size`/`grad_accum_steps`), since
+  `estimate_batch_size` only knows how to read free VRAM. `cfg.train.target_effective_batch_size` sets the desired
+  `effective_batch_size` the estimate solves `grad_accum_steps` for; left at its default `None`, it falls back to
+  whatever `effective_batch_size` the configured `batch_size`/`grad_accum_steps` already imply, so an existing
+  config's effective batch size is preserved even as `auto_batch_size` re-splits it across `batch_size`/
+  `grad_accum_steps` to fit VRAM — set it explicitly to target a different effective batch size instead.
+  `cfg.train.vram_safety_margin` (default `0.5`) scales how much of the estimated budget is actually used.
+  Because the estimate is approximate by construction, `auto_batch_size` also enables a
+  two-tier OOM recovery escalation in the training loop, each tier attacking a different memory pool. Tier one: a
+  CUDA OOM halves an internal `micro_chunk_size` (starts equal to `batch_size`, monotonically shrinks, floor `1`)
+  that further splits each already-fetched micro-batch along the batch dimension and retries the same accumulated
+  step, rather than ending the run — `batch_size`/`grad_accum_steps`/`effective_batch_size` (and therefore
+  `tokens_per_param` accounting) are untouched by this, since backoff never rebuilds the DataLoader, only how many
+  forward/backward calls it takes to process one already-fetched micro-batch; this only reduces activation memory,
+  which scales with batch size. Tier two triggers once `micro_chunk_size` has already bottomed out at `1` and a CUDA
+  OOM still hits (so shrinking the batch further can't help, since the remaining cost is fixed): the `AdamW`
+  optimizer is swapped for `CPUOffloadAdamW` (`train.py`), which keeps `exp_avg`/`exp_avg_sq` in pinned CPU memory
+  instead of on `device`, permanently freeing ~2x `num_params` fp32 bytes of VRAM for the rest of the run — model
+  parameters, gradients, and activations all stay GPU-resident throughout, and only a grad copy (down) and the
+  resulting update (up) cross PCIe, once per optimizer step rather than once per forward/backward, so this doesn't
+  touch the forward path or invalidate `torch.compile`'s captured graph. `migrate_optimizer_to_cpu_offload`
+  (`train.py`) preserves in-flight momentum by migrating each param's existing `exp_avg`/`exp_avg_sq`/`step` onto the
+  new optimizer rather than resetting it, and the LR scheduler is rebuilt against the new optimizer with
+  `last_epoch` set to the current step so the LR trajectory continues uninterrupted. Both tiers are sticky —
+  `micro_chunk_size` only ever shrinks and CPU offload, once triggered, stays on for the rest of the run — and both
+  are scoped to `auto_batch_size`: with it explicitly set to `False`, a CUDA OOM always ends the run cleanly as
+  before, so a manually-chosen or W&B-swept `batch_size` behaves exactly as configured. See
+  `configs/fineweb_500m.yaml`'s commented-out block for a worked example of overriding the defaults. `cfg.train.dtype` (`"fp32"`, `"fp16"`,
   or `"bf16"`, resolved via `resolve_dtype`)
   controls precision: the forward/loss pass runs under `torch.autocast` in that dtype while master weights and the
   optimizer state stay fp32; a `torch.amp.GradScaler` is enabled only for `fp16` (its narrow exponent range can
   underflow small gradients — `bf16` has fp32's exponent range so it needs no scaling). The training loss is
-  `lm_loss + cfg.model.ponder_weight * ponder_cost` (the second term is always zero unless `use_router` is on);
-  `evaluate()`'s `val/loss` stays pure LM loss (ponder cost discarded) so it's comparable across router and
-  non-router runs.
+  `lm_loss + cfg.model.ponder_weight * ponder_cost + cfg.model.moe_aux_loss_weight * moe_aux_loss` (the second
+  term is always zero unless `use_router` is on, the third unless `use_moe` is on); `evaluate()`'s `val/loss`
+  stays pure LM loss (ponder cost and MoE aux loss both discarded) so it's comparable across configurations.
 
 - **`generate.py`** — `load_checkpoint(path, device)` reconstructs a `DenseTransformer` + tokenizer from a saved
   checkpoint (`torch.load(..., weights_only=False)`, since the checkpoint pickles the full `Config` object, not just
@@ -206,5 +261,9 @@ Entry points: `radiance.train:main` (`--config`) and `radiance.generate:main` (`
   `DenseTransformer._forward_act` (the learned per-token loop-halting mechanism, opt-in via `cfg.model.use_router`)
   is the reference example for a variant that changes `DenseTransformer.forward`'s control flow rather than just
   swapping in a different block. See `configs/tinystories_gqa.yaml` for a worked example of GQA (`model.n_kv_heads`).
+- MoE FFN: set `model.use_moe: true` (plus `model.moe_dense_every` to interleave dense blocks within `blocks[1:]`)
+  — see `configs/tinystories_moe.yaml`. `MoEFeedForward` is the reference example for a variant that replaces a
+  block's FFN sublayer wholesale while preserving `FeedForward`'s `(*, d_model) -> (*, d_model)` contract, which
+  is what lets it compose with ACT's own `_sparse_ffn_delta` gather/scatter path with no changes to either.
 - New training behavior (e.g. different scheduler, mixed precision): changes belong in `train.py`; keep the loop
   step-based and keep config-driven values in `TrainConfig` rather than hardcoding.
