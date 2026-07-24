@@ -60,6 +60,12 @@ class ModelConfig:
     dropout: float = 0.1
     max_seq_len: int = 512
     rope_theta: float = 10000.0  # RoPE base frequency (Su et al. 2021)
+    grad_checkpoint: bool = False  # opt-in: recompute each block's activations during backward instead
+    # of storing them. Trades ~20-30% throughput for a large drop in activation memory, and it pays off
+    # disproportionately here because blocks[1:] is re-run loop_count/max_loops times per forward with
+    # every pass retaining its own activations — see DenseTransformer.forward. Training-only (a no-op
+    # under eval/no_grad/kv-cache); raise batch_size or target_effective_batch_size to spend the memory
+    # it frees.
     vocab_pad_multiple: int = 128  # round the tokenizer's vocab up to a multiple of this for the
     # token_emb/lm_head matmuls (see model.padded_vocab_size). The padding rows are unreachable by
     # any tokenizer id, so this is behavior-preserving; it just keeps the model's largest matmul on
@@ -128,6 +134,11 @@ class TrainConfig:
     # also keeps val/loss comparable across configs with different val split sizes. None = full pass.
     save_every: int = 1000
     output_dir: str = "checkpoints/run"
+    resume_from: str | None = None  # opt-in: path to a checkpoint to continue training from, or the
+    # literal "auto" to pick the highest-numbered step_*.pt in output_dir (so an interrupted run can be
+    # relaunched with the same config unchanged). Restores model + optimizer moments + LR schedule +
+    # GradScaler, so the run continues rather than restarting AdamW from zero momentum at warmup LR.
+    # The DataLoader position is *not* restored — a resumed run revisits some examples. None = fresh run.
     seed: int = 42
     device: str = "auto"
     compile: bool = True

@@ -149,13 +149,25 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   when the corresponding feature (`use_router` / `use_moe`) is off, so callers have one contract regardless of mode.
   See `configs/tinystories_router.yaml` for a worked example.
 
+  `cfg.model.grad_checkpoint` (opt-in, default `False`) recomputes each block's activations during backward
+  instead of storing them. It pays off disproportionately in this architecture: `blocks[1:]` is re-run
+  `loop_count`/`max_loops` times per forward and *every* pass retains its own activations, so activation memory
+  scales with the loop multiplier while parameter memory doesn't. Measured on `configs/fineweb_500m.yaml` at
+  `seq_len=1024`: peak memory at micro-batch 4 drops 27.7 GB -> 11.2 GB, which is what lets micro-batch 16 fit at
+  all (19.7 GB) where the unckeckpointed model OOMs above 4; throughput costs ~20-25% (18.6k -> 14.5k tok/s at
+  batch 4). Gradients are bit-identical either way. It's training-only — `DenseTransformer.forward` gates it on
+  `self.training and torch.is_grad_enabled() and kv_cache is None`, since recomputation under a KV cache would
+  re-append to that cache. `activation_bytes_per_token` models the checkpointed regime too (one `d_model` tensor
+  per block boundary plus the largest single block's transient recompute), so `auto_batch_size` spends the freed
+  memory on a bigger micro-batch automatically.
+
   `cfg.model.use_moe` replaces `blocks[1:]`'s `FeedForward` with `MoEFeedForward` — `n_experts` parallel
-  `FeedForward` instances plus an `MoERouter` (same `RMSNorm + Linear` shape as `ACTRouter`, but softmax over
+  experts (`BatchedExperts`) plus an `MoERouter` (same `RMSNorm + Linear` shape as `ACTRouter`, but softmax over
   `n_experts` logits instead of a single sigmoid). Routing is Mixtral-style top-`k` (`cfg.model.moe_top_k`,
   default `2`): each token's router probabilities are renormalized over just its top-`k` selected experts, and
   the FFN output is their weighted sum. Dispatch is capacity-based, mirroring `_sparse_ffn_delta`'s
   gather/compute/scatter idiom (fixed `capacity = round(moe_capacity_factor * n_tokens * moe_top_k / n_experts)`
-  per expert, `torch.topk` priority selection, `index_select` gather) but generalized to `n_experts` writers
+  per expert, `torch.topk` priority selection) but generalized to `n_experts` writers
   into one shared output buffer via `index_add` rather than `_sparse_ffn_delta`'s single-writer `index_copy` —
   with more than one expert able to write a nonzero value for the same token, `index_copy` would let a later
   expert's zero capacity-padding silently clobber an earlier expert's real output at that index. Tokens beyond
@@ -168,7 +180,21 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   weights and inputs, defeating the point of comparing two configs' eval numbers. A
   load-balancing auxiliary loss (`n_experts * sum(f_i * P_i)`, the standard Switch-Transformer formulation)
   keeps routing from collapsing onto a few experts; it's `forward()`'s `moe_aux_loss` return value, weighted by
-  `cfg.model.moe_aux_loss_weight` (mirrors `ponder_weight`'s role for ACT's ponder cost).
+  `cfg.model.moe_aux_loss_weight` (mirrors `ponder_weight`'s role for ACT's ponder cost). Note that
+  `_collect_moe_aux_loss` **sums** the per-layer aux losses, so a balanced model reports `moe_top_k * n_moe_layers`,
+  not `moe_top_k` — e.g. ~8.0 for `configs/tinystories_moe.yaml`'s 4 MoE layers at `top_k=2`, which is the
+  *healthy* value, not evidence of collapse. Measured per-layer aux at init is 2.01-2.10 against an ideal of 2.0,
+  and the capacity drop rate at a realistic batch (16x512 tokens) is under 1% on average.
+
+  All `n_experts` are computed in **one batched `baddbmm`**, not a Python loop over experts: `BatchedExperts`
+  stores each projection as a single stacked `(n_experts, in, out)` tensor (the transpose of `nn.Linear`'s
+  layout, so the forward is a plain `x @ W`), and the gather produces one `(n_experts, capacity, d_model)`
+  tensor. Total FLOPs are constant in `n_experts` — `capacity` shrinks as experts are added — so this keeps
+  step time roughly flat where the per-expert loop grew linearly with expert count. Measured fwd+bwd on one MoE
+  layer (16x512 tokens, bf16): 4 experts 3.16 -> 2.32 ms, 8 experts 4.30 -> 2.15 ms, 16 experts 8.34 -> 3.42 ms,
+  32 experts 24.0 -> 3.16 ms (7.6x). The forward is bit-identical to the old loop; only gradient accumulation
+  order differs (~1e-4). `MoEFeedForward` registers a load-state-dict pre-hook that transposes and stacks the
+  old per-expert `experts.{e}.{gate,up,down}_proj.*` keys, so MoE checkpoints predating this still load.
 
   `blocks[0]` always stays dense (it runs once per forward, not part of the recursive loop body); within
   `blocks[1:]`, `cfg.model.moe_dense_every` (opt-in) keeps every Nth block (1-indexed by position in the loop
@@ -202,6 +228,18 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   the LR for the *first* `optimizer.step()` — a plain `step / warmup_steps` ramp spends that entire first step at
   `lr=0`. The cosine then decays to `cfg.train.min_lr_ratio * lr` (default `0.1`) rather than to 0, since the tail
   of a run at a ~0 LR contributes nothing; set `min_lr_ratio: 0.0` for the old decay-to-zero behavior.
+
+  Checkpoints are **resumable**: `save_checkpoint` writes the optimizer state, LR-scheduler state and
+  `GradScaler` state alongside the weights/step/config, and `cfg.train.resume_from` (opt-in, default `null`)
+  restores all of it. Set it to a checkpoint path, or to the literal `"auto"` to pick the highest-numbered
+  `step_*.pt` in `output_dir` — so an interrupted run can be relaunched with its config unchanged. Without the
+  optimizer moments a "resumed" run restarts AdamW from zero momentum at warmup LR, which shows up as a loss
+  spike. An explicit `resume_from` path that doesn't exist raises rather than silently starting from scratch;
+  `"auto"` against an empty `output_dir` is just a fresh run. What is *not* restored is the DataLoader position
+  and RNG state, which trade off against each other: `train()` re-seeds off the resumed step so the loader draws
+  a different shuffle order rather than replaying batches already trained on. A resumed run is therefore
+  statistically equivalent to an uninterrupted one, not bit-identical — with `dropout: 0.0` it is bit-identical
+  (verified: same weights, same AdamW moments, same LR sequence).
 
   `cfg.train.eval_max_batches` (default `50`) caps how many batches each `evaluate()` call consumes. Uncapped —
   the previous behavior, restored with `null` — every eval walks the *entire* validation split, which is
@@ -264,7 +302,13 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   `last_epoch` set to the current step so the LR trajectory continues uninterrupted. Both tiers are sticky —
   `micro_chunk_size` only ever shrinks and CPU offload, once triggered, stays on for the rest of the run — and both
   are scoped to `auto_batch_size`: with it explicitly set to `False`, a CUDA OOM always ends the run cleanly as
-  before, so a manually-chosen or W&B-swept `batch_size` behaves exactly as configured. See
+  before, so a manually-chosen or W&B-swept `batch_size` behaves exactly as configured. The handler also resets
+  the `GradScaler`'s per-optimizer bookkeeping via `update(get_scale())` before retrying: an OOM at or after
+  `scaler.unscale_()` otherwise leaves the optimizer marked as already-unscaled, so the retry's own `unscale_`
+  raises `"unscale_() has already been called on this optimizer since the last update()"` — an uncaught crash
+  exactly when the backoff was supposed to save the run. Only reachable under `dtype: fp16`, since bf16/fp32
+  run with the scaler disabled; `update(get_scale())` rather than a bare `update()` so the aborted step isn't
+  mistaken for a successful one and used to grow the scale. See
   `configs/fineweb_500m.yaml`'s commented-out block for a worked example of overriding the defaults. `cfg.train.dtype` (`"fp32"`, `"fp16"`,
   or `"bf16"`, resolved via `resolve_dtype`)
   controls precision: the forward/loss pass runs under `torch.autocast` in that dtype while master weights and the

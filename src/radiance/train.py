@@ -209,6 +209,66 @@ def migrate_optimizer_to_cpu_offload(
     return new_optimizer
 
 
+def save_checkpoint(
+    path: Path,
+    raw_model: DenseTransformer,
+    optimizer: torch.optim.Optimizer,
+    scheduler: LambdaLR,
+    scaler: torch.amp.GradScaler,
+    step: int,
+    cfg: Config,
+) -> None:
+    """Write a resumable checkpoint.
+
+    Everything needed to continue the run goes in, not just the weights: without the optimizer's
+    moment buffers a resumed run restarts AdamW from zero momentum, which shows up as a visible
+    loss spike, and without the scheduler/step the LR trajectory restarts from warmup. `config` is
+    the full Config object (pickled), which is what generate.py reads back.
+
+    Not captured: the DataLoader's position, and RNG state. Those two trade off against each other,
+    and the resolution here favours data freshness — train() re-seeds off the resumed step, so the
+    loader draws a *different* shuffle order rather than replaying batches the run already trained
+    on (which is what restoring RNG state verbatim would cause). The cost is that dropout draws a
+    different mask stream, so a resumed run is statistically equivalent to an uninterrupted one
+    rather than bit-identical. With dropout disabled, resume reproduces an uninterrupted run
+    exactly — model weights, AdamW moments, and LR schedule all match to the bit.
+    """
+    torch.save(
+        {
+            "model": raw_model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "scaler": scaler.state_dict(),
+            "step": step,
+            "config": cfg,
+        },
+        path,
+    )
+
+
+def find_resume_checkpoint(cfg: Config) -> Path | None:
+    """Resolve cfg.train.resume_from to an actual checkpoint path.
+
+    "auto" picks the highest-numbered step_*.pt in output_dir, so a config can be re-launched
+    unchanged after an interruption and simply continue. Returns None when there's nothing to
+    resume from (including "auto" against an empty/missing output_dir, which is a fresh run, not
+    an error) — an explicit path that doesn't exist *is* an error, since silently starting a
+    50-hour run from scratch is far worse than failing loudly.
+    """
+    if not cfg.train.resume_from:
+        return None
+    if cfg.train.resume_from != "auto":
+        path = Path(cfg.train.resume_from)
+        if not path.exists():
+            raise FileNotFoundError(f"train.resume_from={cfg.train.resume_from!r} does not exist")
+        return path
+    candidates = sorted(
+        Path(cfg.train.output_dir).glob("step_*.pt"),
+        key=lambda p: int(p.stem.split("_")[1]),
+    )
+    return candidates[-1] if candidates else None
+
+
 def compute_loss(logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
     """Standard causal-LM loss: token t's logits predict token t+1.
 
@@ -357,6 +417,27 @@ def train(cfg: Config) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     step = 0
+    resume_path = find_resume_checkpoint(cfg)
+    if resume_path is not None:
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        raw_model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        scaler.load_state_dict(ckpt["scaler"])
+        step = ckpt["step"]
+        # Re-seed off the resumed step before the train iterator is created below. The DataLoader's
+        # shuffle order is drawn from the global RNG at iteration time, so without this a resumed
+        # run replays exactly the batches the original run already trained on — measurably slower
+        # progress than an uninterrupted run. Offsetting the seed draws a different order instead.
+        # (This is a mitigation, not exact resumption: the loader's true position isn't recoverable,
+        # least of all for a streaming dataset.)
+        set_seed(cfg.train.seed + step)
+        print(f"[radiance] resuming from {resume_path} at step {step:,}/{cfg.train.max_steps:,}")
+        if step >= cfg.train.max_steps:
+            print("[radiance] checkpoint is already at/past max_steps; nothing to do.")
+            wandb.finish()
+            return
+
     model.train()
     data_iter = iter(train_loader)
 
@@ -452,9 +533,20 @@ def train(cfg: Config) -> None:
                     wandb.log({"val/loss": val_loss}, step=step)
 
                 if step % cfg.train.save_every == 0:
-                    ckpt_path = output_dir / f"step_{step}.pt"
-                    torch.save({"model": raw_model.state_dict(), "step": step, "config": cfg}, ckpt_path)
+                    save_checkpoint(
+                        output_dir / f"step_{step}.pt", raw_model, optimizer, scheduler, scaler, step, cfg
+                    )
             except torch.cuda.OutOfMemoryError:
+                # An OOM anywhere at or after scaler.unscale_() below leaves this optimizer marked
+                # as already-unscaled for the current scaler generation, so the retry's own
+                # unscale_ would raise "unscale_() has already been called on this optimizer since
+                # the last update()" — an uncaught crash exactly when the backoff is supposed to be
+                # saving the run. update(get_scale()) resets that per-optimizer bookkeeping without
+                # disturbing the scale factor (a bare update() would treat the aborted step as a
+                # successful one and grow it). No-op unless dtype is fp16, since bf16/fp32 run with
+                # the scaler disabled.
+                if scaler.is_enabled():
+                    scaler.update(scaler.get_scale())
                 if cfg.train.auto_batch_size and micro_chunk_size > 1:
                     torch.cuda.empty_cache()
                     micro_chunk_size = max(1, micro_chunk_size // 2)

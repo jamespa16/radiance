@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from radiance.config import ModelConfig
 
@@ -182,6 +183,50 @@ def _moe_capacity(cfg: ModelConfig, n_tokens: int) -> int:
     return max(1, min(n_tokens, round(cfg.moe_capacity_factor * n_tokens * cfg.moe_top_k / cfg.n_experts)))
 
 
+class BatchedExperts(nn.Module):
+    """`n_experts` parallel FeedForwards whose weights live in single stacked 3-D tensors, so one
+    `baddbmm` per layer replaces a Python loop of `n_experts` separate small matmuls.
+
+    Mathematically identical to `nn.ModuleList([FeedForward(cfg) for _ in range(n_experts)])` run
+    one expert at a time; the difference is purely how the work is issued to the GPU. The loop
+    version's cost is dominated by launch overhead and low occupancy on narrow per-expert matmuls,
+    which is why it measured ~4x a single dense FFN while doing only ~2.5x its FLOPs.
+
+    Weights are stored (in_features, out_features) — the transpose of nn.Linear's (out, in) — so
+    the forward is a plain `x @ W` with no transpose per call. See MoEFeedForward's state-dict hook
+    for the conversion from the old per-expert Linear layout.
+    """
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        n_experts, d_model, ffn_dim = cfg.n_experts, cfg.d_model, cfg.ffn_dim
+        depth = max(1, cfg.ffn_depth)
+        self.gate_w = nn.Parameter(torch.empty(n_experts, d_model, ffn_dim))
+        self.gate_b = nn.Parameter(torch.zeros(n_experts, 1, ffn_dim))
+        self.up_w = nn.Parameter(torch.empty(n_experts, d_model, ffn_dim))
+        self.up_b = nn.Parameter(torch.zeros(n_experts, 1, ffn_dim))
+        self.hidden_w = nn.ParameterList(
+            [nn.Parameter(torch.empty(n_experts, ffn_dim, ffn_dim)) for _ in range(depth - 1)]
+        )
+        self.hidden_b = nn.ParameterList(
+            [nn.Parameter(torch.zeros(n_experts, 1, ffn_dim)) for _ in range(depth - 1)]
+        )
+        self.down_w = nn.Parameter(torch.empty(n_experts, ffn_dim, d_model))
+        self.down_b = nn.Parameter(torch.zeros(n_experts, 1, d_model))
+        self.dropout = nn.Dropout(cfg.dropout)
+        # DenseTransformer._init_weights only reaches nn.Linear/nn.Embedding submodules, and these
+        # are raw Parameters, so match its std here explicitly.
+        for w in (self.gate_w, self.up_w, self.down_w, *self.hidden_w):
+            nn.init.normal_(w, mean=0.0, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (n_experts, capacity, d_model) -> same shape."""
+        h = F.silu(torch.baddbmm(self.gate_b, x, self.gate_w)) * torch.baddbmm(self.up_b, x, self.up_w)
+        for w, b in zip(self.hidden_w, self.hidden_b):
+            h = F.silu(torch.baddbmm(b, h, w))
+        return self.dropout(torch.baddbmm(self.down_b, h, self.down_w))
+
+
 class MoEFeedForward(nn.Module):
     """Top-k routed MoE FFN, drop-in replacement for FeedForward: (*, d_model) -> (*, d_model),
     shape-agnostic over leading dims so it works both from TransformerBlock.forward's (batch,
@@ -209,9 +254,41 @@ class MoEFeedForward(nn.Module):
             raise ValueError(f"model.moe_top_k ({cfg.moe_top_k}) must be <= model.n_experts ({cfg.n_experts})")
         self.cfg = cfg
         self.router = MoERouter(cfg)
-        self.experts = nn.ModuleList([FeedForward(cfg) for _ in range(cfg.n_experts)])
+        self.experts = BatchedExperts(cfg)
         self.aux_loss_accum: torch.Tensor | None = None
         self._aux_loss_calls = 0
+        self._register_load_state_dict_pre_hook(self._upgrade_legacy_expert_keys, with_module=False)
+
+    def _upgrade_legacy_expert_keys(self, state_dict, prefix, *args) -> None:
+        """Convert checkpoints saved when experts were an nn.ModuleList of FeedForwards.
+
+        Old layout: `{prefix}experts.{e}.{gate,up,down}_proj.{weight,bias}` with nn.Linear's
+        (out_features, in_features) weights. New layout stacks them into one (n_experts, in, out)
+        tensor per projection, so each old weight is transposed and the experts concatenated.
+        """
+        legacy = [k for k in state_dict if k.startswith(f"{prefix}experts.") and k.split(".")[-2].endswith("_proj")]
+        if not legacy:
+            return
+        n_experts = self.cfg.n_experts
+        for old_name, new_w, new_b in (
+            ("gate_proj", "gate_w", "gate_b"),
+            ("up_proj", "up_w", "up_b"),
+            ("down_proj", "down_w", "down_b"),
+        ):
+            weights = [state_dict.pop(f"{prefix}experts.{e}.{old_name}.weight") for e in range(n_experts)]
+            biases = [state_dict.pop(f"{prefix}experts.{e}.{old_name}.bias") for e in range(n_experts)]
+            state_dict[f"{prefix}experts.{new_w}"] = torch.stack([w.t() for w in weights])
+            state_dict[f"{prefix}experts.{new_b}"] = torch.stack([b.unsqueeze(0) for b in biases])
+        for i in range(max(1, self.cfg.ffn_depth) - 1):
+            weights = [state_dict.pop(f"{prefix}experts.{e}.hidden_layers.{i}.weight") for e in range(n_experts)]
+            biases = [state_dict.pop(f"{prefix}experts.{e}.hidden_layers.{i}.bias") for e in range(n_experts)]
+            state_dict[f"{prefix}experts.hidden_w.{i}"] = torch.stack([w.t() for w in weights])
+            state_dict[f"{prefix}experts.hidden_b.{i}"] = torch.stack([b.unsqueeze(0) for b in biases])
+
+    def per_expert_parameter_count(self) -> int:
+        """Parameters belonging to a single expert — the stacked tensors divided by n_experts.
+        Used by num_active_parameters() to discount the experts a given token never activates."""
+        return sum(p.numel() for p in self.experts.parameters()) // self.cfg.n_experts
 
     def reset_aux_loss(self) -> None:
         self.aux_loss_accum = None
@@ -236,28 +313,32 @@ class MoEFeedForward(nn.Module):
         self._aux_loss_calls += 1
 
         capacity = _moe_capacity(self.cfg, n_tokens)
-        delta = flat_x.new_zeros(n_tokens, d_model)
-        for e, expert in enumerate(self.experts):
-            expert_weight = weight[:, e]
-            assigned_e = expert_weight > 0
-            # Priority within the assigned set is the router's own weight for this expert, not a
-            # random draw: when an expert is over capacity, the tokens it drops should be the ones
-            # it was least confident about. Router weights are in (0, 1], so `assigned + weight`
-            # keeps every assigned token strictly above every unassigned one (which score < 1),
-            # preserving the "assigned always outranks padding" property.
-            #
-            # This also makes routing deterministic. The previous random tiebreak ran in eval and
-            # generation too, so val/loss and even greedy decoding varied run to run for the same
-            # weights and inputs — which defeats comparing two configs' eval numbers.
-            priority = assigned_e.float() + expert_weight.detach().float()
-            token_idx = torch.topk(priority, k=capacity).indices
-            valid = assigned_e.index_select(0, token_idx)
 
-            gathered = flat_x.index_select(0, token_idx)
-            expert_out = expert(gathered) * valid.unsqueeze(-1).to(x.dtype)
-            w = (expert_weight.index_select(0, token_idx) * valid.to(expert_weight.dtype)).to(x.dtype)
-            delta = delta.index_add(0, token_idx, w.unsqueeze(-1) * expert_out)
+        # Per-expert token selection, computed for all experts at once. Priority within the
+        # assigned set is the router's own weight for this expert, not a random draw: when an
+        # expert is over capacity, the tokens it drops should be the ones it was least confident
+        # about. Router weights are in (0, 1], so `assigned + weight` keeps every assigned token
+        # strictly above every unassigned one (which scores < 1), preserving the "assigned always
+        # outranks capacity padding" property.
+        #
+        # This also makes routing deterministic. The previous random tiebreak ran in eval and
+        # generation too, so val/loss and even greedy decoding varied run to run for the same
+        # weights and inputs — which defeats comparing two configs' eval numbers.
+        priority = assigned.float() + weight.detach().float()  # (n_tokens, n_experts)
+        token_idx = priority.topk(capacity, dim=0).indices.t().contiguous()  # (n_experts, capacity)
+        valid = assigned.t().gather(1, token_idx)  # (n_experts, capacity) bool
+        gathered = flat_x[token_idx]  # (n_experts, capacity, d_model)
 
+        expert_out = self.experts(gathered) * valid.unsqueeze(-1).to(x.dtype)
+        w = (weight.t().gather(1, token_idx) * valid.to(weight.dtype)).to(x.dtype)
+
+        # index_add, not index_copy: a token can receive nonzero contributions from more than one
+        # expert (top_k >= 2 by default), and even at top_k=1 one expert's zero capacity-padding can
+        # land on an index another expert legitimately wrote. index_copy would let the padding
+        # clobber the real output; index_add sums correctly because `valid` zeroed the padding.
+        delta = flat_x.new_zeros(n_tokens, d_model).index_add(
+            0, token_idx.reshape(-1), (w.unsqueeze(-1) * expert_out).reshape(-1, d_model)
+        )
         return delta.view(orig_shape)
 
 
@@ -378,6 +459,18 @@ def _sparse_ffn_delta(
     return delta_flat.view(batch, seq_len, d_model)
 
 
+def _maybe_checkpoint(fn, *args, enabled: bool):
+    """Run fn(*args) under gradient checkpointing when `enabled`, else call it directly.
+
+    use_reentrant=False is the non-deprecated implementation and the only one that composes with
+    the rest of this model: it supports inputs that don't require grad (the cos/sin tables) and
+    doesn't require the output to require grad, both of which the reentrant version chokes on.
+    """
+    if not enabled:
+        return fn(*args)
+    return checkpoint(fn, *args, use_reentrant=False)
+
+
 def _run_loop_body(
     blocks: nn.ModuleList,
     x: torch.Tensor,
@@ -386,17 +479,25 @@ def _run_loop_body(
     still_running: torch.Tensor | None = None,
     capacity: int | None = None,
     kv_cache: "KVCache | None" = None,
+    grad_checkpoint: bool = False,
 ) -> torch.Tensor:
     """Runs `blocks` once. Attention is always fully dense. When still_running/capacity are given,
     each block's FFN is dispatched through the fixed-capacity sparse path (_sparse_ffn_delta)
     instead of densely.
+
+    grad_checkpoint recomputes each block's activations during backward instead of storing them —
+    see DenseTransformer.forward for why this matters disproportionately here.
     """
     for block in blocks:
         if still_running is None:
-            x = block(x, cos, sin, kv_cache)
+            x = _maybe_checkpoint(block, x, cos, sin, kv_cache, enabled=grad_checkpoint)
         else:
-            x = x + block.attn(block.ln1(x), cos, sin, kv_cache)
-            x = x + _sparse_ffn_delta(block.ffn, block.ln2(x), still_running, capacity)
+
+            def run_sparse(x, cos, sin, still_running, block=block):
+                x = x + block.attn(block.ln1(x), cos, sin, kv_cache)
+                return x + _sparse_ffn_delta(block.ffn, block.ln2(x), still_running, capacity)
+
+            x = _maybe_checkpoint(run_sparse, x, cos, sin, still_running, enabled=grad_checkpoint)
     return x
 
 
@@ -462,8 +563,10 @@ class DenseTransformer(nn.Module):
         loop_multiplier = self.cfg.max_loops if self.cfg.use_router else self.cfg.loop_count
         n_blocks_executed = 1 + loop_multiplier * (self.cfg.n_layers - 1)
         scale = (2 * n_blocks_executed) ** -0.5
+        # "down_w" catches BatchedExperts' stacked down-projection, the MoE counterpart of a dense
+        # block's ffn.down_proj.
         for name, param in self.named_parameters():
-            if name.endswith("out_proj.weight") or name.endswith("down_proj.weight"):
+            if name.endswith(("out_proj.weight", "down_proj.weight", "experts.down_w")):
                 param.data.mul_(scale)
 
     def new_kv_cache(self) -> KVCache:
@@ -511,14 +614,20 @@ class DenseTransformer(nn.Module):
 
         self._reset_moe_aux_loss()
 
+        # Gradient checkpointing is a backward-pass optimization, so it's pointless (and, with a
+        # kv_cache, actively wrong — recomputation would re-append to the cache) whenever there's no
+        # graph to build. Gate on both, so eval/generation always take the plain path.
+        grad_checkpoint = self.cfg.grad_checkpoint and self.training and torch.is_grad_enabled() and kv_cache is None
+
         # first block runs once; remaining n_layers - 1 blocks form the loop body
-        x = self.blocks[0](x, cos, sin, kv_cache)
+        x = _maybe_checkpoint(self.blocks[0], x, cos, sin, kv_cache, enabled=grad_checkpoint)
 
         if not self.cfg.use_router:
             # remaining n_layers - 1 blocks are looped loop_count times, sharing weights across iterations
             for _ in range(self.cfg.loop_count):
-                for block in self.blocks[1:]:
-                    x = block(x, cos, sin, kv_cache)
+                x = _run_loop_body(
+                    self.blocks[1:], x, cos, sin, kv_cache=kv_cache, grad_checkpoint=grad_checkpoint
+                )
             x = self.ln_f(x)
             logits = self.lm_head(x)
             zero = x.new_zeros(())
@@ -527,7 +636,7 @@ class DenseTransformer(nn.Module):
                 kv_cache.seq_len += seq_len
             return logits, zero, zero, moe_aux_loss
 
-        result = self._forward_act(x, cos, sin, kv_cache)
+        result = self._forward_act(x, cos, sin, kv_cache, grad_checkpoint)
         if kv_cache is not None:
             kv_cache.seq_len += seq_len
         return result
@@ -538,6 +647,7 @@ class DenseTransformer(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         kv_cache: KVCache | None = None,
+        grad_checkpoint: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Adaptive Computation Time (Graves 2016) over the loop body (blocks[1:]): each token
         position gets its own halting probability per iteration, halts once its cumulative
@@ -576,10 +686,12 @@ class DenseTransformer(nn.Module):
         for n in range(1, self.cfg.max_loops + 1):
             is_first_or_last = n == 1 or n == self.cfg.max_loops
             if not sparse_enabled or is_first_or_last:
-                new_x = _run_loop_body(self.blocks[1:], frozen_x, cos, sin, kv_cache=kv_cache)
+                new_x = _run_loop_body(
+                    self.blocks[1:], frozen_x, cos, sin, kv_cache=kv_cache, grad_checkpoint=grad_checkpoint
+                )
             else:
                 new_x = _run_loop_body(
-                    self.blocks[1:], frozen_x, cos, sin, still_running, capacity, kv_cache
+                    self.blocks[1:], frozen_x, cos, sin, still_running, capacity, kv_cache, grad_checkpoint
                 )
             p_n = self.router(new_x)
 
@@ -616,7 +728,7 @@ class DenseTransformer(nn.Module):
         sizing (see train.py). Identical to num_parameters() when no MoE layers exist."""
         total = self.num_parameters()
         for moe_ffn in self._moe_layers:
-            per_expert_params = sum(p.numel() for p in moe_ffn.experts[0].parameters())
+            per_expert_params = moe_ffn.per_expert_parameter_count()
             total -= per_expert_params * (self.cfg.n_experts - self.cfg.moe_top_k)
         return total
 
@@ -662,6 +774,17 @@ class DenseTransformer(nn.Module):
         loop_body_units = sum(10 * cfg.d_model + ffn_units(b) for b in self.blocks[1:])
         loop_multiplier = cfg.max_loops if cfg.use_router else cfg.loop_count
         total_block_units = block0_units + loop_multiplier * loop_body_units
+
+        if cfg.grad_checkpoint:
+            # Under per-block checkpointing only each block's *input* survives the forward pass;
+            # everything else is recomputed one block at a time during backward. So the resident
+            # cost is one d_model-wide tensor per block boundary, plus the transient peak of
+            # recomputing whichever single block is largest.
+            n_blocks_executed = 1 + loop_multiplier * (cfg.n_layers - 1)
+            largest_block_units = max(
+                [block0_units] + [10 * cfg.d_model + ffn_units(b) for b in self.blocks[1:]]
+            )
+            total_block_units = n_blocks_executed * cfg.d_model + largest_block_units
         embedding_units = cfg.d_model  # token embedding only (RoPE's cos/sin have no batch dim)
         block_bytes = activation_dtype_bytes * (total_block_units + embedding_units)
         # fp32, x3: logits + their gradient buffer + log_softmax's internal fp32 upcast working

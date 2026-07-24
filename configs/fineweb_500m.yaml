@@ -27,6 +27,10 @@ model:
   ffn_depth: 2
   dropout: 0.01
   max_seq_len: 1024
+  # Uncomment to trade ~20-25% throughput for a large drop in activation memory (27.7 -> 11.2 GB peak at
+  # micro-batch 4, seq_len 1024 — see CLAUDE.md). Worth it here because loop_count: 2 means blocks[1:]
+  # retain activations twice over; auto_batch_size accounts for it and will pick a bigger micro-batch.
+  # grad_checkpoint: true
   # ~498.5M parameters (verified via DenseTransformer(...).num_parameters() with the gpt2
   # tokenizer's 50257-token vocab). Scale n_layers up/down to retarget a different size.
 
@@ -51,6 +55,9 @@ train:
   eval_every: 100
   save_every: 100
   output_dir: checkpoints/fineweb_500m
+  # Uncomment to make an interrupted run continue from the newest checkpoint in output_dir instead of
+  # restarting — restores optimizer moments and the LR schedule, not just the weights.
+  # resume_from: auto
   seed: 42
   device: auto
   compile: true
