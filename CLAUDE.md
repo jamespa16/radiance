@@ -94,8 +94,24 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   restart in `train.py`) silently replay only what fits in the cache rather than fetching new data — a one-time
   warning is logged when this happens. Size `disk_cache_max_gb` to cover a full epoch, or skip disk-cache mode
   entirely, for open-ended multi-epoch training over a dataset larger than the cache.
-- **`model.py`** — `DenseTransformer`: token + learned positional embeddings, a stack of `n_layers` pre-norm
-  `TransformerBlock`s, final LayerNorm, and a weight-tied LM head. Each block is `CausalSelfAttention` (uses
+- **`model.py`** — `padded_vocab_size(vocab_size, multiple)` rounds the tokenizer's vocab up to a multiple of
+  `cfg.model.vocab_pad_multiple` (default `128`; `1` disables) before the model is built — `train.py` calls it
+  instead of passing `len(tokenizer)` straight through. A vocab that isn't a multiple of 64/128 leaves the
+  model's largest matmul (the `lm_head`) on a ragged tensor-core tile; the padding rows are unreachable by any
+  tokenizer id, so this is behavior-preserving, and it's worth ~9% of step time with the gpt2 tokenizer
+  (50257 -> 50304). `generate.py` reads the vocab width off the checkpoint rather than recomputing it (so
+  checkpoints predating this still load) and masks the padding columns before sampling, since a sampled padding
+  id would decode to nothing and corrupt the KV cache. Like `qk_norm`/`auto_batch_size`, this defaults *on*
+  rather than following the file's usual opt-in-`False` convention.
+
+  `DenseTransformer`: token + learned positional embeddings, a stack of `n_layers` pre-norm
+  `TransformerBlock`s, final LayerNorm, and a weight-tied LM head. `_scale_residual_init` shrinks every
+  projection that *writes into* the residual stream (`attn.out_proj`, `ffn.down_proj`, including each MoE
+  expert's) by `1/sqrt(2 * blocks_executed)` after `_init_weights` — the standard GPT-2 depth-scaled init, but
+  counting the blocks actually *executed* per forward (`1 + loop_multiplier * (n_layers - 1)`) rather than
+  `n_layers`, since `blocks[1:]` is re-run `loop_count`/`max_loops` times and so performs the residual writes of
+  a much deeper stack. Looping is exactly the regime where the unscaled init hurts most, because it multiplies
+  effective depth without adding parameters. Each block is `CausalSelfAttention` (uses
   `F.scaled_dot_product_attention` with `is_causal=True`, no manual mask construction) followed by `FeedForward`.
   `CausalSelfAttention` supports GQA via `model.n_kv_heads` (default `None` = standard multi-head attention, one
   K/V head per query head; when set, `n_heads` must be evenly divisible by it — see `ModelConfig.n_kv_heads_resolved`
@@ -143,7 +159,13 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   into one shared output buffer via `index_add` rather than `_sparse_ffn_delta`'s single-writer `index_copy` —
   with more than one expert able to write a nonzero value for the same token, `index_copy` would let a later
   expert's zero capacity-padding silently clobber an earlier expert's real output at that index. Tokens beyond
-  an expert's capacity are dropped (zero contribution from that expert, standard Switch-Transformer policy). A
+  an expert's capacity are dropped (zero contribution from that expert, standard Switch-Transformer policy);
+  which tokens get dropped is decided by the router's own weight for that expert, so an over-capacity expert
+  sheds the tokens it was least confident about. Both this and `_sparse_ffn_delta`'s ACT capacity selection are
+  deterministic outside training mode — `_sparse_ffn_delta` keeps a random tiebreak while `ffn.training` (an
+  unbiased choice among still-running positions) but falls back to sequence order in eval. Previously both drew
+  `torch.rand` unconditionally, which made `val/loss` and even greedy decoding vary run-to-run for identical
+  weights and inputs, defeating the point of comparing two configs' eval numbers. A
   load-balancing auxiliary loss (`n_experts * sum(f_i * P_i)`, the standard Switch-Transformer formulation)
   keeps routing from collapsing onto a few experts; it's `forward()`'s `moe_aux_loss` return value, weighted by
   `cfg.model.moe_aux_loss_weight` (mirrors `ponder_weight`'s role for ACT's ponder cost).
@@ -160,10 +182,32 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   `_run_loop_body` calls `block.ffn` generically regardless of which FFN type it is. See
   `configs/tinystories_moe.yaml` for a worked example.
 - **`train.py`** — plain PyTorch training loop (no HF `Trainer`): AdamW + cosine-with-warmup LR schedule
-  (`build_lr_scheduler`), manual loss computation (`compute_loss` shifts logits/labels by one position for standard
-  causal LM loss), gradient clipping, periodic W&B logging (`train/loss`, `train/lm_loss`, `train/ponder_cost`,
+  (`build_lr_scheduler`), manual loss computation (`compute_loss`), gradient clipping, periodic W&B logging
+  (`train/loss`, `train/lm_loss`, `train/ponder_cost`,
   `train/mean_loop_depth`, `train/lr`, `val/loss`), periodic checkpointing to `cfg.train.output_dir` (raw
-  `torch.save` of state dict + config), and periodic `evaluate()` against the validation split. The loop is
+  `torch.save` of state dict + config), and periodic `evaluate()` against the validation split.
+
+  `compute_loss` applies the causal-LM one-position shift to the *labels* (padding them with `ignore_index`),
+  not by slicing `logits[:, :-1]`. The slice is a non-contiguous view whose `.contiguous()`/`.view()` forces a
+  full copy of the `(batch, seq, vocab_size)` logits — the largest activation in the model — on every forward;
+  shifting labels instead makes `logits.view(-1, vocab_size)` a free reshape over exactly the same targets.
+  Worth ~7% of step time at the `configs/tinystories.yaml` size.
+
+  `build_param_groups` splits parameters into a weight-decayed group (`dim() >= 2`, i.e. the weight matrices,
+  including the tied embedding) and a non-decayed group (RMSNorm gains and biases). Passing `model.parameters()`
+  straight to `AdamW` would decay the 1-D scale/shift parameters too, which just fights the norm layers; decaying
+  only the matrices is what GPT-2/Llama/nanoGPT do.
+
+  `build_lr_scheduler`'s warmup ramps over `(step + 1)`, because `LambdaLR` evaluates the lambda at step 0 to set
+  the LR for the *first* `optimizer.step()` — a plain `step / warmup_steps` ramp spends that entire first step at
+  `lr=0`. The cosine then decays to `cfg.train.min_lr_ratio * lr` (default `0.1`) rather than to 0, since the tail
+  of a run at a ~0 LR contributes nothing; set `min_lr_ratio: 0.0` for the old decay-to-zero behavior.
+
+  `cfg.train.eval_max_batches` (default `50`) caps how many batches each `evaluate()` call consumes. Uncapped —
+  the previous behavior, restored with `null` — every eval walks the *entire* validation split, which is
+  unbounded for a streaming one and, at `configs/tinystories.yaml`'s settings, cost more wall-clock than all
+  1000 training steps combined. A fixed batch count also keeps `val/loss` comparable across configs whose
+  validation splits differ in size. The loop is
   step-based (`cfg.train.max_steps`), not epoch-based, and cycles the train `DataLoader` via manual `StopIteration`
   handling rather than epochs. Setting `cfg.train.tokens_per_param` (opt-in, default `null`) derives `max_steps`
   from model size instead of pinning it directly: once the model is built, `train()` overwrites `cfg.train.max_steps`

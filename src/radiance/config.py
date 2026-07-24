@@ -60,6 +60,11 @@ class ModelConfig:
     dropout: float = 0.1
     max_seq_len: int = 512
     rope_theta: float = 10000.0  # RoPE base frequency (Su et al. 2021)
+    vocab_pad_multiple: int = 128  # round the tokenizer's vocab up to a multiple of this for the
+    # token_emb/lm_head matmuls (see model.padded_vocab_size). The padding rows are unreachable by
+    # any tokenizer id, so this is behavior-preserving; it just keeps the model's largest matmul on
+    # a tensor-core tile boundary. Set to 1 to disable. Defaults on (like qk_norm/auto_batch_size,
+    # and unlike this file's usual opt-in-False convention) since it's a pure throughput win.
 
     @property
     def n_heads(self) -> int:
@@ -89,6 +94,8 @@ class TrainConfig:
     lr: float = 3.0e-4
     weight_decay: float = 0.01
     warmup_ratio: float = 0.04  # warmup_steps = round(max_steps * warmup_ratio)
+    min_lr_ratio: float = 0.1  # cosine decays to min_lr_ratio * lr, not to 0 — the tail of a run at
+    # a ~0 LR contributes nothing. 0.0 restores a decay-all-the-way-to-zero schedule.
     max_steps: int = 5000  # ignored (overwritten once the model is built) if tokens_per_param is set
     tokens_per_param: float | None = None  # opt-in: derive max_steps from model size instead of a fixed step
     # count — max_steps = round(tokens_per_param * num_active_parameters / (effective_batch_size *
@@ -116,6 +123,9 @@ class TrainConfig:
     grad_clip: float = 1.0
     log_every: int = 10
     eval_every: int = 500
+    eval_max_batches: int | None = 50  # cap on batches per evaluate() call. Uncapped, each eval walks
+    # the whole validation split (unbounded for a streaming one) every eval_every steps; a fixed count
+    # also keeps val/loss comparable across configs with different val split sizes. None = full pass.
     save_every: int = 1000
     output_dir: str = "checkpoints/run"
     seed: int = 42

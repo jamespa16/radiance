@@ -7,6 +7,22 @@ import torch.nn.functional as F
 from radiance.config import ModelConfig
 
 
+def padded_vocab_size(vocab_size: int, multiple: int) -> int:
+    """Round a tokenizer's vocab up to a multiple of `multiple` for the token_emb/lm_head matmuls.
+
+    A vocab that isn't a multiple of 64/128 leaves the largest matmul in the model (the lm_head,
+    d_model x vocab_size) on a ragged tile boundary, so the GPU runs a slow remainder tile. The
+    extra rows are pure padding: no tokenizer id ever maps to them, so they never appear as a
+    target, and the model simply learns to give them low probability (their embedding rows still
+    receive gradient through the softmax denominator). This is the standard nanoGPT trick.
+
+    `multiple <= 1` disables padding and returns vocab_size unchanged.
+    """
+    if multiple <= 1:
+        return vocab_size
+    return ((vocab_size + multiple - 1) // multiple) * multiple
+
+
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat([-x2, x1], dim=-1)
@@ -224,7 +240,16 @@ class MoEFeedForward(nn.Module):
         for e, expert in enumerate(self.experts):
             expert_weight = weight[:, e]
             assigned_e = expert_weight > 0
-            priority = assigned_e.float() + torch.rand(n_tokens, device=x.device, dtype=torch.float32)
+            # Priority within the assigned set is the router's own weight for this expert, not a
+            # random draw: when an expert is over capacity, the tokens it drops should be the ones
+            # it was least confident about. Router weights are in (0, 1], so `assigned + weight`
+            # keeps every assigned token strictly above every unassigned one (which score < 1),
+            # preserving the "assigned always outranks padding" property.
+            #
+            # This also makes routing deterministic. The previous random tiebreak ran in eval and
+            # generation too, so val/loss and even greedy decoding varied run to run for the same
+            # weights and inputs — which defeats comparing two configs' eval numbers.
+            priority = assigned_e.float() + expert_weight.detach().float()
             token_idx = torch.topk(priority, k=capacity).indices
             valid = assigned_e.index_select(0, token_idx)
 
@@ -329,7 +354,20 @@ def _sparse_ffn_delta(
 
     # Running positions score in [1, 2); non-running in [0, 1) — running always outranks
     # non-running; ties among an overflowing running set broken by a fresh random draw each call.
-    priority = flat_running.float() + torch.rand(n_tokens, device=h.device, dtype=torch.float32)
+    #
+    # Only in training mode: a random draw is the right unbiased choice while learning (no position
+    # is systematically starved of FFN across steps), but it also makes the forward pass
+    # irreproducible, which at eval/generation time means val/loss and even greedy decoding move
+    # run to run for identical weights and inputs. In eval the tiebreak falls back to sequence
+    # order, which is deterministic. Train/eval divergence here is the same kind dropout already
+    # has, and this path is documented as not bit-exact against the dense computation anyway.
+    if ffn.training:
+        tiebreak = torch.rand(n_tokens, device=h.device, dtype=torch.float32)
+    else:
+        # Descending over position, and strictly inside (0, 1) so a non-running token can never tie
+        # with a running one (which scores 1 + tiebreak).
+        tiebreak = torch.arange(n_tokens, 0, -1, device=h.device, dtype=torch.float32) / (n_tokens + 1)
+    priority = flat_running.float() + tiebreak
     _, token_idx = torch.topk(priority, k=capacity)  # static k, compile-friendly
     valid = flat_running.index_select(0, token_idx)  # (capacity,) bool
 
@@ -392,6 +430,7 @@ class DenseTransformer(nn.Module):
             self.router = ACTRouter(cfg)
 
         self.apply(self._init_weights)
+        self._scale_residual_init()
         if self.router is not None:
             # Bias the halting unit against halting immediately (Graves ACT): sigmoid(-1) ≈ 0.27,
             # encouraging some early pondering rather than collapsing to a single pass at init.
@@ -404,6 +443,28 @@ class DenseTransformer(nn.Module):
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def _scale_residual_init(self) -> None:
+        """Scale every projection that *writes into* the residual stream by 1/sqrt(n_residual_writes).
+
+        Each block adds two terms to the residual stream (attn.out_proj and ffn.down_proj). With
+        all of them initialized at the same std, the residual's variance grows linearly in the
+        number of writes, so the deeper the stack the larger the activations entering ln_f — the
+        standard GPT-2 fix is to shrink these particular projections at init so the *summed*
+        residual keeps roughly unit scale.
+
+        The count that matters here is the number of writes actually executed per forward, not
+        n_layers: blocks[1:] is a weight-shared loop body re-run loop_count (or, in router mode,
+        max_loops) times, so a 6-layer model at loop_count=4 performs the residual writes of a
+        21-block stack and needs to be scaled as such. This is exactly the regime where the
+        unscaled init hurts most, since looping multiplies depth without adding parameters.
+        """
+        loop_multiplier = self.cfg.max_loops if self.cfg.use_router else self.cfg.loop_count
+        n_blocks_executed = 1 + loop_multiplier * (self.cfg.n_layers - 1)
+        scale = (2 * n_blocks_executed) ** -0.5
+        for name, param in self.named_parameters():
+            if name.endswith("out_proj.weight") or name.endswith("down_proj.weight"):
+                param.data.mul_(scale)
 
     def new_kv_cache(self) -> KVCache:
         """Builds an empty KVCache sized for this model/config: one slot for blocks[0] plus one

@@ -16,7 +16,11 @@ def load_checkpoint(path: str, device: str) -> tuple[DenseTransformer, Config, P
     cfg: Config = ckpt["config"]
 
     tokenizer = build_tokenizer(cfg)
-    model = DenseTransformer(cfg.model, vocab_size=len(tokenizer))
+    # Must match training's padded vocab (see model.padded_vocab_size), or load_state_dict fails on
+    # the token_emb/lm_head shapes. Read the width off the checkpoint itself rather than recomputing
+    # it, so checkpoints saved before vocab padding existed still load.
+    vocab_size = ckpt["model"]["token_emb.weight"].shape[0]
+    model = DenseTransformer(cfg.model, vocab_size=vocab_size)
     model.load_state_dict(ckpt["model"])
     model.to(device)
     model.eval()
@@ -45,6 +49,12 @@ def generate(
         )
         logits, _, _, _ = model(next_input, kv_cache=kv_cache)
         logits = logits[:, -1, :]
+
+        # Mask the vocab-padding rows (see model.padded_vocab_size): no tokenizer id maps to them,
+        # so sampling one would decode to nothing and corrupt the KV cache for every later step.
+        # They're only ever trained down implicitly via the softmax denominator, never to -inf.
+        if logits.size(-1) > len(tokenizer):
+            logits[:, len(tokenizer) :] = float("-inf")
 
         if temperature == 0:
             next_token = logits.argmax(dim=-1, keepdim=True)

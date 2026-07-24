@@ -14,7 +14,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from radiance.config import Config, load_config, resolve_device, resolve_dtype
 from radiance.data import build_dataloaders, build_tokenizer
-from radiance.model import DenseTransformer
+from radiance.model import DenseTransformer, padded_vocab_size
 
 
 def set_seed(seed: int) -> None:
@@ -27,14 +27,43 @@ def set_seed(seed: int) -> None:
 def build_lr_scheduler(optimizer: torch.optim.Optimizer, cfg: Config) -> LambdaLR:
     warmup_steps = cfg.train.warmup_steps
     max_steps = cfg.train.max_steps
+    min_lr_ratio = cfg.train.min_lr_ratio
 
     def lr_lambda(step: int) -> float:
+        # step + 1: LambdaLR evaluates the lambda at step 0 to set the LR for the *first*
+        # optimizer.step(), so a plain step/warmup_steps ramp spends that entire first step at
+        # lr=0 — a wasted update. Ramping over (step + 1) makes the first step take a real,
+        # nonzero LR and still reach the full LR exactly at the end of warmup.
         if step < warmup_steps:
-            return step / max(1, warmup_steps)
+            return (step + 1) / max(1, warmup_steps)
         progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
-        return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+        # Decay to min_lr_ratio * lr rather than all the way to 0: the last steps of a run at a
+        # ~0 LR contribute nothing, and a small floor is standard (Llama/Chinchilla both keep one).
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
     return LambdaLR(optimizer, lr_lambda)
+
+
+def build_param_groups(model: torch.nn.Module, weight_decay: float) -> list[dict]:
+    """Split parameters into decayed / non-decayed groups.
+
+    AdamW over model.parameters() applies weight decay uniformly, which decays RMSNorm gains and
+    every bias. Those are 1-D scale/shift parameters with no "shrink toward zero is a useful
+    prior" interpretation — decaying them just fights the norm layers. Standard practice
+    (GPT-2/Llama/nanoGPT) is to decay only the >=2-D weight matrices, which is what this does.
+    The tied token_emb/lm_head weight is 2-D and stays in the decayed group, matching those
+    references.
+    """
+    decay, no_decay = [], []
+    for param in model.parameters():
+        if not param.requires_grad:
+            continue
+        (decay if param.dim() >= 2 else no_decay).append(param)
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
 
 
 def estimate_batch_size(raw_model: DenseTransformer, cfg: Config, device: str, device_type: str) -> tuple[int, int]:
@@ -156,7 +185,10 @@ def migrate_optimizer_to_cpu_offload(
     training OOM'd before its first successful step) are left to lazy-init on first step(), matching
     fresh-AdamW behavior."""
     new_optimizer = CPUOffloadAdamW(
-        model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay, device=device
+        build_param_groups(model, cfg.train.weight_decay),
+        lr=cfg.train.lr,
+        weight_decay=cfg.train.weight_decay,
+        device=device,
     )
     # LambdaLR.__init__ requires 'initial_lr' already present in param_groups whenever it's
     # constructed with last_epoch != -1 (its "resuming a schedule" path) — copy it over from the old
@@ -178,23 +210,48 @@ def migrate_optimizer_to_cpu_offload(
 
 
 def compute_loss(logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
-    shift_logits = logits[:, :-1, :].contiguous()
-    shift_labels = input_ids[:, 1:].contiguous()
-    return F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+    """Standard causal-LM loss: token t's logits predict token t+1.
+
+    The shift is done on the *labels* (cheap, one int64 row) rather than by slicing the logits.
+    Slicing logits[:, :-1] yields a non-contiguous view whose .contiguous()/.view() forces a full
+    copy of the (batch, seq, vocab_size) tensor — the single largest activation in the model — on
+    every forward. Padding the labels with ignore_index instead lets logits.view(-1, vocab_size)
+    be a free reshape of the already-contiguous tensor, and cross_entropy skips the padded
+    positions, giving a numerically identical mean over exactly the same (seq - 1) targets.
+    """
+    labels = torch.cat([input_ids[:, 1:], input_ids.new_full((input_ids.size(0), 1), -100)], dim=1)
+    return F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100)
 
 
 @torch.no_grad()
-def evaluate(model: DenseTransformer, val_loader, device: str, device_type: str, dtype: torch.dtype) -> float:
+def evaluate(
+    model: DenseTransformer,
+    val_loader,
+    device: str,
+    device_type: str,
+    dtype: torch.dtype,
+    max_batches: int | None = None,
+) -> float:
+    """Mean LM loss over the validation loader, capped at max_batches batches.
+
+    The cap matters because this runs every eval_every steps: uncapped, a large validation split
+    (or a streaming one, which has no length at all) makes each eval cost a meaningful fraction of
+    the run. A fixed batch count also keeps val/loss comparable across configs whose val split
+    sizes differ. max_batches=None keeps the original full-pass behavior.
+    """
     model.eval()
-    losses = []
-    for batch in val_loader:
+    total, count = 0.0, 0
+    for i, batch in enumerate(val_loader):
+        if max_batches is not None and i >= max_batches:
+            break
         input_ids = batch["input_ids"].to(device)
         with torch.autocast(device_type=device_type, dtype=dtype, enabled=dtype != torch.float32):
             logits, _, _, _ = model(input_ids)
             loss = compute_loss(logits, input_ids)
-        losses.append(loss.item())
+        total += loss.item()
+        count += 1
     model.train()
-    return sum(losses) / len(losses) if losses else float("nan")
+    return total / count if count else float("nan")
 
 
 def train(cfg: Config) -> None:
@@ -211,7 +268,13 @@ def train(cfg: Config) -> None:
 
     tokenizer = build_tokenizer(cfg)
 
-    raw_model = DenseTransformer(cfg.model, vocab_size=len(tokenizer)).to(device)
+    vocab_size = padded_vocab_size(len(tokenizer), cfg.model.vocab_pad_multiple)
+    if vocab_size != len(tokenizer):
+        print(
+            f"[radiance] padding vocab {len(tokenizer):,} -> {vocab_size:,} "
+            f"(multiple of {cfg.model.vocab_pad_multiple}) for tensor-core-aligned lm_head matmuls"
+        )
+    raw_model = DenseTransformer(cfg.model, vocab_size=vocab_size).to(device)
 
     if cfg.train.auto_batch_size:
         if device_type == "cuda":
@@ -247,7 +310,9 @@ def train(cfg: Config) -> None:
         )
 
     optimizer = AdamW(
-        model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay, fused=(device_type == "cuda")
+        build_param_groups(model, cfg.train.weight_decay),
+        lr=cfg.train.lr,
+        fused=(device_type == "cuda"),
     )
     scheduler = build_lr_scheduler(optimizer, cfg)
 
@@ -381,7 +446,9 @@ def train(cfg: Config) -> None:
                     )
 
                 if val_loader is not None and step % cfg.train.eval_every == 0:
-                    val_loss = evaluate(model, val_loader, device, device_type, dtype)
+                    val_loss = evaluate(
+                        model, val_loader, device, device_type, dtype, cfg.train.eval_max_batches
+                    )
                     wandb.log({"val/loss": val_loss}, step=step)
 
                 if step % cfg.train.save_every == 0:
