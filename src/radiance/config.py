@@ -30,18 +30,78 @@ class ModelConfig:
     # default). Each K/V head is shared by n_heads // n_kv_heads_resolved query heads. Must evenly
     # divide n_heads — see n_kv_heads_resolved.
     qk_norm: bool = True  # RMSNorm applied per-head to q/k (over head_dim) before RoPE, for training
-    # stability across blocks[1:]'s weight-shared loop iterations. Defaults to True (a behavior change
-    # for every existing config) unlike this file's usual opt-in-False convention — see CLAUDE.md.
+    # stability across blocks[1:]'s weight-shared loop iterations.
+    value_residual: bool = True  # mix each block's attention values with blocks[0]'s: v = lam * v +
+    # (1 - lam) * v_first, with a learned per-block scalar `lam` initialised to 1.0. At init this is
+    # therefore *exactly* the un-mixed model; the mixing only appears if training moves lam. Gives
+    # every block (and, since blocks[1:] is a weight-shared loop, every iteration) direct access to
+    # the first block's values (ResFormer / nanoGPT-speedrun).
+    attn_out_gate: bool = True  # per-head sigmoid gate on the attention output before out_proj.
+    # Written as 2 * sigmoid(Linear(x)) with the Linear zero-initialised, so the gate is exactly
+    # 1.0 at init (a plain sigmoid cannot reach 1) and the model starts identical to an ungated one.
+    mtp_heads: int = 1  # multi-token prediction: how many future tokens each position predicts.
+    # 1 (default) is ordinary next-token prediction — exactly the previous behavior. Higher values
+    # add auxiliary heads predicting t+2, t+3, ... which densifies the training signal per token
+    # and lays the groundwork for speculative decoding. Left off by default despite this file's
+    # on-by-default convention because the cost is real rather than nominal: each head materialises
+    # its own (batch, seq, vocab_size) logits tensor — the largest activation in the model — so
+    # defaulting to 2 would quietly halve the batch size auto_batch_size can fit.
+    mtp_weight: float = 0.3  # coefficient on the averaged auxiliary-head loss
+    z_loss_weight: float = 1.0e-4  # coefficient on the log-Z regulariser mean(logsumexp(logits)^2),
+    # which keeps logit scale from drifting. Mirrors ponder_weight/moe_aux_loss_weight's role and
+    # placement. Applied to the *training* loss only — evaluate()'s val/loss stays pure LM loss.
+    # 0.0 disables. Matters more here than in a plain transformer because looping multiplies
+    # effective depth without adding parameters.
     n_layers: int = 6
     loop_count: int = 1
+    loop_iter_conditioning: str = "norm_gains"  # "norm_gains" (default), "lora", or "none". The
+    # loop body is weight-shared, so without this iteration 5 is computationally indistinguishable
+    # from iteration 1 except through residual-stream norm drift — the block has no idea how deep
+    # into the recursion it is. "norm_gains" gives each loop iteration its own RMSNorm gains (the
+    # adaLN trick) plus its own router biases, costing ~2 * loop_multiplier * d_model parameters per
+    # block; "lora" additionally gives each iteration a rank-loop_lora_rank adapter on the attention
+    # and FFN projections. Inert whenever the loop only runs once (loop_count: 1, the default),
+    # since there is then exactly one iteration to condition on.
+    loop_lora_rank: int = 8  # rank of the per-iteration adapters when loop_iter_conditioning="lora"
+    loop_input_injection: bool = True  # re-inject the token embedding at the start of every loop
+    # iteration after the first: h = h + W_inj @ x0. Without an anchor a deep recurrence drifts;
+    # with one it trains stably to far higher iteration counts. W_inj is zero-initialised, so this
+    # is exactly a no-op at init regardless of loop count and can only be learned into.
+    loop_count_min: int | None = None  # stochastic loop depth: each training step samples the loop
+    loop_count_max: int | None = None  # count uniformly from [loop_count_min, loop_count_max].
+    # Both default to None, resolving to loop_count, which collapses the range to a point and makes
+    # sampling inert. Set them to train one model across a range of depths, which both regularises
+    # the recursion and lets inference dial compute up or down (radiance-generate --loops). Eval and
+    # generation always use loop_count_max so their numbers stay deterministic. Note each distinct
+    # sampled count compiles its own graph, so raise torch._dynamo.config.cache_size_limit (default
+    # 8) if the range is wide — train.py does this automatically.
+    loop_bptt_window: int | None = None  # backpropagate through only the last N loop iterations,
+    # running earlier ones under no_grad. Activation memory becomes O(N) instead of O(loop_count) —
+    # a stronger lever than grad_checkpoint on this axis, and composable with it. Off (full BPTT)
+    # by default: truncating the gradient is an approximation you reach for deliberately, not a
+    # free win like the zero-init features above.
     use_router: bool = False  # opt-in: replace fixed loop_count with per-token ACT halting
     max_loops: int = 6  # hard cap on loop iterations when use_router=True; independent of loop_count
     ponder_weight: float = 1.0e-2  # tau: coefficient on the ponder-cost loss term
     halt_epsilon: float = 0.01  # ACT epsilon: a position halts once cumulative halting prob >= 1 - halt_epsilon
-    act_ffn_capacity_ratio: float = 1.0  # fraction of batch*seq_len tokens the FFN sublayer actually
-    # processes per interior ACT loop iteration (first/last iteration always run fully dense — see
-    # DenseTransformer._forward_act). 1.0 (default) disables the fixed-capacity sparse-FFN path
-    # entirely, so the loop is byte-for-byte identical to the fully-dense implementation.
+    act_capacity_ratio: float = 1.0  # fraction of each sequence's positions that an interior ACT
+    # loop iteration actually computes — attention *and* FFN, i.e. the whole block. This is what
+    # makes router mode save wall-clock: below 1.0, iterations past the first process only the
+    # highest-priority still-running positions, and everything else is carried forward unchanged
+    # while its keys/values are served from the previous iteration's retained store.
+    #
+    # It is an approximation, not an exact speedup, and knowing why matters. Only the *first* block
+    # of the loop body has genuinely invariant K/V for a halted position (K and V are per-position
+    # projections of frozen_x, which stops changing). Later blocks' K/V do drift, because block 1's
+    # output at a halted position mixes in attention over still-running positions that keep
+    # evolving — see tests/test_act_kv_invariance.py. Reusing them is the same class of
+    # approximation act_ffn_capacity_ratio already made, extended to the whole block.
+    #
+    # 1.0 (default) disables it entirely, leaving the loop byte-for-byte identical to the dense
+    # implementation. Incompatible with grad_checkpoint (see DenseTransformer.__init__).
+    act_ffn_capacity_ratio: float = 1.0  # the older, narrower version of the above: sparsifies only
+    # the FFN sublayer and leaves attention fully dense, so it saves much less. Superseded by
+    # act_capacity_ratio; kept so existing configs keep working. Setting both below 1.0 raises.
     ffn_mult: float = 4.0  # ffn_dim = round(d_model * ffn_mult)
     ffn_depth: int = 2
     use_moe: bool = False  # opt-in: blocks[1:] (the shared loop body) use MoEFeedForward instead of
@@ -53,13 +113,55 @@ class ModelConfig:
     # moe_top_k / n_experts); tokens routed to an already-full expert are dropped (zero contribution
     # from that expert — see MoEFeedForward).
     moe_aux_loss_weight: float = 1.0e-2  # coefficient on the load-balancing aux loss term; mirrors
-    # ponder_weight's role/placement for ACT's ponder cost.
+    # ponder_weight's role/placement for ACT's ponder cost. Only used when moe_balance includes the
+    # aux-loss term.
+    moe_balance: str = "both"  # how expert load is balanced: "aux_loss" (the gradient-based term
+    # above, the previous behavior), "bias" (a non-learned per-expert bias on the routing logits,
+    # nudged after each optimizer step toward whichever experts are under-loaded), or "both"
+    # (default, DeepSeek-V3's actual configuration). The bias term balances load without adding a
+    # gradient that competes with the LM objective, which is what the aux loss alone does.
+    moe_bias_update_rate: float = 1.0e-3  # step size for the "bias"/"both" balancing update
+    moe_n_shared: int = 1  # always-on expert(s) added to every token's FFN output alongside the
+    # routed ones (DeepSeekMoE). Absorbs the computation every token needs, so the routed experts
+    # are free to specialise instead of each re-learning the common case. 0 disables.
+    moe_shared_ffn_mult: float = 1.0  # shared expert width as a fraction of ffn_dim
+    moe_expert_ffn_mult: float | None = None  # width of each routed expert as a fraction of
+    # ffn_dim. None (default) means ffn_dim, i.e. unchanged. Set below 1.0 to make experts
+    # fine-grained: n_experts: 32, moe_top_k: 8, moe_expert_ffn_mult: 0.25 activates the same
+    # parameter count per token as 8 experts at top_k 2, but from 4x as many combinations. The
+    # batched baddbmm dispatch keeps step time nearly flat in expert count, which is what makes
+    # this affordable.
+    moe_eval_full_capacity: bool = True  # outside training, size expert capacity to the actual
+    # per-expert load instead of the moe_capacity_factor formula, so no token is ever dropped.
+    # Capacity limits exist to bound *training* throughput and memory; at eval they only discard
+    # computation, and because the limit scales with the token count they made a token's output
+    # depend on how many other tokens were passed alongside it — the same prompt scored differently
+    # in a batch than alone, and incremental decoding diverged from a full forward.
     moe_dense_every: int | None = None  # opt-in: every Nth block (1-indexed by position within
     # blocks[1:]) uses a plain dense FeedForward instead of MoEFeedForward even when use_moe=True.
     # None (default) means every block in blocks[1:] is MoE.
+    mup_base_d_model: int | None = None  # muP: the width this config's hyperparameters were tuned
+    # at. None (default) resolves to d_model itself, making the width multiplier exactly 1.0 and
+    # every muP correction a no-op — so this is on by default yet changes nothing until you sweep
+    # d_model away from the base. Set it once (to the small proxy width you tuned lr at) and the
+    # init scale, per-tensor LRs and output logit scale all track d_model automatically, instead of
+    # the optimal lr silently moving every time the model gets wider. See mup_width_mult.
     dropout: float = 0.1
     max_seq_len: int = 512
     rope_theta: float = 10000.0  # RoPE base frequency (Su et al. 2021)
+    doc_attention_mask: bool = True  # mask attention at document boundaries. data.py packs many
+    # documents into each seq_len block joined by EOS, and plain causal attention lets every token
+    # attend back across those joins into unrelated text — so the model spends capacity predicting
+    # one document's tokens from another's. Document ids are recovered in-model from the EOS
+    # positions (no data-pipeline or cache change), and the mask is built once per forward with
+    # torch's flex_attention and reused across every block and loop iteration. Automatically
+    # disabled without CUDA (flex_attention is impractically slow on CPU) and during generation
+    # (a single prompt is one document), both of which fall back to the plain SDPA path.
+    loop_attn_windows: list[int] | None = None  # opt-in: per-iteration attention window sizes, e.g.
+    # [128, 128, 512, 512] to make the early loop passes local and the later ones global. Indexed by
+    # loop iteration and clamped at the end of the list. A knob that only exists because the
+    # architecture loops — the same weights get a different receptive field on each pass. Requires
+    # doc_attention_mask (it rides the same flex_attention BlockMask). None = every pass is global.
     grad_checkpoint: bool = False  # opt-in: recompute each block's activations during backward instead
     # of storing them. Trades ~20-30% throughput for a large drop in activation memory, and it pays off
     # disproportionately here because blocks[1:] is re-run loop_count/max_loops times per forward with
@@ -90,6 +192,47 @@ class ModelConfig:
     def ffn_dim(self) -> int:
         return round(self.d_model * self.ffn_mult)
 
+    @property
+    def moe_expert_dim(self) -> int:
+        """Hidden width of one routed expert. Defaults to ffn_dim (a dense FFN's width)."""
+        if self.moe_expert_ffn_mult is None:
+            return self.ffn_dim
+        return max(1, round(self.ffn_dim * self.moe_expert_ffn_mult))
+
+    @property
+    def moe_shared_dim(self) -> int:
+        """Hidden width of the always-on shared expert."""
+        return max(1, round(self.ffn_dim * self.moe_shared_ffn_mult))
+
+    @property
+    def loop_multiplier(self) -> int:
+        """The maximum number of times the loop body (blocks[1:]) can run in one forward pass.
+
+        The single source of truth for everything that must be sized to the *worst case* rather
+        than the typical one: the KV cache's slot count, the depth-scaled residual init, and the
+        activation-memory estimate. Under stochastic depth the actual count varies per step, so
+        each of those must use loop_count_max, not loop_count.
+        """
+        if self.use_router:
+            return self.max_loops
+        return self.loop_count_max or self.loop_count
+
+    @property
+    def mup_width_mult(self) -> float:
+        """d_model relative to the width the config's hyperparameters were tuned at.
+
+        Exactly 1.0 when mup_base_d_model is unset, which makes every muP correction an identity —
+        that's what lets muP default on without perturbing any existing config.
+
+        Note what is deliberately *not* corrected: the attention logit scale stays 1/sqrt(head_dim)
+        rather than becoming 1/head_dim. muP's 1/d attention scale applies when the head dimension
+        grows with width; here head_dim is a fixed config constant and width grows by adding heads
+        (n_heads = d_model // head_dim), so each q·k dot product is a sum over a fixed number of
+        terms and its variance does not grow with d_model.
+        """
+        base = self.mup_base_d_model or self.d_model
+        return self.d_model / base
+
 
 @dataclass
 class TrainConfig:
@@ -97,11 +240,28 @@ class TrainConfig:
     grad_accum_steps: int = 1  # micro-batches (of batch_size each) accumulated per optimizer.step();
     # effective_batch_size = batch_size * grad_accum_steps. Raise this instead of batch_size to grow the
     # effective batch beyond what fits in VRAM.
-    lr: float = 3.0e-4
+    lr: float = 3.0e-4  # AdamW's LR. Under optimizer="muon" this governs only the tensors AdamW
+    # still owns (embeddings, norm gains, biases, routers/gates) — see optim.build_muon_param_groups.
+    optimizer: str = "muon"  # "muon" (default) or "adamw". Muon orthogonalises the momentum update
+    # of every hidden weight matrix via a Newton-Schulz iteration, which lets it take a much larger
+    # step than AdamW at equal stability; embeddings/norms/biases stay on an auxiliary AdamW. Set
+    # to "adamw" for the previous behavior.
+    muon_lr: float = 0.02  # LR for the Muon group only. Deliberately a separate field rather than a
+    # multiplier on `lr`: Muon's normalised update wants a ~50x larger LR, so folding the two
+    # together would silently invalidate every config's tuned `lr`.
+    muon_momentum: float = 0.95
     weight_decay: float = 0.01
     warmup_ratio: float = 0.04  # warmup_steps = round(max_steps * warmup_ratio)
-    min_lr_ratio: float = 0.1  # cosine decays to min_lr_ratio * lr, not to 0 — the tail of a run at
-    # a ~0 LR contributes nothing. 0.0 restores a decay-all-the-way-to-zero schedule.
+    min_lr_ratio: float = 0.1  # the schedule decays to min_lr_ratio * lr, not to 0 — the tail of a
+    # run at a ~0 LR contributes nothing. 0.0 restores a decay-all-the-way-to-zero schedule.
+    lr_schedule: str = "cosine"  # "cosine" (default) or "wsd" (warmup-stable-decay: hold at full lr,
+    # then decay only over the last wsd_decay_ratio of the run). Unlike most additions in this file
+    # this stays *off* by default: it is not a bug fix, and switching it would silently reshape the
+    # LR trajectory of every existing config whose lr was tuned against cosine. WSD's advantage is
+    # operational — a run can be branched or extended from a mid-training checkpoint without
+    # invalidating the schedule, which cosine cannot do since its shape depends on max_steps.
+    wsd_decay_ratio: float = 0.2  # only used when lr_schedule == "wsd": fraction of max_steps spent
+    # in the final decay phase.
     max_steps: int = 5000  # ignored (overwritten once the model is built) if tokens_per_param is set
     tokens_per_param: float | None = None  # opt-in: derive max_steps from model size instead of a fixed step
     # count — max_steps = round(tokens_per_param * num_active_parameters / (effective_batch_size *

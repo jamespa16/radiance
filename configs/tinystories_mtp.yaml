@@ -1,0 +1,53 @@
+# Worked example: multi-token prediction.
+#
+# Each position predicts the next 3 tokens rather than 1: the trunk predicts t+1 as usual, and two
+# auxiliary heads chain off its final hidden state to predict t+2 and t+3. Every head shares the
+# trunk's unembedding, so a head costs one transformer block rather than another
+# d_model x vocab_size matrix.
+#
+# The heads are training-only — evaluate() and radiance-generate skip them entirely, so val/loss
+# stays a pure next-token number and sampling is unaffected. They are also excluded from
+# num_active_parameters(), since they never run at inference and would otherwise inflate a
+# tokens_per_param-derived max_steps.
+#
+# Cost worth knowing: each head materialises its own (batch, seq, vocab_size) logits tensor during
+# training — the largest activation in the model. That is why mtp_heads defaults to 1, and why
+# batch_size here is lower than the reference config's.
+
+run_name: tinystories-mtp
+
+data:
+  dataset: roneneldan/TinyStories
+  text_column: text
+  tokenizer: gpt2
+  seq_len: 512
+  num_workers: 4
+  cache_dir: .cache/radiance/tokenized
+
+model:
+  d_model: 256
+  head_dim: 64
+  n_layers: 6
+  loop_count: 1
+  ffn_mult: 4.0
+  ffn_depth: 3
+  dropout: 0.0
+  max_seq_len: 512
+
+  mtp_heads: 3      # trunk (t+1) plus two auxiliary heads (t+2, t+3)
+  mtp_weight: 0.3   # weight on the averaged auxiliary loss
+
+train:
+  batch_size: 16
+  lr: 3.0e-4
+  muon_lr: 0.02
+  warmup_ratio: 0.2
+  max_steps: 2000
+  eval_every: 100
+  save_every: 500
+  output_dir: checkpoints/tinystories_mtp
+  dtype: bf16
+
+wandb:
+  project: radiance
+  mode: online

@@ -9,12 +9,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import wandb
-from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
 from radiance.config import Config, load_config, resolve_device, resolve_dtype
 from radiance.data import build_dataloaders, build_tokenizer
 from radiance.model import DenseTransformer, padded_vocab_size
+from radiance.optim import build_optimizer, migrate_optimizer_to_cpu_offload
 
 
 def set_seed(seed: int) -> None:
@@ -28,6 +28,13 @@ def build_lr_scheduler(optimizer: torch.optim.Optimizer, cfg: Config) -> LambdaL
     warmup_steps = cfg.train.warmup_steps
     max_steps = cfg.train.max_steps
     min_lr_ratio = cfg.train.min_lr_ratio
+    schedule = cfg.train.lr_schedule
+    if schedule not in ("cosine", "wsd"):
+        raise ValueError(f"Unknown train.lr_schedule {schedule!r}, expected 'cosine' or 'wsd'")
+    # Precomputed rather than derived per call: lr_lambda runs once per optimizer step, and this
+    # is also the value the "wsd" branch needs to know where the stable phase ends.
+    decay_steps = max(1, round(max_steps * cfg.train.wsd_decay_ratio))
+    decay_start = max(warmup_steps, max_steps - decay_steps)
 
     def lr_lambda(step: int) -> float:
         # step + 1: LambdaLR evaluates the lambda at step 0 to set the LR for the *first*
@@ -36,6 +43,16 @@ def build_lr_scheduler(optimizer: torch.optim.Optimizer, cfg: Config) -> LambdaL
         # nonzero LR and still reach the full LR exactly at the end of warmup.
         if step < warmup_steps:
             return (step + 1) / max(1, warmup_steps)
+        if schedule == "wsd":
+            # Warmup-stable-decay: hold full LR, then decay only over the final wsd_decay_ratio.
+            # The stable phase's LR doesn't depend on max_steps, which is what lets a run be
+            # extended or branched from a mid-training checkpoint without the earlier steps having
+            # been trained on the "wrong" schedule — cosine's shape is a function of max_steps, so
+            # changing it invalidates everything before the change.
+            if step < decay_start:
+                return 1.0
+            progress = min(1.0, (step - decay_start) / max(1, max_steps - decay_start))
+            return min_lr_ratio + (1.0 - min_lr_ratio) * (1.0 - math.sqrt(progress))
         progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
         cosine = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
         # Decay to min_lr_ratio * lr rather than all the way to 0: the last steps of a run at a
@@ -43,27 +60,6 @@ def build_lr_scheduler(optimizer: torch.optim.Optimizer, cfg: Config) -> LambdaL
         return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
     return LambdaLR(optimizer, lr_lambda)
-
-
-def build_param_groups(model: torch.nn.Module, weight_decay: float) -> list[dict]:
-    """Split parameters into decayed / non-decayed groups.
-
-    AdamW over model.parameters() applies weight decay uniformly, which decays RMSNorm gains and
-    every bias. Those are 1-D scale/shift parameters with no "shrink toward zero is a useful
-    prior" interpretation — decaying them just fights the norm layers. Standard practice
-    (GPT-2/Llama/nanoGPT) is to decay only the >=2-D weight matrices, which is what this does.
-    The tied token_emb/lm_head weight is 2-D and stays in the decayed group, matching those
-    references.
-    """
-    decay, no_decay = [], []
-    for param in model.parameters():
-        if not param.requires_grad:
-            continue
-        (decay if param.dim() >= 2 else no_decay).append(param)
-    return [
-        {"params": decay, "weight_decay": weight_decay},
-        {"params": no_decay, "weight_decay": 0.0},
-    ]
 
 
 def estimate_batch_size(raw_model: DenseTransformer, cfg: Config, device: str, device_type: str) -> tuple[int, int]:
@@ -100,115 +96,6 @@ def estimate_batch_size(raw_model: DenseTransformer, cfg: Config, device: str, d
     return batch_size, grad_accum_steps
 
 
-class CPUOffloadAdamW(torch.optim.Optimizer):
-    """AdamW with exp_avg/exp_avg_sq kept in pinned CPU memory instead of on `device`, freeing the
-    ~2x num_params fp32 moment-buffer VRAM cost for the rest of the run. Params/grads stay
-    GPU-resident the whole time — only a grad copy (down) and the resulting update (up) cross PCIe,
-    once per step() call rather than once per forward/backward — so this only touches optimizer
-    bookkeeping, never the forward path or torch.compile's captured graph. Used as auto_batch_size's
-    second OOM-recovery tier once chunk-size backoff (micro_chunk_size == 1) is exhausted — see
-    migrate_optimizer_to_cpu_offload and the OOM handler in train()."""
-
-    def __init__(
-        self,
-        params,
-        lr: float,
-        weight_decay: float,
-        device: str,
-        betas: tuple[float, float] = (0.9, 0.999),
-        eps: float = 1.0e-8,
-    ) -> None:
-        super().__init__(params, dict(lr=lr, weight_decay=weight_decay, betas=betas, eps=eps))
-        self._device = device
-        self._is_cuda = device.split(":")[0] == "cuda"
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = closure() if closure is not None else None
-
-        for group in self.param_groups:
-            lr, weight_decay = group["lr"], group["weight_decay"]
-            beta1, beta2 = group["betas"]
-            eps = group["eps"]
-
-            params, grads_cpu, exp_avgs, exp_avg_sqs, steps = [], [], [], [], []
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                state = self.state[p]
-                if "exp_avg" not in state:
-                    state["exp_avg"] = torch.zeros_like(p, device="cpu", dtype=torch.float32).pin_memory()
-                    state["exp_avg_sq"] = torch.zeros_like(p, device="cpu", dtype=torch.float32).pin_memory()
-                    state["grad_cpu"] = torch.empty_like(p, device="cpu", dtype=torch.float32).pin_memory()
-                    state["step"] = 0
-                state["grad_cpu"].copy_(p.grad, non_blocking=True)
-                state["step"] += 1
-                params.append(p)
-                grads_cpu.append(state["grad_cpu"])
-                exp_avgs.append(state["exp_avg"])
-                exp_avg_sqs.append(state["exp_avg_sq"])
-                steps.append(state["step"])
-
-            if not params:
-                continue
-
-            # Every grad copy above was issued non_blocking against a pinned buffer; sync once here
-            # (rather than per-param) before touching them on the CPU side.
-            if self._is_cuda:
-                torch.cuda.synchronize(self._device)
-
-            torch._foreach_mul_(exp_avgs, beta1)
-            torch._foreach_add_(exp_avgs, grads_cpu, alpha=1 - beta1)
-            torch._foreach_mul_(exp_avg_sqs, beta2)
-            torch._foreach_addcmul_(exp_avg_sqs, grads_cpu, grads_cpu, value=1 - beta2)
-
-            for p, exp_avg, exp_avg_sq, step in zip(params, exp_avgs, exp_avg_sqs, steps):
-                bias_correction1 = 1 - beta1**step
-                bias_correction2 = 1 - beta2**step
-                denom = (exp_avg_sq / bias_correction2).sqrt_().add_(eps)
-                update = (exp_avg / bias_correction1) / denom
-                if weight_decay != 0:
-                    p.data.mul_(1 - lr * weight_decay)
-                p.data.add_(update.to(p.device, non_blocking=True), alpha=-lr)
-
-            if self._is_cuda:
-                torch.cuda.synchronize(self._device)
-
-        return loss
-
-
-def migrate_optimizer_to_cpu_offload(
-    optimizer: torch.optim.Optimizer, model: torch.nn.Module, cfg: Config, device: str
-) -> CPUOffloadAdamW:
-    """Swap a live AdamW for CPUOffloadAdamW, migrating any existing exp_avg/exp_avg_sq/step per
-    param onto pinned CPU tensors instead of resetting momentum. Params with no prior state (e.g.
-    training OOM'd before its first successful step) are left to lazy-init on first step(), matching
-    fresh-AdamW behavior."""
-    new_optimizer = CPUOffloadAdamW(
-        build_param_groups(model, cfg.train.weight_decay),
-        lr=cfg.train.lr,
-        weight_decay=cfg.train.weight_decay,
-        device=device,
-    )
-    # LambdaLR.__init__ requires 'initial_lr' already present in param_groups whenever it's
-    # constructed with last_epoch != -1 (its "resuming a schedule" path) — copy it over from the old
-    # optimizer so the caller can rebuild the scheduler against new_optimizer at the current step.
-    for old_group, new_group in zip(optimizer.param_groups, new_optimizer.param_groups):
-        if "initial_lr" in old_group:
-            new_group["initial_lr"] = old_group["initial_lr"]
-    for p, old_state in optimizer.state.items():
-        if "exp_avg" not in old_state:
-            continue
-        step = old_state["step"]
-        new_optimizer.state[p] = {
-            "exp_avg": old_state["exp_avg"].detach().to("cpu", dtype=torch.float32).pin_memory(),
-            "exp_avg_sq": old_state["exp_avg_sq"].detach().to("cpu", dtype=torch.float32).pin_memory(),
-            "grad_cpu": torch.empty_like(p, device="cpu", dtype=torch.float32).pin_memory(),
-            "step": step.item() if torch.is_tensor(step) else step,
-        }
-    return new_optimizer
-
-
 def save_checkpoint(
     path: Path,
     raw_model: DenseTransformer,
@@ -237,6 +124,11 @@ def save_checkpoint(
         {
             "model": raw_model.state_dict(),
             "optimizer": optimizer.state_dict(),
+            # Which algorithm produced that state. Muon's per-param state is a single momentum
+            # buffer where AdamW's is two moments, so loading one into the other silently produces
+            # a wrong (or shape-mismatched) resume — see train()'s resume block, which resets
+            # optimizer state with a warning rather than crashing when these disagree.
+            "optimizer_type": cfg.train.optimizer,
             "scheduler": scheduler.state_dict(),
             "scaler": scaler.state_dict(),
             "step": step,
@@ -269,8 +161,37 @@ def find_resume_checkpoint(cfg: Config) -> Path | None:
     return candidates[-1] if candidates else None
 
 
-def compute_loss(logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
-    """Standard causal-LM loss: token t's logits predict token t+1.
+def compute_mtp_loss(
+    model: DenseTransformer, mtp_hidden: tuple[torch.Tensor, ...] | None, input_ids: torch.Tensor
+) -> torch.Tensor:
+    """Mean cross-entropy over the auxiliary multi-token-prediction heads.
+
+    Head `d` (1-indexed) predicts the token d+1 positions ahead, so its labels are input_ids shifted
+    left by d+1 with the tail padded to ignore_index — the same label-shifting trick compute_loss
+    uses, for the same reason (never slice the logits).
+
+    Heads are projected and reduced one at a time so only one (batch, seq, vocab_size) tensor is
+    live in the loop, rather than materialising all of them and then reducing.
+    """
+    if not mtp_hidden:
+        return input_ids.new_zeros((), dtype=torch.float32)
+
+    total = None
+    for depth, hidden in enumerate(mtp_hidden, start=1):
+        shift = depth + 1
+        labels = torch.cat(
+            [input_ids[:, shift:], input_ids.new_full((input_ids.size(0), shift), -100)], dim=1
+        )
+        logits = model._project_logits(hidden)
+        head_loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100
+        )
+        total = head_loss if total is None else total + head_loss
+    return total / len(mtp_hidden)
+
+
+def compute_loss(logits: torch.Tensor, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Standard causal-LM loss: token t's logits predict token t+1. Returns (lm_loss, z_loss).
 
     The shift is done on the *labels* (cheap, one int64 row) rather than by slicing the logits.
     Slicing logits[:, :-1] yields a non-contiguous view whose .contiguous()/.view() forces a full
@@ -278,9 +199,26 @@ def compute_loss(logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
     every forward. Padding the labels with ignore_index instead lets logits.view(-1, vocab_size)
     be a free reshape of the already-contiguous tensor, and cross_entropy skips the padded
     positions, giving a numerically identical mean over exactly the same (seq - 1) targets.
+
+    z_loss is the log-Z regulariser mean(logsumexp(logits)^2) (PaLM/Chinchilla), returned
+    separately so callers decide whether to apply it: train() adds cfg.model.z_loss_weight * z_loss
+    to the training objective, while evaluate() discards it so val/loss stays a pure LM number and
+    remains comparable across configurations — exactly how ponder_cost and moe_aux_loss are already
+    handled.
     """
     labels = torch.cat([input_ids[:, 1:], input_ids.new_full((input_ids.size(0), 1), -100)], dim=1)
-    return F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100)
+    flat_logits = logits.view(-1, logits.size(-1))
+    flat_labels = labels.view(-1)
+    lm_loss = F.cross_entropy(flat_logits, flat_labels, ignore_index=-100)
+
+    # Reduced over the vocab first, then masked — rather than flat_logits[mask], which would
+    # materialise a near-full copy of the largest activation in the model just to drop one row per
+    # sequence. logsumexp is internally max-subtracted so it's stable in the autocast dtype; only
+    # the (n_tokens,) result is upcast for the square/mean.
+    keep = (flat_labels != -100).to(flat_logits.dtype)
+    z = torch.logsumexp(flat_logits, dim=-1).float()
+    z_loss = (z.square() * keep).sum() / keep.sum().clamp(min=1)
+    return lm_loss, z_loss
 
 
 @torch.no_grad()
@@ -306,8 +244,8 @@ def evaluate(
             break
         input_ids = batch["input_ids"].to(device)
         with torch.autocast(device_type=device_type, dtype=dtype, enabled=dtype != torch.float32):
-            logits, _, _, _ = model(input_ids)
-            loss = compute_loss(logits, input_ids)
+            out = model(input_ids)
+            loss, _ = compute_loss(out.logits, input_ids)  # z_loss discarded: val/loss stays pure LM
         total += loss.item()
         count += 1
     model.train()
@@ -334,7 +272,9 @@ def train(cfg: Config) -> None:
             f"[radiance] padding vocab {len(tokenizer):,} -> {vocab_size:,} "
             f"(multiple of {cfg.model.vocab_pad_multiple}) for tensor-core-aligned lm_head matmuls"
         )
-    raw_model = DenseTransformer(cfg.model, vocab_size=vocab_size).to(device)
+    # eos_id is what recovers packed document boundaries for doc_attention_mask (see
+    # model.document_ids) — data.py joins documents with exactly this token.
+    raw_model = DenseTransformer(cfg.model, vocab_size=vocab_size, eos_id=tokenizer.eos_token_id).to(device)
 
     if cfg.train.auto_batch_size:
         if device_type == "cuda":
@@ -349,7 +289,31 @@ def train(cfg: Config) -> None:
                 "using configured batch_size/grad_accum_steps."
             )
 
-    model = torch.compile(raw_model, mode="reduce-overhead") if cfg.train.compile else raw_model
+    stochastic_depth = cfg.model.loop_count_min is not None
+    compile_mode = "reduce-overhead"
+    if cfg.train.compile and stochastic_depth:
+        # Stochastic loop depth means the Python `for` over the loop body runs a different number
+        # of times per step, so dynamo traces one graph per distinct count. Two consequences:
+        #
+        # 1. The default cache limit (8) would be exceeded by a wide range and silently fall back
+        #    to eager for the rest of the run. Raise it to cover the range with headroom for the
+        #    separate eval/generate traces.
+        # 2. mode="reduce-overhead" captures each graph as a CUDA graph sharing one memory pool,
+        #    and CUDA graphs assume a *static* execution graph — which is exactly what stochastic
+        #    depth gives up. Replaying a different loop count overwrites the previous graph's
+        #    gradient tensors ("accessing gradient tensor output of CUDAGraphs that has been
+        #    overwritten by a subsequent run"). Drop to plain inductor: still compiled, just
+        #    without the CUDA-graph capture that the varying shape makes unsound.
+        span = (cfg.model.loop_count_max or cfg.model.loop_count) - cfg.model.loop_count_min + 1
+        torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 4 * span + 8)
+        compile_mode = None
+        print(
+            "[radiance] stochastic loop depth is on, so compiling without CUDA graphs "
+            "(mode=None instead of 'reduce-overhead'): the loop count varies per step, which a "
+            "captured graph cannot represent."
+        )
+
+    model = torch.compile(raw_model, mode=compile_mode) if cfg.train.compile else raw_model
 
     # batch_size must be finalized (auto_batch_size, if any, already ran) before the DataLoader is built.
     train_loader, val_loader = build_dataloaders(cfg, tokenizer)
@@ -369,12 +333,17 @@ def train(cfg: Config) -> None:
             f"= effective_batch_size={cfg.train.effective_batch_size})"
         )
 
-    optimizer = AdamW(
-        build_param_groups(model, cfg.train.weight_decay),
-        lr=cfg.train.lr,
-        fused=(device_type == "cuda"),
-    )
+    optimizer = build_optimizer(model, cfg, device)
     scheduler = build_lr_scheduler(optimizer, cfg)
+    print(
+        f"[radiance] optimizer={cfg.train.optimizer} "
+        + (
+            f"(muon_lr={cfg.train.muon_lr} over {sum(1 for g in optimizer.param_groups if g.get('algorithm') == 'muon' for _ in g['params'])} "
+            f"tensors, adamw lr={cfg.train.lr} over the rest)"
+            if cfg.train.optimizer == "muon"
+            else f"(lr={cfg.train.lr})"
+        )
+    )
 
     if cfg.train.compile:
         # mode="reduce-overhead" captures the backward pass as a CUDA graph. If a param's .grad is
@@ -421,7 +390,21 @@ def train(cfg: Config) -> None:
     if resume_path is not None:
         ckpt = torch.load(resume_path, map_location=device, weights_only=False)
         raw_model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
+        # Checkpoints predating optimizer_type were all AdamW.
+        saved_optimizer = ckpt.get("optimizer_type", "adamw")
+        if saved_optimizer == cfg.train.optimizer:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        else:
+            # Warn and continue rather than raise: the weights and LR schedule are still perfectly
+            # resumable, and refusing to load a checkpoint because the optimizer was switched would
+            # be a worse failure than restarting momentum. But say so loudly — the first steps after
+            # this will show the same loss bump a from-scratch optimizer always causes.
+            print(
+                f"[radiance] WARNING: checkpoint was saved with optimizer={saved_optimizer!r} but "
+                f"this run uses optimizer={cfg.train.optimizer!r}. Model weights and LR schedule "
+                "are restored; optimizer state is NOT (their state layouts differ), so momentum "
+                "restarts from zero and you should expect a transient loss spike."
+            )
         scheduler.load_state_dict(ckpt["scheduler"])
         scaler.load_state_dict(ckpt["scaler"])
         step = ckpt["step"]
@@ -465,6 +448,8 @@ def train(cfg: Config) -> None:
                 accum_ponder_cost = torch.zeros((), device=device)
                 accum_mean_loop_depth = torch.zeros((), device=device)
                 accum_moe_aux_loss = torch.zeros((), device=device)
+                accum_z_loss = torch.zeros((), device=device)
+                accum_mtp_loss = torch.zeros((), device=device)
 
             try:
                 # set_to_none=False when compiled: keeps .grad buffers stable/preallocated (see the
@@ -487,12 +472,17 @@ def train(cfg: Config) -> None:
                         with torch.autocast(
                             device_type=device_type, dtype=dtype, enabled=dtype != torch.float32
                         ):
-                            logits, ponder_cost, mean_loop_depth, moe_aux_loss = model(chunk)
-                            lm_loss = compute_loss(logits, chunk)
+                            out = model(chunk)
+                            ponder_cost, mean_loop_depth = out.ponder_cost, out.mean_loop_depth
+                            moe_aux_loss = out.moe_aux_loss
+                            lm_loss, z_loss = compute_loss(out.logits, chunk)
+                            mtp_loss = compute_mtp_loss(raw_model, out.mtp_hidden, chunk)
                             chunk_loss = (
                                 lm_loss
                                 + cfg.model.ponder_weight * ponder_cost
                                 + cfg.model.moe_aux_loss_weight * moe_aux_loss
+                                + cfg.model.z_loss_weight * z_loss
+                                + cfg.model.mtp_weight * mtp_loss
                             )
 
                         scaler.scale(chunk_loss * chunk_weight).backward()
@@ -503,16 +493,32 @@ def train(cfg: Config) -> None:
                             accum_ponder_cost += ponder_cost.detach() * chunk_weight
                             accum_mean_loop_depth += mean_loop_depth.detach() * chunk_weight
                             accum_moe_aux_loss += moe_aux_loss.detach() * chunk_weight
+                            accum_z_loss += z_loss.detach() * chunk_weight
+                            accum_mtp_loss += mtp_loss.detach() * chunk_weight
 
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
+                # Loss-free MoE load balancing (cfg.model.moe_balance). Deliberately here rather
+                # than inside forward: it mutates a buffer by an explicit rule with no gradient, so
+                # keeping it outside the compiled region avoids a graph break on every micro-batch.
+                # No-op unless MoE and bias balancing are both on.
+                raw_model.update_expert_bias()
                 step += 1
                 step_done = True
 
                 if will_log:
+                    # Also to stdout: W&B was previously the only place a loss ever appeared, so a
+                    # run with wandb.mode=disabled (sweeps, CI, quick A/Bs) produced no visible
+                    # signal at all. Cheap — accum_* are already being .item()'d for the log below.
+                    print(
+                        f"[radiance] step {step:>6}/{cfg.train.max_steps} "
+                        f"loss {accum_loss.item():.4f} lm {accum_lm_loss.item():.4f} "
+                        f"lr {scheduler.get_last_lr()[0]:.3e}",
+                        flush=True,
+                    )
                     wandb.log(
                         {
                             "train/loss": accum_loss.item(),
@@ -520,6 +526,9 @@ def train(cfg: Config) -> None:
                             "train/ponder_cost": accum_ponder_cost.item(),
                             "train/mean_loop_depth": accum_mean_loop_depth.item(),
                             "train/moe_aux_loss": accum_moe_aux_loss.item(),
+                            "train/z_loss": accum_z_loss.item(),
+                            "train/mtp_loss": accum_mtp_loss.item(),
+                            "train/expert_bias_spread": raw_model.expert_bias_spread(),
                             "train/lr": scheduler.get_last_lr()[0],
                             "train/micro_chunk_size": micro_chunk_size,
                         },
@@ -530,6 +539,7 @@ def train(cfg: Config) -> None:
                     val_loss = evaluate(
                         model, val_loader, device, device_type, dtype, cfg.train.eval_max_batches
                     )
+                    print(f"[radiance] step {step:>6} val/loss {val_loss:.4f}", flush=True)
                     wandb.log({"val/loss": val_loss}, step=step)
 
                 if step % cfg.train.save_every == 0:
@@ -559,11 +569,17 @@ def train(cfg: Config) -> None:
                     # Chunk-size backoff alone can't help once it's already at its floor: that tier
                     # only attacks activation memory, which scales with batch size, not the fixed
                     # cost of AdamW's exp_avg/exp_avg_sq. Move those to pinned CPU memory instead.
+                    previous_optimizer = optimizer
                     optimizer = migrate_optimizer_to_cpu_offload(optimizer, model, cfg, device)
-                    # Reconstructed (not resumed) against the new optimizer so the LR trajectory
-                    # continues exactly as if training had never paused - LambdaLR only needs the
-                    # lambda(s) it was built with and the step to resume from.
-                    scheduler = LambdaLR(optimizer, scheduler.lr_lambdas[0], last_epoch=step - 1)
+                    if optimizer is not previous_optimizer:
+                        # A *new* optimizer object (the plain-AdamW path swaps in CPUOffloadAdamW).
+                        # Reconstructed, not resumed, so the LR trajectory continues exactly as if
+                        # training had never paused - LambdaLR only needs the lambda(s) it was built
+                        # with and the step to resume from. MuonWithAuxAdam instead flips its adamw
+                        # groups to offloaded in place and returns itself, so its scheduler — which
+                        # already points at those same param_groups — needs no rebuild.
+                        scheduler = LambdaLR(optimizer, scheduler.lr_lambdas[0], last_epoch=step - 1)
+                    del previous_optimizer
                     # Only reclaims anything once the old optimizer (holding the GPU-resident
                     # exp_avg/exp_avg_sq we just migrated off of) has lost its last reference above.
                     torch.cuda.empty_cache()

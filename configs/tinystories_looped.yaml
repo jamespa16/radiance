@@ -1,0 +1,68 @@
+# Worked example: the recursive loop body with per-iteration identity.
+#
+# blocks[1:] is weight-shared and re-run loop_count times, so this trains a model with the
+# effective depth of ~16 blocks from the parameters of 6. The three loop_* settings below are what
+# make that work rather than just repeating the same computation:
+#
+#   loop_iter_conditioning  gives each iteration its own RMSNorm gains, so the shared block knows
+#                           how deep into the recursion it is
+#   loop_input_injection    re-anchors every iteration to blocks[0]'s output, which is what keeps a
+#                           deep recurrence from drifting
+#   loop_count_min/max      trains across a range of depths, so inference can dial compute up or
+#                           down: radiance-generate --loops 12 spends more per token than training did
+#
+# Measured against the same config with conditioning and injection off (400 steps, RTX 5090):
+# val/loss 2.8606 vs 2.8996.
+
+run_name: tinystories-looped
+
+data:
+  dataset: roneneldan/TinyStories
+  text_column: text
+  tokenizer: gpt2
+  seq_len: 512
+  num_workers: 4
+  cache_dir: .cache/radiance/tokenized
+
+model:
+  d_model: 256
+  head_dim: 64
+  n_layers: 4
+  ffn_mult: 4.0
+  ffn_depth: 2
+  # 1 unlooped block + 3 shared blocks x 6 iterations = 19 block executions per forward, from the
+  # parameters of a 4-block model.
+  loop_count: 6
+  loop_iter_conditioning: norm_gains  # "lora" for per-iteration rank-r adapters instead
+  loop_input_injection: true
+  # Stochastic depth: each training step samples a loop count from [5, 8].
+  #
+  # Widen this range with care — it is the dominant startup cost. Each distinct count is a separate
+  # dynamo graph, and each costs roughly 25s of inductor compile at this model size (train.py also
+  # raises dynamo's cache limit to suit, and drops CUDA-graph capture, which a varying loop count
+  # cannot support). Four counts is ~100s before the first loss line appears; that's compilation,
+  # not a hang. Enabling grad_checkpoint below roughly doubles it again. Set train.compile: false
+  # while you're iterating on the config rather than training.
+  loop_count_min: 5
+  loop_count_max: 8
+  # Activation memory scales with the loop count while parameter memory doesn't, so a looped model
+  # is where gradient checkpointing pays off most — but this model is small enough not to need it,
+  # and it multiplies the compile cost above. Turn it on when you scale d_model/seq_len up.
+  grad_checkpoint: false
+  dropout: 0.0  # doc_attention_mask uses flex_attention, which has no attention-weight dropout
+  max_seq_len: 512
+
+train:
+  batch_size: 32
+  lr: 3.0e-4
+  muon_lr: 0.02
+  warmup_ratio: 0.2
+  max_steps: 2000
+  eval_every: 100
+  save_every: 500
+  output_dir: checkpoints/tinystories_looped
+  dtype: bf16
+
+wandb:
+  project: radiance
+  mode: online

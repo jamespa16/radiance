@@ -13,6 +13,11 @@ dependencies = [
     "numpy>=1.26",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
 [project.scripts]
 radiance-train = "radiance.train:main"
 radiance-generate = "radiance.generate:main"
@@ -24,3 +29,11 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+# pythonpath=["."] so tests can `from tests.conftest import ...` for shared constants; without it
+# pytest's rootdir isn't on sys.path and only fixtures (not module-level names) are reachable.
+pythonpath = ["."]
+testpaths = ["tests"]
+# Compiled-GPU regression tests; each pays an inductor compile. Skip with -m "not slow".
+markers = ["slow: compiles a model (CUDA only)"]

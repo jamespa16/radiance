@@ -1,0 +1,437 @@
+"""Optimizers and parameter-group construction.
+
+Split out of train.py, which was carrying ~160 lines of optimizer machinery unrelated to the
+training loop itself. Everything here is about *how parameters get updated*; train.py keeps the
+step-based loop, loss computation, checkpointing and evaluation.
+
+build_param_groups lives here rather than in train.py because migrate_optimizer_to_cpu_offload
+needs it, and importing it back from train.py would make the two modules circular.
+"""
+
+from __future__ import annotations
+
+import torch
+
+from radiance.config import Config
+
+
+def build_param_groups(model: torch.nn.Module, weight_decay: float) -> list[dict]:
+    """Split parameters into decayed / non-decayed groups.
+
+    AdamW over model.parameters() applies weight decay uniformly, which decays RMSNorm gains and
+    every bias. Those are 1-D scale/shift parameters with no "shrink toward zero is a useful
+    prior" interpretation — decaying them just fights the norm layers. Standard practice
+    (GPT-2/Llama/nanoGPT) is to decay only the >=2-D weight matrices, which is what this does.
+    The tied token_emb/lm_head weight is 2-D and stays in the decayed group, matching those
+    references.
+    """
+    decay, no_decay = [], []
+    for param in model.parameters():
+        if not param.requires_grad:
+            continue
+        (decay if param.dim() >= 2 else no_decay).append(param)
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
+
+# Parameters excluded from Muon and left to the auxiliary AdamW. Two reasons appear here:
+#   - token_emb / lm_head: these are the *tied* embedding matrix. Its rows are per-token, not a
+#     linear map between two hidden spaces, so orthogonalising it is not meaningful — and it is the
+#     largest tensor in the model, so Newton-Schulz on it would also be the dominant step cost.
+#   - router / out_gate: tiny tensors whose exact scale is load-bearing (a router's softmax
+#     calibration, a gate's zero-init). Muon's update has a fixed spectral norm regardless of how
+#     small the gradient is, which is the wrong behaviour for these.
+_MUON_EXCLUDED_SUBSTRINGS = ("token_emb", "lm_head", "router", "out_gate")
+
+
+def build_muon_param_groups(model: torch.nn.Module, cfg: Config) -> list[dict]:
+    """Three-way split for MuonWithAuxAdam: Muon hidden weights, AdamW-decayed, AdamW-undecayed.
+
+    Each group carries its own base `lr`, so the Muon group can run at cfg.train.muon_lr (typically
+    ~50x cfg.train.lr) while the AdamW groups keep the LR every existing config already tuned.
+    LambdaLR scales each group from its own initial_lr, so one schedule shape drives both.
+
+    `mup_lr_scale` implements muP's per-tensor LR correction (see ModelConfig.mup_width_mult). It
+    is 1.0 for the Muon group — Muon's update is spectrally normalised, so it is already
+    approximately width-invariant and needs no correction — and 1/width_mult for AdamW's hidden
+    weights. Embeddings and 1-D parameters are unscaled under muP.
+    """
+    width_mult = cfg.model.mup_width_mult
+    muon, adam_decay, adam_no_decay = [], [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.dim() < 2:
+            adam_no_decay.append(param)
+        elif any(s in name for s in _MUON_EXCLUDED_SUBSTRINGS):
+            adam_decay.append(param)
+        else:
+            muon.append(param)
+
+    groups = [
+        {
+            "params": muon,
+            "algorithm": "muon",
+            "lr": cfg.train.muon_lr,
+            "weight_decay": cfg.train.weight_decay,
+            "mup_lr_scale": 1.0,
+        },
+        {
+            "params": adam_decay,
+            "algorithm": "adamw",
+            "lr": cfg.train.lr,
+            "weight_decay": cfg.train.weight_decay,
+            # The excluded set is embeddings (unscaled under muP) plus routers/gates (hidden-like,
+            # so 1/m). They share a group; embeddings dominate it, so leave it unscaled — the
+            # routers and gates are a rounding error in both parameter count and gradient norm.
+            "mup_lr_scale": 1.0,
+        },
+        {
+            "params": adam_no_decay,
+            "algorithm": "adamw",
+            "lr": cfg.train.lr,
+            "weight_decay": 0.0,
+            "mup_lr_scale": 1.0,
+        },
+    ]
+    for group in groups:
+        group["lr"] *= group["mup_lr_scale"] if width_mult != 1.0 else 1.0
+    return [g for g in groups if g["params"]]
+
+
+def orthogonalize(grad: torch.Tensor, steps: int = 5, eps: float = 1.0e-7) -> torch.Tensor:
+    """Newton-Schulz quintic iteration: replace a matrix by (approximately) the orthogonal factor
+    of its polar decomposition, i.e. the same matrix with every singular value driven toward 1.
+
+    This is the whole idea behind Muon. A raw SGD-momentum update tends to be dominated by a few
+    large singular directions; orthogonalising it spreads the step evenly across every direction,
+    which is what makes a much larger learning rate stable.
+
+    Shape-generic over leading batch dimensions: `@`/`.mT` are batched, so a (n_experts, in, out)
+    tensor — exactly BatchedExperts' stacked layout — is orthogonalised per expert with no
+    reshaping, dim 0 acting as a free batch dimension.
+
+    The quintic coefficients are the standard tuned ones: they do not converge to machine-precision
+    orthogonality, but they drive the singular values into a band around 1 in very few steps, which
+    is all the optimizer needs. bfloat16 is deliberate and also standard — the iteration is
+    self-correcting, so the halved precision costs nothing and halves the bandwidth.
+    """
+    a, b, c = 3.4445, -4.7750, 2.0315
+    X = grad.bfloat16()
+    X = X / (torch.linalg.matrix_norm(X, keepdim=True) + eps)
+
+    # The iteration below assumes rows <= cols; transpose the tall case and undo it afterwards.
+    transposed = X.size(-2) > X.size(-1)
+    if transposed:
+        X = X.mT
+    for _ in range(steps):
+        A = X @ X.mT
+        B = b * A + c * (A @ A)
+        X = a * X + B @ X
+    if transposed:
+        X = X.mT
+    return X.to(grad.dtype)
+
+
+class MuonWithAuxAdam(torch.optim.Optimizer):
+    """Muon for the hidden weight matrices, AdamW for everything else, in one Optimizer object.
+
+    One object rather than two because everything downstream assumes a single optimizer: the
+    GradScaler's unscale_/step bookkeeping is keyed on it, LambdaLR drives its param_groups,
+    save_checkpoint serialises its state_dict, and the OOM handler swaps it. Splitting into two
+    optimizers would mean touching all of those; a per-group `algorithm` key does not.
+
+    Groups are built by build_muon_param_groups. Each carries `algorithm` ("muon" | "adamw") and,
+    for adamw groups, an `offload` flag that moves the moment buffers to pinned CPU memory — the
+    tier-2 OOM recovery described in train(). Muon's own state is a single momentum buffer (1x
+    params, vs AdamW's 2x) and stays resident: Newton-Schulz is a chain of matmuls per parameter
+    per step, and running it against CPU memory would cost far more than the VRAM it reclaims.
+    """
+
+    def __init__(
+        self,
+        param_groups: list[dict],
+        momentum: float = 0.95,
+        nesterov: bool = True,
+        ns_steps: int = 5,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1.0e-8,
+        device: str = "cpu",
+    ) -> None:
+        defaults = dict(
+            algorithm="adamw",
+            momentum=momentum,
+            nesterov=nesterov,
+            ns_steps=ns_steps,
+            betas=betas,
+            eps=eps,
+            offload=False,
+            mup_lr_scale=1.0,
+        )
+        super().__init__(param_groups, defaults)
+        self._device = device
+        self._is_cuda = device.split(":")[0] == "cuda"
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = closure() if closure is not None else None
+        for group in self.param_groups:
+            if group["algorithm"] == "muon":
+                self._step_muon(group)
+            else:
+                self._step_adamw(group)
+        return loss
+
+    def _step_muon(self, group: dict) -> None:
+        lr, weight_decay = group["lr"], group["weight_decay"]
+        momentum, nesterov = group["momentum"], group["nesterov"]
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            state = self.state[p]
+            if "momentum_buffer" not in state:
+                state["momentum_buffer"] = torch.zeros_like(p)
+            buf = state["momentum_buffer"]
+            buf.lerp_(p.grad, 1.0 - momentum)
+            # Nesterov: step from where the momentum is about to be, not where it is.
+            update = p.grad.lerp(buf, momentum) if nesterov else buf
+            update = orthogonalize(update, steps=group["ns_steps"])
+            # Newton-Schulz normalises the update's singular values to ~1, so its Frobenius norm is
+            # ~sqrt(min(rows, cols)) regardless of the parameter's shape. This factor restores the
+            # standard sqrt(fan-out / fan-in) scaling, which is also what makes Muon approximately
+            # muP-correct without a separate width correction (see build_muon_param_groups).
+            scale = max(1.0, p.size(-2) / p.size(-1)) ** 0.5
+            if weight_decay != 0:
+                p.mul_(1 - lr * weight_decay)
+            p.add_(update, alpha=-lr * scale)
+
+    def _step_adamw(self, group: dict) -> None:
+        lr, weight_decay = group["lr"], group["weight_decay"]
+        beta1, beta2 = group["betas"]
+        eps = group["eps"]
+        offload = group["offload"]
+        state_device = "cpu" if offload else None
+
+        params, grads, exp_avgs, exp_avg_sqs, steps = [], [], [], [], []
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            state = self.state[p]
+            if "exp_avg" not in state:
+                state["exp_avg"] = _new_state_like(p, state_device)
+                state["exp_avg_sq"] = _new_state_like(p, state_device)
+                if offload:
+                    state["grad_cpu"] = torch.empty_like(p, device="cpu", dtype=torch.float32).pin_memory()
+                state["step"] = 0
+            state["step"] += 1
+            if offload:
+                state["grad_cpu"].copy_(p.grad, non_blocking=True)
+                grads.append(state["grad_cpu"])
+            else:
+                grads.append(p.grad)
+            params.append(p)
+            exp_avgs.append(state["exp_avg"])
+            exp_avg_sqs.append(state["exp_avg_sq"])
+            steps.append(state["step"])
+
+        if not params:
+            return
+        # Grad copies above were issued non_blocking against pinned buffers; sync once (not
+        # per-param) before touching them on the CPU side.
+        if offload and self._is_cuda:
+            torch.cuda.synchronize(self._device)
+
+        torch._foreach_mul_(exp_avgs, beta1)
+        torch._foreach_add_(exp_avgs, grads, alpha=1 - beta1)
+        torch._foreach_mul_(exp_avg_sqs, beta2)
+        torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1 - beta2)
+
+        for p, exp_avg, exp_avg_sq, step in zip(params, exp_avgs, exp_avg_sqs, steps):
+            bias_correction1 = 1 - beta1**step
+            bias_correction2 = 1 - beta2**step
+            denom = (exp_avg_sq / bias_correction2).sqrt_().add_(eps)
+            update = (exp_avg / bias_correction1) / denom
+            if weight_decay != 0:
+                p.mul_(1 - lr * weight_decay)
+            p.add_(update.to(p.device, non_blocking=True), alpha=-lr)
+
+        if offload and self._is_cuda:
+            torch.cuda.synchronize(self._device)
+
+
+def _new_state_like(p: torch.Tensor, device: str | None) -> torch.Tensor:
+    """Zeroed fp32 optimizer state for `p`, pinned on the CPU when offloading."""
+    if device is None:
+        return torch.zeros_like(p, dtype=torch.float32)
+    return torch.zeros_like(p, device=device, dtype=torch.float32).pin_memory()
+
+
+def build_optimizer(model: torch.nn.Module, cfg: Config, device: str) -> torch.optim.Optimizer:
+    """Construct the optimizer named by cfg.train.optimizer."""
+    if cfg.train.optimizer == "adamw":
+        from torch.optim import AdamW
+
+        return AdamW(
+            build_param_groups(model, cfg.train.weight_decay),
+            lr=cfg.train.lr,
+            fused=(device.split(":")[0] == "cuda"),
+        )
+    if cfg.train.optimizer == "muon":
+        return MuonWithAuxAdam(
+            build_muon_param_groups(model, cfg),
+            momentum=cfg.train.muon_momentum,
+            device=device,
+        )
+    raise ValueError(f"Unknown train.optimizer {cfg.train.optimizer!r}, expected 'muon' or 'adamw'")
+
+
+class CPUOffloadAdamW(torch.optim.Optimizer):
+    """AdamW with exp_avg/exp_avg_sq kept in pinned CPU memory instead of on `device`, freeing the
+    ~2x num_params fp32 moment-buffer VRAM cost for the rest of the run. Params/grads stay
+    GPU-resident the whole time — only a grad copy (down) and the resulting update (up) cross PCIe,
+    once per step() call rather than once per forward/backward — so this only touches optimizer
+    bookkeeping, never the forward path or torch.compile's captured graph. Used as auto_batch_size's
+    second OOM-recovery tier once chunk-size backoff (micro_chunk_size == 1) is exhausted — see
+    migrate_optimizer_to_cpu_offload and the OOM handler in train()."""
+
+    def __init__(
+        self,
+        params,
+        lr: float,
+        weight_decay: float,
+        device: str,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1.0e-8,
+    ) -> None:
+        super().__init__(params, dict(lr=lr, weight_decay=weight_decay, betas=betas, eps=eps))
+        self._device = device
+        self._is_cuda = device.split(":")[0] == "cuda"
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = closure() if closure is not None else None
+
+        for group in self.param_groups:
+            lr, weight_decay = group["lr"], group["weight_decay"]
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+
+            params, grads_cpu, exp_avgs, exp_avg_sqs, steps = [], [], [], [], []
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                if "exp_avg" not in state:
+                    state["exp_avg"] = torch.zeros_like(p, device="cpu", dtype=torch.float32).pin_memory()
+                    state["exp_avg_sq"] = torch.zeros_like(p, device="cpu", dtype=torch.float32).pin_memory()
+                    state["grad_cpu"] = torch.empty_like(p, device="cpu", dtype=torch.float32).pin_memory()
+                    state["step"] = 0
+                state["grad_cpu"].copy_(p.grad, non_blocking=True)
+                state["step"] += 1
+                params.append(p)
+                grads_cpu.append(state["grad_cpu"])
+                exp_avgs.append(state["exp_avg"])
+                exp_avg_sqs.append(state["exp_avg_sq"])
+                steps.append(state["step"])
+
+            if not params:
+                continue
+
+            # Every grad copy above was issued non_blocking against a pinned buffer; sync once here
+            # (rather than per-param) before touching them on the CPU side.
+            if self._is_cuda:
+                torch.cuda.synchronize(self._device)
+
+            torch._foreach_mul_(exp_avgs, beta1)
+            torch._foreach_add_(exp_avgs, grads_cpu, alpha=1 - beta1)
+            torch._foreach_mul_(exp_avg_sqs, beta2)
+            torch._foreach_addcmul_(exp_avg_sqs, grads_cpu, grads_cpu, value=1 - beta2)
+
+            for p, exp_avg, exp_avg_sq, step in zip(params, exp_avgs, exp_avg_sqs, steps):
+                bias_correction1 = 1 - beta1**step
+                bias_correction2 = 1 - beta2**step
+                denom = (exp_avg_sq / bias_correction2).sqrt_().add_(eps)
+                update = (exp_avg / bias_correction1) / denom
+                if weight_decay != 0:
+                    p.data.mul_(1 - lr * weight_decay)
+                p.data.add_(update.to(p.device, non_blocking=True), alpha=-lr)
+
+            if self._is_cuda:
+                torch.cuda.synchronize(self._device)
+
+        return loss
+
+
+def migrate_optimizer_to_cpu_offload(
+    optimizer: torch.optim.Optimizer, model: torch.nn.Module, cfg: Config, device: str
+) -> torch.optim.Optimizer:
+    """Move optimizer state to pinned CPU memory — auto_batch_size's tier-2 OOM recovery.
+
+    Returns the optimizer to use from here on. For MuonWithAuxAdam that is the *same object*,
+    mutated in place, so the caller can skip rebuilding the LR scheduler; for a plain AdamW it is a
+    new CPUOffloadAdamW and the caller must rebuild. Callers should test identity:
+
+        optimizer = migrate_optimizer_to_cpu_offload(optimizer, model, cfg, device)
+
+    and only rebuild the scheduler when the returned object differs from the one passed in.
+    """
+    if isinstance(optimizer, MuonWithAuxAdam):
+        return _offload_muon_aux_adam(optimizer)
+    return _adamw_to_cpu_offload(optimizer, model, cfg, device)
+
+
+def _offload_muon_aux_adam(optimizer: MuonWithAuxAdam) -> MuonWithAuxAdam:
+    """Flip the adamw groups of a live MuonWithAuxAdam to CPU-resident moments, in place.
+
+    Only the adamw groups: Muon's state is a single momentum buffer (half AdamW's footprint), and
+    its step is a chain of matmuls per parameter, so keeping that state off-device would cost far
+    more time than the VRAM it returns. In a Muon run the AdamW groups hold the embedding matrix,
+    which is typically the single largest tensor in the model, so this still reclaims most of what
+    the tier is after.
+    """
+    for group in optimizer.param_groups:
+        if group["algorithm"] != "adamw" or group["offload"]:
+            continue
+        group["offload"] = True
+        for p in group["params"]:
+            state = optimizer.state[p]
+            if "exp_avg" not in state:
+                continue  # never stepped; lazy-init on the next step() will allocate on CPU
+            state["exp_avg"] = state["exp_avg"].detach().to("cpu", dtype=torch.float32).pin_memory()
+            state["exp_avg_sq"] = state["exp_avg_sq"].detach().to("cpu", dtype=torch.float32).pin_memory()
+            state["grad_cpu"] = torch.empty_like(p, device="cpu", dtype=torch.float32).pin_memory()
+    return optimizer
+
+
+def _adamw_to_cpu_offload(
+    optimizer: torch.optim.Optimizer, model: torch.nn.Module, cfg: Config, device: str
+) -> CPUOffloadAdamW:
+    """Swap a live AdamW for CPUOffloadAdamW, migrating any existing exp_avg/exp_avg_sq/step per
+    param onto pinned CPU tensors instead of resetting momentum. Params with no prior state (e.g.
+    training OOM'd before its first successful step) are left to lazy-init on first step(), matching
+    fresh-AdamW behavior."""
+    new_optimizer = CPUOffloadAdamW(
+        build_param_groups(model, cfg.train.weight_decay),
+        lr=cfg.train.lr,
+        weight_decay=cfg.train.weight_decay,
+        device=device,
+    )
+    # LambdaLR.__init__ requires 'initial_lr' already present in param_groups whenever it's
+    # constructed with last_epoch != -1 (its "resuming a schedule" path) — copy it over from the old
+    # optimizer so the caller can rebuild the scheduler against new_optimizer at the current step.
+    for old_group, new_group in zip(optimizer.param_groups, new_optimizer.param_groups):
+        if "initial_lr" in old_group:
+            new_group["initial_lr"] = old_group["initial_lr"]
+    for p, old_state in optimizer.state.items():
+        if "exp_avg" not in old_state:
+            continue
+        step = old_state["step"]
+        new_optimizer.state[p] = {
+            "exp_avg": old_state["exp_avg"].detach().to("cpu", dtype=torch.float32).pin_memory(),
+            "exp_avg_sq": old_state["exp_avg_sq"].detach().to("cpu", dtype=torch.float32).pin_memory(),
+            "grad_cpu": torch.empty_like(p, device="cpu", dtype=torch.float32).pin_memory(),
+            "step": step.item() if torch.is_tensor(step) else step,
+        }
+    return new_optimizer

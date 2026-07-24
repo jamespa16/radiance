@@ -1,0 +1,80 @@
+# Worked example: ACT that actually saves wall-clock.
+#
+# Router mode on its own does not — halting changes what gets *accumulated*, not what gets
+# *computed*, so every iteration costs a full dense pass regardless of how many tokens have
+# stopped. act_capacity_ratio is what converts it into a real adaptive-compute mechanism: each
+# interior iteration runs only that fraction of each sequence's positions through the whole
+# loop-body stack, and everything else keeps its hidden state while serving its keys/values from
+# the previous iteration's retained store.
+#
+# Measured fwd+bwd, bf16, max_loops 6:
+#   d512 L8, batch 8x512:   105.6 -> 87.0 (1.21x) -> 73.4 ms (1.44x)  at ratios 1.0 / 0.5 / 0.25
+#   d256 L6, batch 16x512:   71.3 -> 63.1 (1.13x) -> 60.1 ms (1.19x)
+#
+# The gain scales with how much of the step the loop body is (93% of FLOPs at d512, 83% at d256) —
+# the gather/scatter and attention mask are a roughly fixed overhead that amortises better on a
+# wider model. This config is the *smaller* shape, so expect ~1.2x on the step, and note that a
+# short run's wall-clock is dominated by compile and data loading rather than model compute: a
+# 400-step A/B here moved only 3% end to end while the step itself was 19% faster.
+#
+# Quality cost over that A/B (pinned batch_size, val/loss at step 400):
+#   ratio 1.0 -> 3.0735    ratio 0.5 -> 3.0757    ratio 0.25 -> 3.0728
+# i.e. indistinguishable at this scale.
+#
+# Two things to know before using it:
+#
+#  * It is an approximation. Reusing a halted position's K/V is exact only for the first block of
+#    the loop body — see tests/test_act_kv_invariance.py, which pins down exactly where the line is
+#    and why the tempting "frozen state implies frozen K/V" argument overreaches. Lower ratios trade
+#    more accuracy for more speed; treat the ratio as a hyperparameter, not a free switch.
+#  * It is training-only. Eval and generation always run the full dense model, so val/loss stays
+#    comparable across ratios and radiance-generate matches what evaluate() scored.
+#
+# Incompatible with grad_checkpoint (the config would be rejected at startup): recomputation during
+# backward would write the retained K/V store twice. Sparsity already cuts activation memory.
+
+run_name: tinystories-act-sparse
+
+data:
+  dataset: roneneldan/TinyStories
+  text_column: text
+  tokenizer: gpt2
+  seq_len: 512
+  num_workers: 4
+  cache_dir: .cache/radiance/tokenized
+
+model:
+  d_model: 256
+  head_dim: 64
+  n_layers: 6
+  ffn_mult: 4.0
+  ffn_depth: 2
+  dropout: 0.0
+  max_seq_len: 512
+
+  use_router: true          # ACT halting; act_capacity_ratio requires it
+  max_loops: 6
+  ponder_weight: 1.0e-2
+  halt_epsilon: 0.01
+
+  # The first and last iterations always run dense — the first because nothing has halted yet (and
+  # it seeds the retained K/V store), the last because it force-halts every remaining position at
+  # often-high weight, where an overflow drop would discard a real contribution.
+  act_capacity_ratio: 0.5
+
+  grad_checkpoint: false    # refused in combination with act_capacity_ratio < 1.0
+
+train:
+  batch_size: 32
+  lr: 3.0e-4
+  muon_lr: 0.02
+  warmup_ratio: 0.2
+  max_steps: 2000
+  eval_every: 100
+  save_every: 500
+  output_dir: checkpoints/tinystories_act_sparse
+  dtype: bf16
+
+wandb:
+  project: radiance
+  mode: online

@@ -1,0 +1,62 @@
+# Worked example: MoE with a shared expert, loss-free load balancing, and fine-grained experts.
+#
+# Three changes over configs/tinystories_moe.yaml, each independently toggleable:
+#
+#   moe_n_shared        an always-on expert every token flows through, so the routed experts can
+#                       specialise instead of each re-learning the common case (DeepSeekMoE)
+#   moe_balance: both   adds a non-learned per-expert bias, nudged after each optimizer step toward
+#                       under-loaded experts. Balances load without a gradient term competing with
+#                       the LM objective the way the aux loss alone does (DeepSeek-V3)
+#   moe_expert_ffn_mult fine-grained experts: 16 experts at 1/4 width with top_k 8 activates the
+#                       same parameter count per token as 4 experts at full width with top_k 2, but
+#                       from far more combinations. Affordable because the batched baddbmm dispatch
+#                       keeps step time nearly flat in expert count.
+
+run_name: tinystories-moe-v2
+
+data:
+  dataset: roneneldan/TinyStories
+  text_column: text
+  tokenizer: gpt2
+  seq_len: 512
+  num_workers: 4
+  cache_dir: .cache/radiance/tokenized
+
+model:
+  d_model: 256
+  head_dim: 64
+  n_layers: 6
+  loop_count: 2
+  ffn_mult: 4.0
+  ffn_depth: 2
+  dropout: 0.0
+  max_seq_len: 512
+
+  use_moe: true
+  n_experts: 16
+  moe_top_k: 8
+  moe_expert_ffn_mult: 0.25   # each routed expert is ffn_dim/4 wide
+  moe_capacity_factor: 1.25
+  moe_dense_every: 3          # keep every 3rd block of the loop body dense
+
+  moe_n_shared: 1
+  moe_shared_ffn_mult: 1.0
+
+  moe_balance: both           # "aux_loss" for the previous behavior, "bias" for no aux term
+  moe_bias_update_rate: 1.0e-3
+  moe_aux_loss_weight: 1.0e-3 # lower than the aux_loss-only default: the bias does most of the work
+
+train:
+  batch_size: 16
+  lr: 3.0e-4
+  muon_lr: 0.02
+  warmup_ratio: 0.2
+  max_steps: 2000
+  eval_every: 100
+  save_every: 500
+  output_dir: checkpoints/tinystories_moe_v2
+  dtype: bf16
+
+wandb:
+  project: radiance
+  mode: online

@@ -37,18 +37,25 @@ def generate(
     temperature: float = 0.8,
     top_k: int = 50,
     device: str = "cpu",
+    loops: int | None = None,
 ) -> str:
+    """`loops` overrides how many times the weight-shared loop body runs per forward pass.
+
+    A model trained with stochastic loop depth (model.loop_count_min/max) has seen a range of
+    depths, so inference can spend *more* compute per token than training did by raising this —
+    test-time compute scaling with no change to the weights. The KV cache is sized to match, since
+    it needs one slot per (block, iteration) pair actually executed.
+    """
     input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
     next_input = input_ids[:, -model.cfg.max_seq_len :]
-    kv_cache = model.new_kv_cache()
+    kv_cache = model.new_kv_cache(loop_count=loops)
 
     for _ in range(max_new_tokens):
         assert kv_cache.seq_len + next_input.shape[1] <= model.cfg.max_seq_len, (
             f"generation would exceed model.cfg.max_seq_len ({model.cfg.max_seq_len}); "
             "reduce --max-new-tokens or use a checkpoint trained with a larger max_seq_len"
         )
-        logits, _, _, _ = model(next_input, kv_cache=kv_cache)
-        logits = logits[:, -1, :]
+        logits = model(next_input, kv_cache=kv_cache, loop_count=loops).logits[:, -1, :]
 
         # Mask the vocab-padding rows (see model.padded_vocab_size): no tokenizer id maps to them,
         # so sampling one would decode to nothing and corrupt the KV cache for every later step.
@@ -83,6 +90,14 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.8, help="0 for greedy decoding")
     parser.add_argument("--top-k", type=int, default=50, help="0 to disable top-k filtering")
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument(
+        "--loops",
+        type=int,
+        default=None,
+        help="Override loop-body iterations per forward pass (default: the checkpoint's own "
+        "loop_count_max / max_loops). Raise it to spend more compute per token than training did — "
+        "most useful for a model trained with stochastic loop depth.",
+    )
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
     device = resolve_device(args.device)
@@ -99,6 +114,7 @@ def main() -> None:
         temperature=args.temperature,
         top_k=args.top_k,
         device=device,
+        loops=args.loops,
     )
     print(text)
 

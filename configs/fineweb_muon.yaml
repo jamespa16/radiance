@@ -1,0 +1,72 @@
+# Worked example: Muon + muP for width sweeps, on a real dataset.
+#
+# Muon (train.optimizer, the default) orthogonalises the momentum update of every hidden weight
+# matrix via a Newton-Schulz iteration, which lets it take a far larger step than AdamW at equal
+# stability. Embeddings, norms, biases and routers stay on an auxiliary AdamW at train.lr — so the
+# `lr` below still means what it always did, and `muon_lr` is a separate field.
+#
+# Measured on configs/tinystories.yaml (400 steps, RTX 5090): Muon reached val/loss 2.826 where
+# AdamW reached 3.300, and passed AdamW's *final* loss at roughly half the steps.
+#
+# mup_base_d_model makes the hyperparameters transferable across width. Tune lr/muon_lr once at a
+# small d_model with mup_base_d_model set to that width, then raise d_model: the init scale,
+# per-tensor LRs and output logit scale all track it, instead of the optimal lr silently moving
+# every time the model gets wider. Leave it unset and every muP correction is exactly 1.0.
+
+run_name: fineweb-muon
+
+data:
+  dataset: HuggingFaceFW/fineweb
+  text_column: text
+  tokenizer: gpt2
+  seq_len: 1024
+  num_workers: 8
+  streaming: true
+  shuffle_buffer_size: 10000
+  eval_split_size: 2000     # fineweb has no validation split; carve one off the front of train
+
+model:
+  d_model: 1024
+  head_dim: 64
+  n_kv_heads: 4             # GQA
+  n_layers: 16
+  loop_count: 1
+  ffn_mult: 4.0
+  ffn_depth: 2
+  dropout: 0.0
+  max_seq_len: 1024
+  grad_checkpoint: true
+
+  # Set to the width the LRs below were tuned at. Raising d_model above this rescales init,
+  # per-tensor LRs and the output logit scale automatically.
+  mup_base_d_model: 256
+
+train:
+  optimizer: muon
+  lr: 3.0e-4                # AdamW group: embeddings, norms, biases, routers/gates
+  muon_lr: 0.02             # Muon group: the hidden weight matrices
+  muon_momentum: 0.95
+  weight_decay: 0.01
+
+  # WSD rather than cosine: its stable phase doesn't depend on max_steps, so this run can be
+  # extended or branched from a mid-training checkpoint without the earlier steps having been
+  # trained on a schedule shaped for a different horizon. Cosine remains the default.
+  lr_schedule: wsd
+  wsd_decay_ratio: 0.2
+  warmup_ratio: 0.02
+  min_lr_ratio: 0.1
+
+  tokens_per_param: 20      # Chinchilla-optimal; overwrites max_steps once the model is built
+  max_steps: 100000         # ignored while tokens_per_param is set
+  target_effective_batch_size: 256
+  grad_clip: 1.0
+  log_every: 20
+  eval_every: 500
+  eval_max_batches: 50
+  save_every: 2000
+  output_dir: checkpoints/fineweb_muon
+  dtype: bf16
+
+wandb:
+  project: radiance
+  mode: online
