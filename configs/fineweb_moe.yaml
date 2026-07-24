@@ -1,0 +1,46 @@
+run_name: fineweb-rmoe-transformer
+
+data: 
+  dataset: HuggingFaceFW/fineweb
+  text_column: text
+  tokenizer: gpt2
+  seq_len: 1024
+  num_workers: 4
+  cache_dir: .cache/radiance/tokenized 
+  streaming: true
+  shuffle_buffer_size: 10000
+  eval_split_size: 4000
+  disk_cache_max_gb: 128
+  disk_cache_shard_size: 128
+  prefetch_factor: 2
+
+model:
+  d_model: 1024
+  head_dim: 64
+  n_layers: 6
+  use_router: true
+  use_moe: true
+  n_experts: 4
+  moe_top_k: 2
+  moe_capacity_factor: 1.35
+  moe_aux_loss_weight: 1.0e-3
+  moe_dense_every: 3
+  ffn_mult: 4.0
+  ffn_depth: 2
+  dropout: 0.03
+  max_seq_len: 1024
+
+train:
+  lr: 2.5e-3
+  weight_decay: 1.25e-4
+  warmup_ratio: 0.2
+  max_steps: 1000
+  grad_clip: 1.0
+  log_every: 10
+  eval_every: 50
+  save_every: 100
+  output_dir: checkpoints/fineweb/moe
+  seed: 42
+  device: auto
+  compile: true
+  dtype: bf16
