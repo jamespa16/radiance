@@ -501,16 +501,18 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   already applied to inactive MoE experts. See `configs/tinystories_mtp.yaml`.
 
   Checkpoints are **resumable**: `save_checkpoint` writes the optimizer state, LR-scheduler state and
-  `GradScaler` state alongside the weights/step/config, and `cfg.train.resume_from` (opt-in, default `null`)
-  restores all of it. Set it to a checkpoint path, or to the literal `"auto"` to pick the highest-numbered
-  `step_*.pt` in `output_dir` — so an interrupted run can be relaunched with its config unchanged. Without the
-  optimizer moments a "resumed" run restarts AdamW from zero momentum at warmup LR, which shows up as a loss
-  spike. An explicit `resume_from` path that doesn't exist raises rather than silently starting from scratch;
-  `"auto"` against an empty `output_dir` is just a fresh run. What is *not* restored is the DataLoader position
-  and RNG state, which trade off against each other: `train()` re-seeds off the resumed step so the loader draws
-  a different shuffle order rather than replaying batches already trained on. A resumed run is therefore
-  statistically equivalent to an uninterrupted one, not bit-identical — with `dropout: 0.0` it is bit-identical
-  (verified: same weights, same AdamW moments, same LR sequence).
+  `GradScaler` state alongside the weights/step/config. Only one checkpoint per run is kept — each
+  `save_every` save deletes the previous `step_*.pt` before writing the new one — so an output directory
+  holds at most one `.pt` file. `cfg.train.resume_from` (opt-in, default `null`) restores all saved state.
+  Set it to a checkpoint path, or to the literal `"auto"` to pick the single `step_*.pt` in `output_dir` —
+  so an interrupted run can be relaunched with its config unchanged. Without the optimizer moments a
+  "resumed" run restarts AdamW from zero momentum at warmup LR, which shows up as a loss spike. An explicit
+  `resume_from` path that doesn't exist raises rather than silently starting from scratch; `"auto"` against
+  an empty `output_dir` is just a fresh run. What is *not* restored is the DataLoader position and RNG state,
+  which trade off against each other: `train()` re-seeds off the resumed step so the loader draws a different
+  shuffle order rather than replaying batches already trained on. A resumed run is therefore statistically
+  equivalent to an uninterrupted one, not bit-identical — with `dropout: 0.0` it is bit-identical (verified:
+  same weights, same AdamW moments, same LR sequence).
 
   `cfg.train.eval_max_batches` (default `50`) caps how many batches each `evaluate()` call consumes. Uncapped —
   the previous behavior, restored with `null` — every eval walks the *entire* validation split, which is

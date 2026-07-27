@@ -293,24 +293,37 @@ def train(cfg: Config) -> None:
     compile_mode = "reduce-overhead"
     if cfg.train.compile and stochastic_depth:
         # Stochastic loop depth means the Python `for` over the loop body runs a different number
-        # of times per step, so dynamo traces one graph per distinct count. Two consequences:
-        #
-        # 1. The default cache limit (8) would be exceeded by a wide range and silently fall back
-        #    to eager for the rest of the run. Raise it to cover the range with headroom for the
-        #    separate eval/generate traces.
-        # 2. mode="reduce-overhead" captures each graph as a CUDA graph sharing one memory pool,
-        #    and CUDA graphs assume a *static* execution graph — which is exactly what stochastic
-        #    depth gives up. Replaying a different loop count overwrites the previous graph's
-        #    gradient tensors ("accessing gradient tensor output of CUDAGraphs that has been
-        #    overwritten by a subsequent run"). Drop to plain inductor: still compiled, just
-        #    without the CUDA-graph capture that the varying shape makes unsound.
+        # of times per step, so dynamo traces one graph per distinct count. The default cache limit
+        # (8) would be exceeded by a wide range and silently fall back to eager for the rest of the
+        # run. Raise it to cover the range with headroom for the separate eval/generate traces.
         span = (cfg.model.loop_count_max or cfg.model.loop_count) - cfg.model.loop_count_min + 1
         torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 4 * span + 8)
+
+    if cfg.train.compile and (stochastic_depth or cfg.model.grad_checkpoint):
+        # mode="reduce-overhead" captures each graph as a CUDA graph sharing one memory pool, which
+        # assumes a *static* execution graph. Two independent things give that up:
+        #
+        # 1. Stochastic loop depth: replaying a different loop count overwrites the previous
+        #    graph's gradient tensors ("accessing gradient tensor output of CUDAGraphs that has
+        #    been overwritten by a subsequent run").
+        # 2. grad_checkpoint: torch.utils.checkpoint recomputes each block during backward:
+        #    AOTAutograd partitions that recompute into its own graph segment, and under
+        #    reduce-overhead each segment gets captured as its own CUDA graph against the same
+        #    static pool — so the recompute's outputs overwrite a tensor the original forward's
+        #    backward still needs ("accessing tensor output of CUDAGraphs that has been overwritten
+        #    by a subsequent run"). Same failure mode as (1), different trigger.
+        #
+        # Drop to plain inductor in either case: still compiled, just without the CUDA-graph
+        # capture that a varying shape or a recompute makes unsound.
         compile_mode = None
+        reasons = []
+        if stochastic_depth:
+            reasons.append("stochastic loop depth")
+        if cfg.model.grad_checkpoint:
+            reasons.append("grad_checkpoint")
         print(
-            "[radiance] stochastic loop depth is on, so compiling without CUDA graphs "
-            "(mode=None instead of 'reduce-overhead'): the loop count varies per step, which a "
-            "captured graph cannot represent."
+            f"[radiance] {' and '.join(reasons)} on, so compiling without CUDA graphs "
+            "(mode=None instead of 'reduce-overhead')."
         )
 
     model = torch.compile(raw_model, mode=compile_mode) if cfg.train.compile else raw_model
@@ -543,6 +556,9 @@ def train(cfg: Config) -> None:
                     wandb.log({"val/loss": val_loss}, step=step)
 
                 if step % cfg.train.save_every == 0:
+                    # Keep only the latest checkpoint — remove previous ones before saving.
+                    for old_ckpt in output_dir.glob("step_*.pt"):
+                        old_ckpt.unlink()
                     save_checkpoint(
                         output_dir / f"step_{step}.pt", raw_model, optimizer, scheduler, scaler, step, cfg
                     )
