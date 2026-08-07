@@ -1,0 +1,36 @@
+name: GPU tests
+
+# Full suite, including tests/test_compile.py (marked `slow`) — compiled-model
+# regression tests that are CUDA-only and each pay an inductor compile.
+# CLAUDE.md calls these out as required after touching attention masking, the
+# loop count, or compile settings.
+#
+# Manual trigger only (workflow_dispatch), not on every push: the runner is a
+# personal GPU box that may be mid-training-run, and this suite compiles
+# several models back to back — see "Startup compile cost" in CLAUDE.md.
+# Run it by hand (Actions tab -> GPU tests -> Run workflow) after changes in
+# that area, or add a push trigger yourself once you're comfortable with the
+# time/VRAM cost running unattended.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: gpu-tests
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check GPU visibility
+        run: nvidia-smi
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Run full test suite (includes slow/CUDA-only tests)
+        run: uv run --group dev pytest
