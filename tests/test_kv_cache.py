@@ -23,6 +23,7 @@ MODES = {
     "moe": dict(use_moe=True, n_experts=4, moe_top_k=2, loop_count=2),
     "moe_router": dict(use_moe=True, n_experts=4, use_router=True, max_loops=3),
     "gqa": dict(n_kv_heads=2, loop_count=2),
+    "nsa": dict(use_nsa=True, nsa_block_size=4, nsa_top_k_blocks=2, doc_attention_mask=False, loop_count=2),
 }
 
 
@@ -37,10 +38,13 @@ def test_incremental_decode_matches_full_forward(tiny_cfg, tiny_ids, mode):
 
         # Prefill on a prompt, then decode the rest one token at a time.
         cache = model.new_kv_cache()
+        # cfg.use_nsa needs its own compressed-block cache alongside the ordinary one, driven in
+        # lockstep — None for every other mode, a no-op there.
+        nsa_cache = model.new_nsa_cache() if cfg.model.use_nsa else None
         prompt_len = 5
-        stepwise = [model(ids[:, :prompt_len], kv_cache=cache).logits]
+        stepwise = [model(ids[:, :prompt_len], kv_cache=cache, nsa_cache=nsa_cache).logits]
         for t in range(prompt_len, ids.size(1)):
-            stepwise.append(model(ids[:, t : t + 1], kv_cache=cache).logits)
+            stepwise.append(model(ids[:, t : t + 1], kv_cache=cache, nsa_cache=nsa_cache).logits)
         stepwise = torch.cat(stepwise, dim=1)
 
     assert stepwise.shape == full.shape
@@ -59,11 +63,14 @@ def test_cache_slot_count_matches_attention_calls(tiny_cfg, tiny_ids, mode):
     cfg = tiny_cfg(**MODES[mode])
     model = DenseTransformer(cfg.model, vocab_size=TINY_VOCAB).eval()
     cache = model.new_kv_cache()
+    nsa_cache = model.new_nsa_cache() if cfg.model.use_nsa else None
 
     with torch.no_grad():
-        model(tiny_ids(batch=1, seq=4), kv_cache=cache)
+        model(tiny_ids(batch=1, seq=4), kv_cache=cache, nsa_cache=nsa_cache)
 
     assert cache._cursor == len(cache._k), (
         f"{mode}: forward made {cache._cursor} attention calls but new_kv_cache() allocated "
         f"{len(cache._k)} slots"
     )
+    if nsa_cache is not None:
+        assert nsa_cache._cursor == len(nsa_cache._k) == len(cache._k)

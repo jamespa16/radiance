@@ -162,6 +162,33 @@ class ModelConfig:
     # loop iteration and clamped at the end of the list. A knob that only exists because the
     # architecture loops — the same weights get a different receptive field on each pass. Requires
     # doc_attention_mask (it rides the same flex_attention BlockMask). None = every pass is global.
+    use_nsa: bool = False  # opt-in: DeepSeek NSA-style learned block-sparse attention. Replaces plain
+    # dense/doc-masked attention with two branches: a coarse "compression" branch attending against
+    # mean-pooled KV blocks (cheap, always dense), and a fine "selection" branch attending against
+    # only the top-k historical KV blocks a learned score picks per query *token*, plus that token's
+    # own local block. A per-token gate (NSAGate) combines the two. Unlike value_residual/attn_out_gate,
+    # there is no zero/identity init that makes a learned key-selection mechanism equivalent to dense
+    # attention, so this follows the use_moe/use_router/n_kv_heads precedent: off by default, a
+    # genuinely different computation you opt into, not a free inert addition. Incompatible with
+    # doc_attention_mask (mean-pooling raw KV blocks has no document-boundary awareness, so a block
+    # straddling a packed-document join would blend two documents together before any attention mask
+    # gets applied — masking the attention step can't undo that), with loop_attn_windows (the
+    # selection branch's forced local block already covers recency; combining two receptive-field
+    # mechanisms is unscoped), and with act_capacity_ratio/act_ffn_capacity_ratio < 1.0 (two
+    # independent sparsity axes). See DenseTransformer.__init__ for the raised errors.
+    nsa_block_size: int = 128  # granularity, in raw KV positions, of both compression pooling and
+    # selection. Selection is decided per query *token* (not per query block — a shared per-block
+    # decision would need to average in later tokens' scores that don't exist yet during incremental
+    # decoding, which is impossible; see _nsa_select_blocks), so unlike doc_attention_mask's window
+    # BlockMask, a mismatched value here doesn't just lose sparsity at the tile level — the selection
+    # branch's BlockMask is built with BLOCK_SIZE=nsa_block_size, and flex_attention's Triton kernel
+    # only accepts a BLOCK_SIZE that's a multiple of its own internal tile size (128 on the hardware
+    # this was verified against) — anything smaller raises at the first compiled forward, not just
+    # runs slower. Leave this at 128 unless you've confirmed a different value's kernel actually
+    # compiles on your GPU.
+    nsa_top_k_blocks: int = 8  # non-local historical blocks the selection branch attends to, per
+    # query token, per head, in addition to that token's own always-included local block. Clamped to
+    # the number of causally-valid candidate blocks when the sequence is shorter than that.
     grad_checkpoint: bool = False  # opt-in: recompute each block's activations during backward instead
     # of storing them. Trades ~20-30% throughput for a large drop in activation memory, and it pays off
     # disproportionately here because blocks[1:] is re-run loop_count/max_loops times per forward with
@@ -240,8 +267,17 @@ class TrainConfig:
     grad_accum_steps: int = 1  # micro-batches (of batch_size each) accumulated per optimizer.step();
     # effective_batch_size = batch_size * grad_accum_steps. Raise this instead of batch_size to grow the
     # effective batch beyond what fits in VRAM.
-    lr: float = 3.0e-4  # AdamW's LR. Under optimizer="muon" this governs only the tensors AdamW
+    lr: float = 1.0e-2  # AdamW's LR. Under optimizer="muon" this governs only the tensors AdamW
     # still owns (embeddings, norm gains, biases, routers/gates) — see optim.build_muon_param_groups.
+    #
+    # Was 3.0e-4, which is what it had been tuned to back when AdamW trained *every* tensor. Moving
+    # the hidden weights to Muon preserved that value but silently changed its job, leaving the tied
+    # embedding — the one large matrix AdamW still owns — training ~30-100x too slowly. A sweep on
+    # configs/tinystories.yaml bottoms out flat between 1.0e-2 and 3.0e-2 and is worth ~0.44 val/loss
+    # at 1200 steps (2.2341 -> 1.7984), better at every eval point; see "Measured results" in
+    # CLAUDE.md. This is one of the few defaults here that changes results deliberately, and unlike
+    # the rest of them it is a fix, not a feature. Note it only reaches configs that *omit* lr —
+    # most configs in configs/ pin it, and pinning 3.0e-4 restores the old behavior exactly.
     optimizer: str = "muon"  # "muon" (default) or "adamw". Muon orthogonalises the momentum update
     # of every hidden weight matrix via a Newton-Schulz iteration, which lets it take a much larger
     # step than AdamW at equal stability; embeddings/norms/biases stay on an auxiliary AdamW. Set
@@ -249,6 +285,14 @@ class TrainConfig:
     muon_lr: float = 0.02  # LR for the Muon group only. Deliberately a separate field rather than a
     # multiplier on `lr`: Muon's normalised update wants a ~50x larger LR, so folding the two
     # together would silently invalidate every config's tuned `lr`.
+    embed_lr: float | None = None  # LR for the tied token_emb/lm_head matrix only. None (default)
+    # resolves to `lr`, collapsing this to exactly the previous single-LR behavior — the
+    # range-collapsed inert default this file's convention asks for. Split out because `lr` was
+    # tuned when AdamW owned *every* tensor: moving the hidden weights to Muon left the embedding
+    # as the one large matrix still on AdamW, and the value that was right for "all of it" is far
+    # too small for "just the embedding". The embedding also wants a different LR from the other
+    # tensors AdamW still holds (norm gains, biases, routers, gates), whose scale is load-bearing —
+    # hence its own field rather than simply raising `lr`. See embed_lr_resolved.
     muon_momentum: float = 0.95
     weight_decay: float = 0.01
     warmup_ratio: float = 0.04  # warmup_steps = round(max_steps * warmup_ratio)
@@ -303,6 +347,16 @@ class TrainConfig:
     device: str = "auto"
     compile: bool = True
     dtype: str = "fp32"
+
+    @property
+    def embed_lr_resolved(self) -> float:
+        """The tied embedding's LR, falling back to `lr` when embed_lr is unset.
+
+        Exactly `lr` by default, which is what makes the separate embedding group inert for every
+        config that hasn't set it — the group is still built, but at the same LR it had when it
+        shared AdamW's decayed group, so the update is unchanged.
+        """
+        return self.lr if self.embed_lr is None else self.embed_lr
 
     @property
     def warmup_steps(self) -> int:

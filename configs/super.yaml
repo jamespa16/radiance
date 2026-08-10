@@ -1,0 +1,20 @@
+data:
+  dataset: HuggingFaceFW/fineweb
+  streaming: true
+  disk_cache_max_gb: 50
+  eval_split_size: 3000
+
+model:
+  use_router: true
+  loop_count_max: 16
+  use_moe: true
+  n_experts: 16
+  grad_checkpoint: true
+
+train:
+  optimizer: muon
+  lr_schedule: wsd
+  max_steps: 1000
+  dtype: bf16
+  eval_every: 100
+  save_every: 100

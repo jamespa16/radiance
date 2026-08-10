@@ -107,6 +107,21 @@ def test_moe_expert_stacks_are_routed_to_muon():
     assert id(moe.router.proj.weight) not in muon_params  # routers stay on AdamW
 
 
+def test_nsa_gate_is_not_routed_to_muon():
+    """nsa_router is a tiny gate (RMSNorm -> Linear(d_model, 2)), same treatment as every other
+    router/gate — named with the "router" substring specifically so it rides the existing
+    exclusion list with no optim.py change."""
+    model, cfg = _model_and_cfg(
+        use_nsa=True, nsa_block_size=4, nsa_top_k_blocks=2, doc_attention_mask=False
+    )
+    groups = build_muon_param_groups(model, cfg)
+    muon_params = {id(p) for g in groups if g["algorithm"] == "muon" for p in g["params"]}
+
+    for block in model.blocks:
+        assert id(block.attn.nsa_router.proj.weight) not in muon_params
+        assert id(block.attn.qkv_proj.weight) in muon_params  # the real hidden matrix still is
+
+
 def test_muon_group_uses_muon_lr():
     """Muon needs a ~50x larger LR than AdamW; the two must not share one field."""
     model, cfg = _model_and_cfg()
@@ -115,6 +130,62 @@ def test_muon_group_uses_muon_lr():
 
     assert next(g["lr"] for g in groups if g["algorithm"] == "muon") == 0.02
     assert all(g["lr"] == 3e-4 for g in groups if g["algorithm"] == "adamw")
+
+
+def test_embed_lr_is_inert_when_unset():
+    """cfg.train.embed_lr defaults to None, which resolves to `lr` — so the embedding gets its own
+    group but at exactly the LR it had when it shared AdamW's decayed group. Every existing config
+    therefore trains identically."""
+    model, cfg = _model_and_cfg()
+    cfg.train.lr, cfg.train.embed_lr = 3e-4, None
+    groups = build_muon_param_groups(model, cfg)
+
+    assert cfg.train.embed_lr_resolved == 3e-4
+    assert all(g["lr"] == 3e-4 for g in groups if g["algorithm"] == "adamw")
+
+
+def test_embed_lr_applies_to_the_embedding_alone():
+    """Set, it must move the tied token_emb/lm_head matrix and nothing else: the routers, gates and
+    norm gains AdamW also owns keep `lr`, since their exact scale is load-bearing in a way the
+    embedding's is not."""
+    model, cfg = _model_and_cfg()
+    cfg.train.lr, cfg.train.embed_lr = 3e-4, 0.05
+    groups = build_muon_param_groups(model, cfg)
+
+    embed_groups = [g for g in groups if any(p is model.token_emb.weight for p in g["params"])]
+    assert len(embed_groups) == 1, "the tied matrix must live in exactly one group"
+    assert embed_groups[0]["lr"] == 0.05
+    assert embed_groups[0]["algorithm"] == "adamw"  # never orthogonalised
+    # It is alone there — the gates/routers/norms did not come along for the larger step.
+    assert [id(p) for p in embed_groups[0]["params"]] == [id(model.token_emb.weight)]
+    for group in groups:
+        if group is embed_groups[0]:
+            continue
+        assert group["lr"] == (0.02 if group["algorithm"] == "muon" else 3e-4)
+
+
+def test_embed_lr_actually_changes_the_embedding_update():
+    """The other half of the inert-default pair: prove the knob does something. Two otherwise
+    identical models stepped on identical gradients must diverge in the embedding and nowhere
+    else."""
+    results = {}
+    for embed_lr in (None, 0.05):
+        model, cfg = _model_and_cfg()
+        cfg.train.lr, cfg.train.embed_lr = 3e-4, embed_lr
+        optimizer = build_optimizer(model, cfg, "cpu")
+        torch.manual_seed(0)
+        for p in model.parameters():
+            p.grad = torch.ones_like(p)
+        optimizer.step()
+        results[embed_lr] = (
+            model.token_emb.weight.detach().clone(),
+            model.blocks[1].ln1.weight.detach().clone(),
+        )
+
+    embed_default, norm_default = results[None]
+    embed_raised, norm_raised = results[0.05]
+    assert not torch.allclose(embed_default, embed_raised), "embed_lr did not move the embedding"
+    torch.testing.assert_close(norm_default, norm_raised)  # ...and moved nothing else
 
 
 # --- optimizer behaviour -------------------------------------------------------------------

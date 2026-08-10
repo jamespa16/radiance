@@ -34,6 +34,7 @@ LOOP_MODES = {
     "bptt": dict(loop_count=4, loop_bptt_window=2),
     "router": dict(use_router=True, max_loops=4),
     "moe": dict(loop_count=3, use_moe=True, n_experts=4),
+    "nsa": dict(loop_count=3, use_nsa=True, nsa_block_size=4, nsa_top_k_blocks=2, doc_attention_mask=False),
 }
 
 

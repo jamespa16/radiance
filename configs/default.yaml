@@ -1,0 +1,101 @@
+# This YAML file serves to document the defaults and serve as a window into what is possible with this system
+
+run_name: radiance-run
+
+data:
+  dataset: roneneldan/TinyStories
+  text_column: text
+  tokenizer: gpt2
+  seq_len: 512
+  num_workers: 4
+  cache_dir: .cache/radiance/tokenized
+  streaming: false
+  shuffle_buffer_size: 1000
+  disk_cache_max_gb: null
+  disk_cache_shard_size: 100
+  prefetch_factor: 2
+  eval_split_size: 0
+
+model:
+  d_model: 256
+  head_dim: 32
+  n_kv_heads: null
+  qk_norm: true
+  value_residual: true
+  attn_out_gate: true
+  mtp_heads: 1
+  mtp_weight: 0.3
+  z_loss_weight: 1.0e-4
+  n_layers: 6
+  loop_count: 1
+  loop_iter_conditioning: norm_gains  # options: norm_gains, lora, none
+  loop_lora_rank: 8
+  loop_input_injection: true
+  loop_count_min: null
+  loop_count_max: null
+  loop_bptt_window: null
+  use_router: false
+  max_loops: 6
+  ponder_weight: 1.0e-2
+  halt_epsilon: 0.01
+  act_capacity_ratio: 1.0
+  act_ffn_capacity_ratio: 1.0
+  ffn_mult: 4.0
+  ffn_depth: 2
+  use_moe: false
+  n_experts: 8
+  moe_top_k: 2
+  moe_capacity_factor: 1.25
+  moe_aux_loss_weight: 1.0e-2
+  moe_balance: both  # options: aux_loss, bias, both
+  moe_bias_update_rate: 1.0e-3
+  moe_n_shared: 1
+  moe_shared_ffn_mult: 1.0
+  moe_expert_ffn_mult: null
+  moe_eval_full_capacity: true
+  moe_dense_every: null
+  mup_base_d_model: null
+  dropout: 0.1
+  max_seq_len: 512
+  rope_theta: 10000.0
+  doc_attention_mask: true
+  loop_attn_windows: null
+  grad_checkpoint: false
+  vocab_pad_multiple: 128
+
+train:
+  batch_size: 32
+  grad_accum_steps: 1
+  lr: 1.0e-2  # was 3.0e-4 — see TrainConfig.lr and CLAUDE.md's "Measured results"
+  optimizer: muon  # options: muon, adamw
+  muon_lr: 0.02
+  muon_momentum: 0.95
+  embed_lr: null  # null resolves to `lr`. LR for the tied token_emb/lm_head matrix alone — the one
+  # large tensor AdamW still owns once Muon takes the hidden weights, and the one most badly served
+  # by `lr`'s default. See "Measured results" in CLAUDE.md: raising it is worth ~0.4 val/loss.
+  weight_decay: 0.01
+  warmup_ratio: 0.04
+  min_lr_ratio: 0.1
+  lr_schedule: cosine  # options: cosine, wsd
+  wsd_decay_ratio: 0.2
+  max_steps: 5000
+  tokens_per_param: null
+  auto_batch_size: true
+  target_effective_batch_size: null
+  vram_safety_margin: 0.5
+  grad_clip: 1.0
+  log_every: 10
+  eval_every: 500
+  eval_max_batches: 50
+  save_every: 1000
+  output_dir: checkpoints/run
+  resume_from: null
+  seed: 42
+  device: auto  # auto resolves to cuda, mps, or cpu
+  compile: true
+  dtype: fp32  # options: fp32, fp16, bf16
+
+wandb:
+  project: radiance
+  entity: null
+  mode: online  # options: online, offline, disabled

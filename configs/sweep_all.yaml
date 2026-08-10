@@ -1,0 +1,126 @@
+# Comprehensive W&B sweep over configs/tinystories.yaml.
+#
+# Explores the full hyperparameter surface of the model: architecture,
+# training dynamics, and loop mechanics. Uses Bayesian optimization
+# (method: bayes) to navigate the space efficiently.
+#
+# Usage:
+#   uv run wandb sweep configs/sweep_all.yaml
+#   uv run wandb agent <sweep-id-printed-above>
+#
+# Run multiple agents in parallel to explore faster:
+#   uv run wandb agent <sweep-id-printed-above> &  # repeat N times
+
+program: src/radiance/sweep.py
+method: bayes
+project: radiance
+
+metric:
+  name: val/loss
+  goal: minimize
+
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - "--config"
+  - "configs/tinystories.yaml"
+
+parameters:
+  model:
+    parameters:
+      d_model:
+        # Core width. 128-1024 covers tiny proxy through serious model.
+        # Discrete values keep n_heads = d_model / head_dim clean.
+        # VRAM note: 768+ paired with n_layers=12 and ffn_mult=6 will
+        # hit ~900M params (20+ GB optimizer state). auto_batch_size
+        # will compensate, but large-loop runs will be slow.
+        values: [128, 256, 384, 512, 768, 1024]
+
+      n_layers:
+        # Block count. Effective depth = 1 + (n_layers - 1) * loop_count.
+        # Keep modest (2-8) because loop_count multiplies it — a 12-layer,
+        # loop_count=16 model executes 187 block passes.
+        min: 2
+        max: 8
+        distribution: int_uniform
+
+      head_dim:
+        # Attention head size. Smaller = more heads for fixed d_model.
+        values: [32, 64]
+
+      ffn_mult:
+        # FFN expansion factor. ffn_dim = round(d_model * ffn_mult).
+        min: 2.0
+        max: 6.0
+        distribution: uniform
+
+      ffn_depth:
+        # MLP depth (stacked Linear + GELU layers).
+        min: 1
+        max: 4
+        distribution: int_uniform
+
+      loop_count:
+        # Fixed loop iterations for blocks[1:]. loop_count=1 is plain
+        # transformer (no loop). Higher multiplies effective depth without
+        # adding parameters. auto_batch_size + OOM backoff handle the
+        # activation memory cost (scales with loop_count).
+        min: 1
+        max: 16
+        distribution: int_uniform
+
+      loop_iter_conditioning:
+        # Per-iteration identity for the weight-shared loop body.
+        # Mapped as: 0="none", 1="norm_gains", 2="lora"
+        # (sweep.py applies the mapping; bayes method doesn't support string values)
+        values: [0, 1, 2]
+
+      loop_lora_rank:
+        # Rank of per-iteration LoRA adapters (only when conditioning="lora").
+        values: [4, 8, 16]
+
+      dropout:
+        # Standard regularization. Keep low since doc_attention_mask
+        # uses flex_attention which has no attention-weight dropout.
+        min: 0.0
+        max: 0.1
+        distribution: uniform
+
+      z_loss_weight:
+        # Log-Z regulariser. Keeps logit scale from drifting, especially
+        # important with looping (multiplies effective depth).
+        min: 1.0e-6
+        max: 1.0e-3
+        distribution: log_uniform_values
+
+  train:
+    parameters:
+      lr:
+        # AdamW LR (governs embeddings, norms, biases, routers/gates).
+        min: 1.0e-5
+        max: 1.0e-3
+        distribution: log_uniform_values
+
+      muon_lr:
+        # Muon LR for hidden weight matrices. ~50x larger than AdamW LR.
+        min: 1.0e-3
+        max: 5.0e-2
+        distribution: log_uniform_values
+
+      weight_decay:
+        min: 1.0e-5
+        max: 1.0e-2
+        distribution: log_uniform_values
+
+      warmup_ratio:
+        # Fraction of max_steps spent warming up.
+        min: 0.01
+        max: 0.3
+        distribution: uniform
+
+      grad_clip:
+        # Gradient clipping threshold.
+        min: 0.5
+        max: 5.0
+        distribution: uniform

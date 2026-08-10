@@ -107,9 +107,17 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   approximation you reach for deliberately). The distinction is cost and reversibility, not novelty — a feature
   whose "on" state is free and inert defaults on; one that spends real memory or changes a tuned quantity doesn't.
 
-  Four settings change results at their defaults, intentionally: `doc_attention_mask`, `optimizer: muon`,
-  `z_loss_weight`, and MoE's `moe_n_shared`/`moe_balance`. Each is a straightforward improvement rather than an
-  experiment — see the A/B numbers recorded below.
+  Five settings change results at their defaults, intentionally: `doc_attention_mask`, `optimizer: muon`,
+  `z_loss_weight`, MoE's `moe_n_shared`/`moe_balance`, and `train.lr`. Each is a straightforward improvement
+  rather than an experiment — see the A/B numbers recorded below.
+
+  `train.lr` is the odd one out and the one to be careful with, because it is the only *tuned quantity* on that
+  list rather than a feature flag — exactly the category the paragraph above says shouldn't change by default.
+  It changed anyway because it had become simply wrong (`3.0e-4` -> `1.0e-2`; see `optim.py` below for the
+  sweep). Two consequences worth knowing. It reaches only configs that **omit** `lr`, which today means the
+  `sweep*`/`super*` ones — every worked example in `configs/` pins `lr: 3.0e-4` and so still trains at the old
+  value until edited. And the 400-step baselines recorded under "Measured results" predate it, so reproducing
+  them means pinning `lr: 3.0e-4` explicitly.
 - **`data.py`** — `build_tokenizer(cfg)` loads an `AutoTokenizer`. `build_dataloaders(cfg, tokenizer)` calls
   `datasets.load_dataset(cfg.data.dataset)` (expects a HF `user/dataset` with `train`/`validation` splits), tokenizes,
   then **packs**: concatenates all tokenized examples (joined by EOS) into one long stream and chunks it into
@@ -209,6 +217,43 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   new configs set `dropout: 0.0`. FFN residual dropout is unaffected. `model.loop_attn_windows` rides the same
   machinery to give each loop iteration its own receptive field (e.g. `[128, 128, 512, 512]` for local-then-global
   passes) — a knob that only exists *because* the architecture loops.
+
+  `cfg.model.use_nsa` (opt-in, default `False`) replaces plain dense/doc-masked attention with a simplified,
+  two-branch version of DeepSeek's Native Sparse Attention: a coarse **compression** branch attends against
+  mean-pooled blocks of raw K/V (cheap, always dense — `_nsa_compress`), and a fine **selection** branch attends
+  only the top-`nsa_top_k_blocks` historical blocks a learned score picks per query *token*, plus that token's own
+  local block (`_nsa_select_blocks`). A per-token gate (`NSAGate`, same `RMSNorm -> Linear` shape as
+  `ACTRouter`/`MoERouter`) combines the two. Unlike `value_residual`/`attn_out_gate`, a learned key-selection
+  mechanism has no zero/identity init that makes it equivalent to dense attention, so this follows the
+  `use_moe`/`use_router`/`n_kv_heads` precedent — off by default, not a free inert addition.
+
+  Selection is decided **per query token, not per query block**, even though every other block-sparse mechanism
+  in this file (doc masking, `loop_attn_windows`) shares a decision across a `flex_attention` tile for efficiency.
+  An earlier version of this shared the decision per query block to match tile granularity, and it was wrong: a
+  block's selection would need to average in later tokens' scores that don't exist yet during incremental
+  decoding, which is impossible without seeing the future. Since NSA has no dense fallback at inference (the model
+  is *trained* attending only to selected blocks, so generation must reproduce the identical computation, not an
+  approximation of it — unlike `doc_attention_mask`'s generation fallback, which is exact only because a single
+  prompt really is one document), train and decode have to compute the same thing, which means per-token
+  everywhere. The cost is real: most `flex_attention` tiles become "partial" (computed but masked) rather than
+  cleanly skippable, since different query rows in the same tile can select different blocks.
+
+  Three things are incompatible with `use_nsa` and raise at `DenseTransformer.__init__` if combined: `doc_attention_mask`
+  (mean-pooling raw K/V blocks has no document-boundary awareness, so a block straddling a packed-document join
+  would blend two documents together *before* any attention mask is applied — masking the attention step can't
+  undo that); `loop_attn_windows` (the selection branch's forced local block already covers the same recency need);
+  and `act_capacity_ratio`/`act_ffn_capacity_ratio` below 1.0 (two independent sparsity axes). `cfg.model.nsa_block_size`
+  (default `128`, matching `flex_attention`'s own default tile size) must stay there unless you've separately
+  confirmed a different value's kernel actually compiles on your GPU — `create_block_mask`'s Triton kernel only
+  accepts a `BLOCK_SIZE` that's a multiple of its own internal tile size, so a smaller value doesn't just run
+  slower, it raises a `LoweringException` at the first compiled forward. Generation needs its own machinery:
+  `NSACompressedCache` mirrors `KVCache`'s implicit-call-order slot scheme, tracking each slot's finalized
+  compressed blocks (from a small pre-RoPE pending buffer — `KVCache` itself only ever stores *post*-RoPE K/V,
+  which can't be safely mean-pooled across positions) plus, implicitly, the real per-position K/V it needs for the
+  selection branch's gather (already retained in full by the ordinary `KVCache`, since NSA's saving is in compute,
+  not cache memory). See `configs/tinystories_nsa.yaml` for a worked example, and the "Measured results" section
+  below for why it isn't (yet) a win at this scale.
+
   Several `ModelConfig`/`TrainConfig` fields are stored as ratios rather than absolute values and expose the
   absolute quantity as a read-only derived property of the same name minus the ratio suffix, so the rest of the
   codebase (and `vars(cfg.model)`/`vars(cfg.train)` used for W&B logging) never needs to distinguish the two:
@@ -439,6 +484,27 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   `cfg.train.muon_lr` (default `0.02`, ~50x AdamW's) while the AdamW groups keep `cfg.train.lr` — a separate
   field precisely so every existing config's tuned `lr` still means what it did.
 
+  **That last decision left `lr` badly mistuned, and it was the single largest quality bug measured in this
+  repo.** Keeping `lr` fixed across the Muon switch preserved its *value* but silently changed its *job*: it was
+  tuned when AdamW trained every tensor, and afterwards it governed only what Muon doesn't own — overwhelmingly
+  the tied `token_emb`/`lm_head` matrix. At `3e-4` that embedding became the bottleneck of the whole model.
+  Sweeping it on `configs/tinystories.yaml` (400 steps, batch pinned at 32, `auto_batch_size: false`) gives a
+  clean bowl with its minimum **30-100x above the old default**:
+
+  | `train.lr` | 3e-4 (old default) | 1e-3 | 3e-3 | 1e-2 | 3e-2 | 1e-1 |
+  |---|---|---|---|---|---|---|
+  | `val/loss` @400 | 2.9111 | 2.4460 | 2.1800 | 2.1117 | **2.1051** | 2.1520 |
+
+  Run-to-run noise on this setup is ~0.002 (a re-run of the baseline gave 2.9091), so the ~0.8 spread is not
+  close to a judgement call. `cfg.train.embed_lr` exists because of *where* that win comes from: holding
+  everything else at `3e-4` and raising only the embedding recovers 0.754 of the 0.797, while raising only the
+  norms/gates/routers recovers 0.416 — they overlap rather than add, but the embedding is plainly the dominant
+  term. It defaults to `None`, resolving to `lr` (the range-collapsed inert default this file's convention asks
+  for), so the embedding gets its own parameter group at exactly the LR it had when it shared AdamW's decayed
+  group. Set it to tune the embedding independently of the routers and gates, whose exact scale is load-bearing
+  in a way the embedding's is not — that is the whole reason it is a separate field rather than advice to raise
+  `lr`.
+
   **muP** (`cfg.model.mup_base_d_model`) makes hyperparameters transfer across width. It defaults to `None`,
   resolving to `d_model`, so `mup_width_mult` is exactly `1.0` and every correction is an identity until a base
   is set. When it isn't 1: hidden-weight init std scales by `1/sqrt(m)`, and the output logit multiplier by
@@ -626,15 +692,53 @@ A/B runs on `configs/tinystories.yaml` (400 steps, RTX 5090, `val/loss` at step 
 | `doc_attention_mask` on vs off | 2.808 | **2.774** |
 | loop conditioning + input injection vs plain looping (`loop_count: 3`) | 2.900 | **2.861** |
 
-Muon is the large one: it passed AdamW's *final* loss at roughly half the steps (2.827 at step 200 vs AdamW's
-3.300 at step 400). The other two are consistent rather than dramatic — better at every eval point, not just the
-last. Re-run any of these with `wandb.mode: disabled`; the stdout logging makes the numbers visible without W&B.
+Muon is the large one *of those three*: it passed AdamW's *final* loss at roughly half the steps (2.827 at step
+200 vs AdamW's 3.300 at step 400). The other two are consistent rather than dramatic — better at every eval
+point, not just the last. Re-run any of these with `wandb.mode: disabled`; the stdout logging makes the numbers
+visible without W&B.
+
+**Retuning `train.lr` dwarfs all of them, and it is a fix rather than a feature** — see the sweep table under
+`optim.py` for why `3e-4` stopped being the right value the moment Muon took over the hidden weights. Confirmed
+at a longer horizon (1200 steps, same config and pinning, so these are *not* comparable to the 400-step numbers
+above):
+
+| 1200 steps | step 200 | 400 | 600 | 800 | 1000 | 1200 |
+|---|---|---|---|---|---|---|
+| `lr: 3.0e-4` (old default) | 3.9008 | 2.8956 | 2.5929 | 2.4093 | 2.2926 | 2.2341 |
+| `lr: 3.0e-4`, `embed_lr: 1.0e-2` | 2.7470 | 2.3321 | 2.1292 | 1.9872 | 1.8830 | **1.8290** |
+| `lr: 1.0e-2` | 2.6801 | 2.2719 | 2.0797 | 1.9482 | 1.8500 | **1.7984** |
+
+Better at every eval point, by a wide margin, in both retuned arms — and the retuned model reaches the old
+default's *final* 1200-step loss in roughly 500 steps, so this is worth more than tripling the training budget.
+Raising `lr` wholesale edges out raising `embed_lr` alone (1.7984 vs 1.8290), which is consistent with the
+400-step decomposition: the embedding is ~93% of the win and the remaining norms/gates/routers supply the rest.
+
+Two caveats worth keeping attached to these numbers. They were measured at one scale only (`d_model: 256`,
+TinyStories) — muP (`mup_base_d_model`) is the intended mechanism for carrying a tuned `lr` across width, and
+nothing here establishes that `1.0e-2` is right for `configs/fineweb_500m.yaml`. And the 400-step baseline here
+(2.9111) does not match the 2.826 recorded in the table above, almost certainly because these runs pin
+`batch_size: 32` with `auto_batch_size: false`; the deltas are sound because every arm shares those settings, but
+the absolute numbers belong to their own series.
 
 ACT sparsity is a throughput change rather than a quality one, so it's measured separately: on
 `configs/tinystories_router.yaml` (400 steps, pinned `batch_size: 16` so the arms are comparable), `val/loss` at
 step 400 was **3.0735** dense, **3.0757** at `act_capacity_ratio: 0.5` and **3.0728** at `0.25` — indistinguishable.
 See the `act_capacity_ratio` discussion above for what it buys in time and memory, and why a short run's
 wall-clock understates it.
+
+`use_nsa` was A/B'd the same way (400 steps, RTX 5090, `d_model: 256`/`head_dim: 64`/`n_layers: 6`, pinned
+`batch_size: 32`), specifically against the *real* default it would replace — `use_nsa` requires
+`doc_attention_mask: false`, so the fair comparison isn't NSA vs. a doc-masking-disabled baseline, it's NSA vs.
+whatever a config actually runs with today. `val/loss` at step 400: **2.8540** dense + `doc_attention_mask: true`
+(today's default), **2.8823** dense with `doc_attention_mask: false` (isolates the cost of losing doc-masking
+alone), **2.9110** NSA. NSA is worse than both — worse than today's default by 0.057, and still worse than the
+doc-masking-disabled baseline it's actually forced to compete against by 0.029. So `use_nsa` stays off by default:
+the A/B doesn't support flipping it, and even setting quality aside, doing so would force `doc_attention_mask`
+off by default too (the two are mutually exclusive), silently giving up an already-proven win for one that isn't
+yet real. Worth re-running at a longer `max_seq_len` before drawing a final conclusion — at 512 tokens and
+`nsa_block_size: 128` there are only 4 blocks, which is little room for the selection branch's sparsity to pay
+for its own approximation error, and this A/B measured quality only, not the compute saving that's NSA's other
+selling point at genuinely long context.
 
 Two cautions when running your own A/B, both learned the hard way here. **Pin `batch_size` and set
 `auto_batch_size: false`** — otherwise a change that reduces memory (sparsity, checkpointing) is silently handed a
@@ -678,6 +782,9 @@ inductor's FX graph cache makes later configurations look far cheaper than they 
   — see `configs/tinystories_moe.yaml`. `MoEFeedForward` is the reference example for a variant that replaces a
   block's FFN sublayer wholesale while preserving `FeedForward`'s `(*, d_model) -> (*, d_model)` contract, which
   is what lets it compose with ACT's own `_sparse_ffn_delta` gather/scatter path with no changes to either.
+- Sparse attention: set `model.use_nsa: true` (plus `model.doc_attention_mask: false`, required) — see
+  `configs/tinystories_nsa.yaml`. Not currently a win at TinyStories scale (see "Measured results"); a candidate
+  for a longer-context follow-up A/B before it's worth defaulting on.
 - New training behavior (e.g. different scheduler, mixed precision): changes belong in `train.py`; keep the loop
   step-based and keep config-driven values in `TrainConfig` rather than hardcoding. A new *optimizer* belongs in
   `optim.py` — add it to `build_optimizer` and give it a `build_*_param_groups`; `MuonWithAuxAdam` is the

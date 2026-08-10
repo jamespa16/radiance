@@ -15,25 +15,39 @@ import torch
 from radiance.config import Config
 
 
-def build_param_groups(model: torch.nn.Module, weight_decay: float) -> list[dict]:
+def build_param_groups(
+    model: torch.nn.Module, weight_decay: float, embed_lr: float | None = None
+) -> list[dict]:
     """Split parameters into decayed / non-decayed groups.
 
     AdamW over model.parameters() applies weight decay uniformly, which decays RMSNorm gains and
     every bias. Those are 1-D scale/shift parameters with no "shrink toward zero is a useful
     prior" interpretation — decaying them just fights the norm layers. Standard practice
     (GPT-2/Llama/nanoGPT) is to decay only the >=2-D weight matrices, which is what this does.
-    The tied token_emb/lm_head weight is 2-D and stays in the decayed group, matching those
-    references.
+
+    `embed_lr` (cfg.train.embed_lr) pulls the tied token_emb/lm_head weight into a third group
+    carrying its own LR, mirroring build_muon_param_groups. None (the default) leaves it in the
+    decayed group exactly as before, so the group list is unchanged for any config that hasn't set
+    it — which also keeps migrate_optimizer_to_cpu_offload's positional group zip valid, since both
+    call sites pass the same value.
     """
-    decay, no_decay = [], []
-    for param in model.parameters():
+    decay, no_decay, embed = [], [], []
+    for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        (decay if param.dim() >= 2 else no_decay).append(param)
-    return [
+        if param.dim() < 2:
+            no_decay.append(param)
+        elif embed_lr is not None and _is_embedding(name):
+            embed.append(param)
+        else:
+            decay.append(param)
+    groups = [
         {"params": decay, "weight_decay": weight_decay},
         {"params": no_decay, "weight_decay": 0.0},
     ]
+    if embed:
+        groups.append({"params": embed, "weight_decay": weight_decay, "lr": embed_lr})
+    return groups
 
 
 # Parameters excluded from Muon and left to the auxiliary AdamW. Two reasons appear here:
@@ -44,6 +58,16 @@ def build_param_groups(model: torch.nn.Module, weight_decay: float) -> list[dict
 #     calibration, a gate's zero-init). Muon's update has a fixed spectral norm regardless of how
 #     small the gradient is, which is the wrong behaviour for these.
 _MUON_EXCLUDED_SUBSTRINGS = ("token_emb", "lm_head", "router", "out_gate")
+
+# The tied embedding matrix, split out of the AdamW-decayed group so it can carry its own LR
+# (cfg.train.embed_lr). It is the one *large* tensor AdamW still owns once Muon takes the hidden
+# weights, and it wants a much larger step than the routers/gates it would otherwise share a group
+# with — those are tiny tensors whose exact scale is load-bearing.
+_EMBEDDING_SUBSTRINGS = ("token_emb", "lm_head")
+
+
+def _is_embedding(name: str) -> bool:
+    return any(s in name for s in _EMBEDDING_SUBSTRINGS)
 
 
 def build_muon_param_groups(model: torch.nn.Module, cfg: Config) -> list[dict]:
@@ -59,12 +83,14 @@ def build_muon_param_groups(model: torch.nn.Module, cfg: Config) -> list[dict]:
     weights. Embeddings and 1-D parameters are unscaled under muP.
     """
     width_mult = cfg.model.mup_width_mult
-    muon, adam_decay, adam_no_decay = [], [], []
+    muon, adam_embed, adam_decay, adam_no_decay = [], [], [], []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
         if param.dim() < 2:
             adam_no_decay.append(param)
+        elif _is_embedding(name):
+            adam_embed.append(param)
         elif any(s in name for s in _MUON_EXCLUDED_SUBSTRINGS):
             adam_decay.append(param)
         else:
@@ -79,13 +105,21 @@ def build_muon_param_groups(model: torch.nn.Module, cfg: Config) -> list[dict]:
             "mup_lr_scale": 1.0,
         },
         {
+            "params": adam_embed,
+            "algorithm": "adamw",
+            "lr": cfg.train.embed_lr_resolved,
+            "weight_decay": cfg.train.weight_decay,
+            # Embeddings are unscaled under muP: a row lookup has fan-in 1, so it does not widen.
+            "mup_lr_scale": 1.0,
+        },
+        {
             "params": adam_decay,
             "algorithm": "adamw",
             "lr": cfg.train.lr,
             "weight_decay": cfg.train.weight_decay,
-            # The excluded set is embeddings (unscaled under muP) plus routers/gates (hidden-like,
-            # so 1/m). They share a group; embeddings dominate it, so leave it unscaled — the
-            # routers and gates are a rounding error in both parameter count and gradient norm.
+            # What's left here is the routers and gates — hidden-like, so muP would want 1/m — but
+            # they are a rounding error in both parameter count and gradient norm, so leave the
+            # group unscaled rather than give them a correction of their own.
             "mup_lr_scale": 1.0,
         },
         {
@@ -274,7 +308,7 @@ def build_optimizer(model: torch.nn.Module, cfg: Config, device: str) -> torch.o
         from torch.optim import AdamW
 
         return AdamW(
-            build_param_groups(model, cfg.train.weight_decay),
+            build_param_groups(model, cfg.train.weight_decay, cfg.train.embed_lr),
             lr=cfg.train.lr,
             fused=(device.split(":")[0] == "cuda"),
         )
@@ -413,7 +447,7 @@ def _adamw_to_cpu_offload(
     training OOM'd before its first successful step) are left to lazy-init on first step(), matching
     fresh-AdamW behavior."""
     new_optimizer = CPUOffloadAdamW(
-        build_param_groups(model, cfg.train.weight_decay),
+        build_param_groups(model, cfg.train.weight_decay, cfg.train.embed_lr),
         lr=cfg.train.lr,
         weight_decay=cfg.train.weight_decay,
         device=device,
