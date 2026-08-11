@@ -357,6 +357,13 @@ def train(cfg: Config) -> None:
             else f"(lr={cfg.train.lr})"
         )
     )
+    if cfg.model.hyper_conn_streams > 1:
+        # Worth its own line: this LR is the difference between hyper-connections helping and
+        # actively hurting, and it is easy to leave at `lr` by accident. See TrainConfig.
+        print(
+            f"[radiance] hyper-connections: {cfg.model.hyper_conn_streams} residual streams "
+            f"(dynamic={cfg.model.hyper_conn_dynamic}, lr={cfg.train.hyper_conn_lr_resolved})"
+        )
 
     if cfg.train.compile:
         # mode="reduce-overhead" captures the backward pass as a CUDA graph. If a param's .grad is

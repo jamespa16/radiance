@@ -266,6 +266,142 @@ def _make_iter_lora(cfg: ModelConfig, in_features: int, out_features: int, n_var
     return IterLoRA(in_features, out_features, cfg.loop_lora_rank, n_variants)
 
 
+class HyperConnection(nn.Module):
+    """One sublayer's hyper-connection unit (Zhu et al., ICLR 2025, arXiv:2409.19606).
+
+    Replaces `x = x + sublayer(norm(x))` on a single residual stream with, over n streams
+    H (n, d) per token:
+
+        h_in = alpha_m^T H              # width read: which stream(s) this sublayer sees
+        out  = sublayer(norm(h_in))     # unchanged
+        H'   = alpha_r^T H + beta^T out # depth-connect the streams, then write the output back
+
+    So a sublayer learns *which* stream to read, how the streams mix with each other, and how its
+    output is distributed across them, instead of every sublayer reading and writing one shared
+    accumulator.
+
+    Why this architecture in particular wants it: blocks[1:] is a weight-shared loop body, so a
+    6-layer model at loop_count 6 performs 62 residual writes into that single accumulator, which
+    is exactly the depth regime the paper's gradient-vanishing/representation-collapse argument
+    covers (and the same regime _scale_residual_init exists for). With per-iteration variants (see
+    cfg.loop_iter_conditioning) each loop pass additionally learns its *own* routing, so a stream
+    a given iteration never writes into carries information across the whole recursion untouched.
+
+    **Exactly the plain residual network at initialisation.** alpha_m starts one-hot, alpha_r the
+    identity, beta all-ones, and the streams start as n copies of the same vector — so every stream
+    receives the same `out` and they stay equal at every depth, with the one-hot read just picking
+    one of n identical copies. Both matmuls are bit-exact at those values (multiplying by exact 1.0
+    and summing exact zeros), so the whole model differs from the single-stream one only by the
+    final reduction in DenseTransformer._reduce_streams — which averages, making the equivalence
+    bit-identical at power-of-two n and ~1 ulp otherwise.
+
+    The `k mod n` stagger in the one-hot init is load-bearing, and the obvious alternative is a
+    trap: initialise alpha_m uniformly at 1/n instead and every alpha_m/beta/alpha_r entry receives
+    an *identical* gradient forever, so the n streams stay one stream for the life of the run and
+    the whole feature is a no-op that looks like it is training. Staggering which stream each
+    sublayer reads is what makes dL/dH differ across streams and lets them diverge.
+    """
+
+    def __init__(
+        self,
+        cfg: ModelConfig,
+        layer_index: int,
+        variant_stride: int = 0,
+        n_variants: int = 1,
+        eps: float = 1e-6,
+    ):
+        """layer_index is this sublayer's position in the execution order (two per block, so
+        adjacent sublayers read adjacent streams as the paper prescribes); variant_stride is how
+        far that position advances per loop iteration, so variant v initialises as sublayer
+        `layer_index + v * variant_stride`.
+
+        The stride is 1 rather than the loop body's true unrolled sublayer count, and that is a
+        deliberate correction rather than an approximation. The true count is `2 * (n_layers - 1)`,
+        which is always even — so at n=2 it is congruent to 0 mod n for *every* model, and at n=4
+        for every odd n_layers. In those cases each iteration reads the identical stream, the
+        per-iteration routing collapses to a single pattern, and the failure is invisible: the
+        model trains fine and merely gives up the loop-identity benefit that motivates having
+        per-iteration variants at all. Advancing by one stream per iteration cannot alias for any
+        n.
+        """
+        super().__init__()
+        n = cfg.hyper_conn_streams
+        self.n_streams = n
+        self.n_variants = n_variants
+        self.dynamic = cfg.hyper_conn_dynamic
+        self.eps = eps
+
+        # Static connection coefficients, all named without "dyn" so optim.py routes them to the
+        # no-decay AdamW group (the paper decays the dynamic weights but not these).
+        self.beta = nn.Parameter(torch.ones(n_variants, n))
+        self.alpha_r = nn.Parameter(torch.eye(n).expand(n_variants, n, n).clone())
+        alpha_m = torch.zeros(n_variants, n)
+        for v in range(n_variants):
+            alpha_m[v, (layer_index + v * variant_stride) % n] = 1.0
+        self.alpha_m = nn.Parameter(alpha_m)
+
+        if self.dynamic:
+            # Zero-initialised, exactly like IterLoRA's B and the input-injection projection:
+            # tanh(0) is exactly 0, so a dynamic unit is bit-identical to a static one at init.
+            # Bare Parameters rather than nn.Linear deliberately — an nn.Linear here would be
+            # visited by DenseTransformer._init_weights and would then have to be re-zeroed in
+            # _init_inert_gates, adding a third entry to an ordering constraint that has already
+            # caused two bugs in this file.
+            #
+            # The three projections (alpha_m, beta, alpha_r — columns [0], [1], [2:]) share one
+            # tensor so the forward is a single matmul over the n-wide hidden state instead of
+            # three. Measured 3.9x faster on that step at d_model 256: these are memory-bound at
+            # this width, so what matters is reading the normalised hidden once rather than the
+            # negligible FLOP count.
+            self.dyn_proj = nn.Parameter(torch.zeros(n_variants, cfg.d_model, 2 + n))
+            # One scale for beta and one shared by both alpha terms, as the paper has it.
+            self.dyn_scale_beta = nn.Parameter(torch.ones(n_variants))
+            self.dyn_scale_alpha = nn.Parameter(torch.ones(n_variants))
+
+    def read(self, hidden: torch.Tensor, variant: int = 0):
+        """(batch, seq, n_streams, d_model) -> ((batch, seq, d_model), write-side coefficients).
+
+        The write's coefficients are computed here, from the hidden state *entering* the sublayer
+        as the paper specifies, and handed back rather than stashed on self — keeping this module
+        stateless is what lets a whole block run under torch.utils.checkpoint unchanged.
+        """
+        # Clamped, not wrapped: running more iterations at inference than were trained (see
+        # radiance-generate --loops) should reuse the deepest learned routing rather than silently
+        # cycling back to the shallow ones. Mirrors RMSNorm's per-variant gain selection.
+        v = min(variant, self.n_variants - 1)
+        beta, alpha_m, alpha_r = self.beta[v], self.alpha_m[v], self.alpha_r[v]
+
+        if self.dynamic:
+            # The rsqrt reduction runs in fp32 for stability, but `hidden` itself is never upcast:
+            # it is the n-times-wider tensor here, and materialising an fp32 copy of it cost more
+            # than the normalisation did.
+            scale = torch.rsqrt(hidden.float().pow(2).mean(dim=-1, keepdim=True) + self.eps)
+            normed = hidden * scale.to(hidden.dtype)
+            dyn = torch.tanh(normed @ self.dyn_proj[v])  # (batch, seq, n_streams, 2 + n_streams)
+            dyn_m, dyn_beta, dyn_r = dyn.split([1, 1, self.n_streams], dim=-1)
+            alpha_m = alpha_m + self.dyn_scale_alpha[v] * dyn_m.squeeze(-1)
+            alpha_r = alpha_r + self.dyn_scale_alpha[v] * dyn_r
+            beta = beta + self.dyn_scale_beta[v] * dyn_beta.squeeze(-1)
+
+        # A matmul, not an einsum contracting dim -2: alpha_m is (n,) when static and (batch, seq,
+        # n) when dynamic, and unsqueezing a row dimension onto it makes one expression cover both
+        # while contracting against `hidden`'s stream dim with no permute of the wide tensor.
+        # Measured 3.6x faster than the equivalent einsum.
+        return (alpha_m.unsqueeze(-2) @ hidden).squeeze(-2), (beta, alpha_r)
+
+    def write(self, hidden: torch.Tensor, out: torch.Tensor, coeffs) -> torch.Tensor:
+        """(batch, seq, n_streams, d_model) + this sublayer's (batch, seq, d_model) output ->
+        the updated stream tensor."""
+        beta, alpha_r = coeffs
+        # alpha_r is (n, n) when static and per-token (batch, seq, n, n) when dynamic, and beta
+        # broadcasts over d_model either way, so one expression covers both. Moving the stream dim
+        # last makes this a plain matmul rather than an einsum contracting dim -2; the movedim
+        # pair are stride permutes on a tensor the matmul has to read anyway, and it measured
+        # faster than either the einsum or a broadcast matmul against alpha_r.mT.
+        mixed = (hidden.movedim(-2, -1) @ alpha_r).movedim(-1, -2)
+        return mixed + out.unsqueeze(-2) * beta.unsqueeze(-1)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, cfg: ModelConfig, is_first: bool = False, n_variants: int = 1):
         """is_first marks blocks[0], which is always called with v_first=None (it is the block that
@@ -982,6 +1118,8 @@ class TransformerBlock(nn.Module):
         use_moe_ffn: bool = False,
         is_first: bool = False,
         n_variants: int = 1,
+        hyper: bool = False,
+        block_index: int = 0,
     ):
         super().__init__()
         # n_variants > 1 only for the loop body (blocks[1:]), which is the part that repeats;
@@ -990,6 +1128,20 @@ class TransformerBlock(nn.Module):
         self.attn = CausalSelfAttention(cfg, is_first=is_first, n_variants=n_variants)
         self.ln2 = RMSNorm(cfg.d_model, n_variants=n_variants)
         self.ffn = MoEFeedForward(cfg) if use_moe_ffn else FeedForward(cfg, n_variants=n_variants)
+
+        # cfg.hyper_conn_streams > 1: this block's two residual writes each become a hyper-connection
+        # read/write pair over n parallel streams. Off by default and for any block outside the
+        # trunk — MTPHead builds a TransformerBlock of its own and feeds it a plain (batch, seq,
+        # d_model) tensor from outside the recursion, so it must keep the single-stream path.
+        self.hyper_attn = self.hyper_ffn = None
+        if hyper:
+            # Two sublayers per block, and one stream of advance per loop iteration so the read
+            # pattern rotates rather than repeating (see HyperConnection.__init__ for why the
+            # loop body's true sublayer count is the wrong stride). blocks[0] runs exactly once,
+            # so it has no iterations to advance over.
+            stride = 0 if block_index == 0 else 1
+            self.hyper_attn = HyperConnection(cfg, 2 * block_index, stride, n_variants)
+            self.hyper_ffn = HyperConnection(cfg, 2 * block_index + 1, stride, n_variants)
 
     def forward(
         self,
@@ -1000,11 +1152,24 @@ class TransformerBlock(nn.Module):
         v_first: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         """Returns (hidden state, this block's own attention values, optional recorded (k, v)) —
-        see CausalSelfAttention.forward for why the latter two come back out."""
+        see CausalSelfAttention.forward for why the latter two come back out.
+
+        `x` is (batch, seq, d_model) normally and (batch, seq, n_streams, d_model) when this block
+        carries hyper-connections; the sublayers themselves always see the plain shape, which is
+        why nothing below the block needs to know about streams.
+        """
         variant = ctx.variant
-        attn_out, v_own, recorded = self.attn(self.ln1(x, variant), cos, sin, ctx, v_first)
-        x = x + attn_out
-        x = x + self.ffn(self.ln2(x, variant), variant)
+        if self.hyper_attn is None:
+            attn_out, v_own, recorded = self.attn(self.ln1(x, variant), cos, sin, ctx, v_first)
+            x = x + attn_out
+            x = x + self.ffn(self.ln2(x, variant), variant)
+            return x, v_own, recorded
+
+        h, coeffs = self.hyper_attn.read(x, variant)
+        attn_out, v_own, recorded = self.attn(self.ln1(h, variant), cos, sin, ctx, v_first)
+        x = self.hyper_attn.write(x, attn_out, coeffs)
+        h, coeffs = self.hyper_ffn.read(x, variant)
+        x = self.hyper_ffn.write(x, self.ffn(self.ln2(h, variant), variant), coeffs)
         return x, v_own, recorded
 
 
@@ -1451,11 +1616,23 @@ def _run_loop_body(
 
             def run_sparse(x, cos, sin, v_first, still_running, block=block):
                 variant = ctx.variant
-                attn_out, _, _ = block.attn(block.ln1(x, variant), cos, sin, ctx, v_first)
-                x = x + attn_out
-                return x + _sparse_ffn_delta(
-                    block.ffn, block.ln2(x, variant), still_running, ctx.capacity, variant
+                if block.hyper_attn is None:
+                    attn_out, _, _ = block.attn(block.ln1(x, variant), cos, sin, ctx, v_first)
+                    x = x + attn_out
+                    return x + _sparse_ffn_delta(
+                        block.ffn, block.ln2(x, variant), still_running, ctx.capacity, variant
+                    )
+                # Same structure with the residual writes replaced by hyper-connection read/write
+                # pairs — see TransformerBlock.forward. _sparse_ffn_delta returns a delta over the
+                # (batch, seq, d_model) sublayer output, which is exactly what write() expects.
+                h, coeffs = block.hyper_attn.read(x, variant)
+                attn_out, _, _ = block.attn(block.ln1(h, variant), cos, sin, ctx, v_first)
+                x = block.hyper_attn.write(x, attn_out, coeffs)
+                h, coeffs = block.hyper_ffn.read(x, variant)
+                delta = _sparse_ffn_delta(
+                    block.ffn, block.ln2(h, variant), still_running, ctx.capacity, variant
                 )
+                return block.hyper_ffn.write(x, delta, coeffs)
 
             x = _maybe_checkpoint(
                 run_sparse, x, cos, sin, v_first, still_running, enabled=grad_checkpoint
@@ -1530,9 +1707,14 @@ def _run_loop_body_sparse(
     kv_store is updated per block as the stack runs, so the next iteration attends against the
     freshest values each position produced.
     """
-    batch, seq_len, d_model = x.shape
+    batch = x.shape[0]
     capacity = token_idx.size(1)
-    gather_idx = token_idx.unsqueeze(-1).expand(batch, capacity, d_model)
+    # Trailing dims are (d_model,) normally and (n_streams, d_model) under hyper-connections; the
+    # gather indexes positions either way, so it just grows a dim.
+    trailing = x.shape[2:]
+    gather_idx = token_idx.reshape(batch, capacity, *(1,) * len(trailing)).expand(
+        batch, capacity, *trailing
+    )
     original = x.gather(1, gather_idx)
     h = original
 
@@ -1548,16 +1730,23 @@ def _run_loop_body_sparse(
 
     variant = ctx.variant
     for index, block in enumerate(blocks):
+        # Hyper-connection read/write pairs in place of the two residual writes, exactly as in
+        # TransformerBlock.forward — the gathered tensor is narrower along seq but has the same
+        # trailing shape, so the connection units need no special-casing for this path.
+        hc_attn, hc_ffn = block.hyper_attn, block.hyper_ffn
+        attn_in, coeffs = (h, None) if hc_attn is None else hc_attn.read(h, variant)
         attn_out, kv_store[index] = block.attn.forward_sparse(
-            block.ln1(h, variant), cos_g, sin_g, kv_store[index], token_idx, attn_mask, v_first_g
+            block.ln1(attn_in, variant), cos_g, sin_g, kv_store[index], token_idx, attn_mask, v_first_g
         )
-        h = h + attn_out
-        h = h + block.ffn(block.ln2(h, variant), variant)
+        h = h + attn_out if hc_attn is None else hc_attn.write(h, attn_out, coeffs)
+        ffn_in, coeffs = (h, None) if hc_ffn is None else hc_ffn.read(h, variant)
+        ffn_out = block.ffn(block.ln2(ffn_in, variant), variant)
+        h = h + ffn_out if hc_ffn is None else hc_ffn.write(h, ffn_out, coeffs)
 
     # Capacity padding rows (selected only to keep the shape static) must not overwrite anything,
     # so they are restored to what they came in as before the scatter. token_idx is distinct per
     # row, so the scatter has no colliding writes.
-    h = torch.where(valid.unsqueeze(-1), h, original)
+    h = torch.where(valid.reshape(batch, capacity, *(1,) * len(trailing)), h, original)
     return x.scatter(1, gather_idx, h)
 
 
@@ -1581,7 +1770,14 @@ class DenseTransformer(nn.Module):
         # Only the loop body gets per-iteration parameters: blocks[0] runs exactly once per forward,
         # so there is no iteration for it to be conditioned on.
         n_variants = cfg.loop_multiplier if cfg.loop_iter_conditioning != "none" else 1
-        self.blocks = nn.ModuleList([TransformerBlock(cfg, use_moe_ffn=False, is_first=True)])
+        # Hyper-connections (cfg.hyper_conn_streams) reuse n_variants as-is rather than adding a
+        # second conditioning knob: at n_variants > 1 each loop iteration gets its own routing over
+        # the streams, which is the same thing per-iteration norm gains do for scale.
+        self.hyper_streams = cfg.hyper_conn_streams
+        hyper = self.hyper_streams > 1
+        self.blocks = nn.ModuleList(
+            [TransformerBlock(cfg, use_moe_ffn=False, is_first=True, hyper=hyper, block_index=0)]
+        )
         for i in range(cfg.n_layers - 1):
             is_dense_override = cfg.use_moe and cfg.moe_dense_every and (i + 1) % cfg.moe_dense_every == 0
             self.blocks.append(
@@ -1589,6 +1785,8 @@ class DenseTransformer(nn.Module):
                     cfg,
                     use_moe_ffn=cfg.use_moe and not is_dense_override,
                     n_variants=n_variants,
+                    hyper=hyper,
+                    block_index=i + 1,
                 )
             )
 
@@ -1896,6 +2094,35 @@ class DenseTransformer(nn.Module):
             logits = logits * self.mup_output_mult
         return logits
 
+    def _expand_streams(self, x: torch.Tensor) -> torch.Tensor:
+        """(batch, seq, d_model) -> (batch, seq, n_streams, d_model), n identical copies.
+
+        No-op at hyper_conn_streams == 1, so a default model never grows the extra dimension and
+        every downstream shape stays exactly what it was.
+        """
+        if self.hyper_streams == 1:
+            return x
+        return x.unsqueeze(-2).expand(*x.shape[:-1], self.hyper_streams, x.size(-1))
+
+    def _reduce_streams(self, hidden: torch.Tensor) -> torch.Tensor:
+        """The inverse: combine the streams back into one (batch, seq, d_model) hidden state.
+
+        A **mean**, where the paper sums. The difference is not cosmetic, and the reason is worth
+        keeping: at init every stream holds the same vector, so a sum hands ln_f exactly n times
+        the single-stream model's hidden state (verified bit-exact — the streams really are
+        identical and the reduction really is n*z to the last ulp). RMSNorm is scale-invariant in
+        exact arithmetic, so that ought to vanish — but `+ self.eps` sits inside the rsqrt and is
+        *not* scale-invariant, so a sum silently changes ln_f's effective normalisation as a
+        function of n. Measured at d_model 32 that was a 1e-3 logit shift, which would have shown
+        up in an n=2 vs n=4 A/B as an architecture effect when it was really an epsilon artifact.
+        Averaging keeps the reduced hidden at single-stream scale for every n, which makes the
+        model exactly the plain residual network at init and is also why this repo does not need
+        the paper's compensating "scale output-module init std by sqrt(n)" adjustment.
+        """
+        if self.hyper_streams == 1:
+            return hidden
+        return hidden.mean(dim=-2)
+
     def _reset_moe_aux_loss(self) -> None:
         for moe_ffn in self._moe_layers:
             moe_ffn.reset_aux_loss()
@@ -1952,6 +2179,9 @@ class DenseTransformer(nn.Module):
 
         x = self.token_emb(input_ids)
         x = self.dropout(x)
+        # No-op unless cfg.hyper_conn_streams > 1, in which case everything from here to ln_f
+        # carries a (batch, seq, n_streams, d_model) hidden state instead of (batch, seq, d_model).
+        x = self._expand_streams(x)
         cos, sin = self.rope(seq_len, offset)
 
         if kv_cache is not None:
@@ -1991,7 +2221,11 @@ class DenseTransformer(nn.Module):
         # set, the early iterations run under no_grad, which severs the only other path from
         # blocks[0] to the loss; injecting its output into the in-window iterations restores it.
         # See the loop_bptt_window/loop_input_injection validation in __init__.
-        anchor = x
+        # Reduced back to (batch, seq, d_model) under hyper-connections, so input_injection stays a
+        # plain d_model -> d_model projection; its output is written into *every* stream, mirroring
+        # a hyper-connection's own all-ones output distribution. W_inj is zero-initialised, so this
+        # is inert at init either way.
+        anchor = self._reduce_streams(x)
 
         if not self.cfg.use_router:
             # remaining n_layers - 1 blocks are looped, sharing weights across iterations
@@ -2000,7 +2234,7 @@ class DenseTransformer(nn.Module):
                 if n > 1 and self.input_injection is not None:
                     # Re-anchor the recursion. From the second iteration on only: the first is
                     # already reading blocks[0]'s output, which *is* the anchor.
-                    x = x + self.input_injection(anchor)
+                    x = x + self._expand_streams(self.input_injection(anchor))
                 with self._loop_grad_context(n, n_loops):
                     x = _run_loop_body(
                         self.blocks[1:],
@@ -2016,7 +2250,7 @@ class DenseTransformer(nn.Module):
                         v_first,
                         grad_checkpoint=grad_checkpoint,
                     )
-            x = self.ln_f(x)
+            x = self.ln_f(self._reduce_streams(x))
             logits = self._project_logits(x)
             zero = x.new_zeros(())
             moe_aux_loss = self._collect_moe_aux_loss(x)
@@ -2070,7 +2304,12 @@ class DenseTransformer(nn.Module):
         skip, and the last force-halts every remaining position (often at high weight), so an
         overflow drop there risks discarding a high-weight contribution.
         """
-        batch, seq_len, d_model = x.shape
+        # x is (batch, seq, d_model), or (batch, seq, n_streams, d_model) under hyper-connections —
+        # so index the leading two dims rather than unpacking, and broadcast the per-position
+        # halting tensors against however many trailing dims the hidden state has.
+        batch, seq_len = x.shape[0], x.shape[1]
+        # (batch, seq, 1) normally, (batch, seq, 1, 1) with streams.
+        halt_shape = (batch, seq_len) + (1,) * (x.dim() - 2)
 
         cum_prob = x.new_zeros(batch, seq_len)
         n_updates = x.new_zeros(batch, seq_len)
@@ -2111,8 +2350,8 @@ class DenseTransformer(nn.Module):
                 # iterations must keep reading exactly the key/value it halted with. Injecting into
                 # it would break that invariant and silently change what earlier-halted tokens
                 # contribute to everyone else's attention.
-                injected = frozen_x + self.input_injection(anchor)
-                frozen_x = torch.where(still_running.unsqueeze(-1), injected, frozen_x)
+                injected = frozen_x + self._expand_streams(self.input_injection(anchor))
+                frozen_x = torch.where(still_running.reshape(halt_shape), injected, frozen_x)
             ctx = LoopContext(
                 iteration=n,
                 kv_cache=kv_cache,
@@ -2140,7 +2379,9 @@ class DenseTransformer(nn.Module):
                 new_x = _run_loop_body(
                     self.blocks[1:], frozen_x, cos, sin, ctx, v_first, still_running, grad_checkpoint
                 )
-            p_n = self.router(new_x, ctx.variant)
+            # The router halts *positions*, so it reads the reduced hidden state rather than one
+            # arbitrary stream — same tensor ln_f eventually sees.
+            p_n = self.router(self._reduce_streams(new_x), ctx.variant)
 
             is_last_step = n == max_loops
             would_exceed = (cum_prob + p_n) >= (1.0 - self.cfg.halt_epsilon)
@@ -2149,16 +2390,16 @@ class DenseTransformer(nn.Module):
             remainder = 1.0 - cum_prob
             weight = torch.where(halts_now, remainder, p_n)
             weight = torch.where(still_running, weight, torch.zeros_like(weight))
-            accum_output = accum_output + weight.unsqueeze(-1) * new_x
+            accum_output = accum_output + weight.reshape(halt_shape) * new_x
 
             n_updates = n_updates + still_running.float()
             remainder_sum = torch.where(halts_now, remainder, remainder_sum)
             cum_prob = torch.where(still_running & ~halts_now, cum_prob + p_n, cum_prob)
 
-            frozen_x = torch.where(still_running.unsqueeze(-1), new_x, frozen_x)
+            frozen_x = torch.where(still_running.reshape(halt_shape), new_x, frozen_x)
             still_running = still_running & ~halts_now
 
-        x = self.ln_f(accum_output)
+        x = self.ln_f(self._reduce_streams(accum_output))
         logits = self._project_logits(x)
         ponder_cost = (n_updates + remainder_sum).mean()
         mean_loop_depth = n_updates.mean()
@@ -2225,6 +2466,12 @@ class DenseTransformer(nn.Module):
         """
         cfg = self.cfg
         depth = max(1, cfg.ffn_depth)
+        # Hyper-connections widen the residual stream itself to n copies, so every hidden state
+        # carried between sublayers costs n times what it did. Each block holds two of them (one
+        # per hyper-connection write); the per-block attention/FFN terms below are computed on the
+        # reduced (d_model-wide) sublayer input and so are unaffected.
+        streams = self.hyper_streams
+        stream_units = 2 * streams * cfg.d_model if streams > 1 else 0
 
         def ffn_units(block: TransformerBlock) -> float:
             if isinstance(block.ffn, MoEFeedForward):
@@ -2236,8 +2483,8 @@ class DenseTransformer(nn.Module):
                 return routed + shared + cfg.n_experts
             return (depth + 1) * cfg.ffn_dim
 
-        block0_units = 10 * cfg.d_model + ffn_units(self.blocks[0])
-        loop_body_units = sum(10 * cfg.d_model + ffn_units(b) for b in self.blocks[1:])
+        block0_units = 10 * cfg.d_model + stream_units + ffn_units(self.blocks[0])
+        loop_body_units = sum(10 * cfg.d_model + stream_units + ffn_units(b) for b in self.blocks[1:])
         loop_multiplier = cfg.loop_multiplier
         if cfg.act_capacity_ratio < 1.0:
             # Sparse ACT: the first and last iterations run dense, the interior ones over only
@@ -2258,10 +2505,13 @@ class DenseTransformer(nn.Module):
             # recomputing whichever single block is largest.
             n_blocks_executed = 1 + loop_multiplier * (cfg.n_layers - 1)
             largest_block_units = max(
-                [block0_units] + [10 * cfg.d_model + ffn_units(b) for b in self.blocks[1:]]
+                [block0_units] + [10 * cfg.d_model + stream_units + ffn_units(b) for b in self.blocks[1:]]
             )
-            total_block_units = n_blocks_executed * cfg.d_model + largest_block_units
-        embedding_units = cfg.d_model  # token embedding only (RoPE's cos/sin have no batch dim)
+            # The tensor surviving at each block boundary is the residual stream, so it is
+            # streams * d_model wide rather than d_model.
+            total_block_units = n_blocks_executed * streams * cfg.d_model + largest_block_units
+        # token embedding only (RoPE's cos/sin have no batch dim), widened to the stream count.
+        embedding_units = streams * cfg.d_model
         block_bytes = activation_dtype_bytes * (total_block_units + embedding_units)
         # fp32, x3: logits + their gradient buffer + log_softmax's internal fp32 upcast working
         # buffer (empirically confirmed via a real OOM sized almost exactly to a 2x estimate during

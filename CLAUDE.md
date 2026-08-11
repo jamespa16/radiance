@@ -95,15 +95,18 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
     `loop_input_injection`'s `W_inj`, the `IterLoRA` adapters' `B`, the router `iter_bias` tensors;
   - **identity-valued**, chosen so the arithmetic is exact — `value_residual`'s λ starts at exactly 1.0, and
     `attn_out_gate` is written `2 * sigmoid(zero_init)` precisely because a plain `sigmoid` cannot reach 1.0;
-  - **range-collapsed**, where a `None` resolves to the existing scalar — `loop_count_min/max` collapse to
-    `loop_count`, `mup_base_d_model` resolves to `d_model` (making every muP correction exactly 1.0),
-    `moe_expert_ffn_mult` resolves to `ffn_dim`.
+  - **range-collapsed**, where a `None` (or a unit scalar) resolves to the existing quantity —
+    `loop_count_min/max` collapse to `loop_count`, `mup_base_d_model` resolves to `d_model` (making every muP
+    correction exactly 1.0), `moe_expert_ffn_mult` resolves to `ffn_dim`, `hyper_conn_streams: 1` collapses the
+    `n` hyper-connection streams back to a single residual stream.
 
-  Three things deliberately do *not* default on, and the reasons are the template for future exceptions:
+  Four things deliberately do *not* default on, and the reasons are the template for future exceptions:
   `lr_schedule` stays `"cosine"` (WSD is an operational convenience, not a quality win, and switching it would
   silently reshape the LR trajectory of every config whose `lr` was tuned against cosine); `mtp_heads` stays `1`
   (each extra head materialises a full `(batch, seq, vocab_size)` logits tensor, so defaulting to 2 would quietly
-  halve what `auto_batch_size` can fit); `loop_bptt_window` stays `None` (truncating the gradient is an
+  halve what `auto_batch_size` can fit); `hyper_conn_streams` stays `1` for the same reason plus a second one —
+  it costs `n` times the residual stream's activation memory *and* 30-40% of step time in the looped regime,
+  so "on" is not free even though it is inert; `loop_bptt_window` stays `None` (truncating the gradient is an
   approximation you reach for deliberately). The distinction is cost and reversibility, not novelty — a feature
   whose "on" state is free and inert defaults on; one that spends real memory or changes a tuned quantity doesn't.
 
@@ -388,6 +391,73 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   re-append to that cache. `activation_bytes_per_token` models the checkpointed regime too (one `d_model` tensor
   per block boundary plus the largest single block's transient recompute), so `auto_batch_size` spends the freed
   memory on a bigger micro-batch automatically.
+
+  **Hyper-connections: `n` residual streams instead of one.** Everything above gives the loop body an
+  identity; `cfg.model.hyper_conn_streams` (default `1`) attacks the other half of the problem — the single
+  accumulator all that depth writes into. At `n > 1` the hidden state becomes `(batch, seq, n, d_model)` and
+  each sublayer's residual write becomes a `HyperConnection` read/write pair (Zhu et al., ICLR 2025,
+  arXiv:2409.19606): `h_in = alpha_m^T H`, then `H' = alpha_r^T H + beta^T out`. So a sublayer learns *which*
+  stream to read, how the streams mix, and how its output is distributed back across them. `blocks[0]` and the
+  loop body both get them; `MTPHead`'s own `TransformerBlock` deliberately does not (it runs outside the
+  recursion on the already-reduced hidden), which is what the `hyper` constructor flag is for.
+
+  It is **exactly the plain residual network at init**, and the argument is worth keeping because it is what
+  makes the feature safe: `alpha_m` starts one-hot, `alpha_r` the identity, `beta` all-ones, and the streams
+  start as `n` copies of the same vector — so every stream receives the same `out` and they stay equal at every
+  depth, with the one-hot read just picking one of `n` identical copies. Both matmuls are exact at those values.
+  Verified bit-identical to the single-stream model at `n` = 2 and 4 across the whole loop-mode matrix, and to
+  ~1 ulp at odd `n` (`tests/test_hyper_connections.py`). `cfg.model.hyper_conn_dynamic` (default on) adds
+  input-conditioned corrections `coeff = static + s * tanh(norm(H) W)` with `W` zero-initialised, so it is
+  bit-identical to the static version at init — the same inert-by-zero-init pattern as `W_inj` and `out_gate`.
+  The three projections share one `dyn_proj` tensor so the forward is a single matmul.
+
+  Three implementation details that are load-bearing, all found by measurement rather than reasoning:
+
+  - **`_reduce_streams` averages; the paper sums.** With the streams identical at init, a sum hands `ln_f`
+    exactly `n` times the single-stream hidden (verified bit-exact). `RMSNorm` is scale-invariant in exact
+    arithmetic, so that ought to vanish — but `+ self.eps` sits inside the `rsqrt` and is *not* scale-invariant,
+    which measured as a 1e-3 logit shift at `d_model: 32`. That would have surfaced in an `n=2` vs `n=4` A/B as
+    an architecture effect when it was an epsilon artifact. Averaging keeps single-stream scale for every `n`,
+    which is also why this repo does not need the paper's compensating "scale output-module init std by
+    `sqrt(n)`" adjustment — applying it here would *break* the equal-to-a-residual-network property.
+  - **The per-iteration stagger advances by one stream, not by the loop body's sublayer count.** The paper
+    initialises layer `k`'s read to `e_{k mod n}`; the obvious generalisation to a weight-shared loop is to
+    advance the variant by the body's true unrolled sublayer count, `2 * (n_layers - 1)`. That is always even,
+    so at `n = 2` it is congruent to 0 mod `n` for *every* model (and at `n = 4` for every odd `n_layers`):
+    every iteration reads the identical stream, the per-iteration routing silently collapses to one pattern,
+    and nothing fails — the model just quietly gives up the reason to have per-iteration variants at all.
+  - **`optim.py` excludes them from Muon and does not decay the static ones.** `alpha_r` is
+    `(n_variants, n, n)` and `dyn_proj` is `(n_variants, d_model, 2 + n)` — both >= 2-D, so without the
+    `"hyper"` entry in `_MUON_EXCLUDED_SUBSTRINGS` they fall straight through to Muon, whose
+    fixed-spectral-norm update is exactly wrong for a one-hot read and an identity mix. `_is_hyper_static`
+    additionally routes `beta`/`alpha_m`/`alpha_r` to the no-decay group: decaying them drags the model off
+    precisely the initialisation that makes it a residual network. The paper splits the same way.
+
+  **Cost.** Parameters are negligible (~0.06% of a `d_model: 256` model at `n=4`). Activation memory is `n` times
+  the residual stream, which `activation_bytes_per_token` models so `auto_batch_size` accounts for it. Step time
+  is the real price and it is *not* free the way the FLOP count suggests — the read/write are `O(n * d_model)`
+  per token against a block's `O(12 * d_model^2)`, but at these widths they are memory-bound, so what matters is
+  traffic, not arithmetic. Compiled, fwd+bwd, `n_layers: 4`, `loop_count: 6`, seq 512, bf16:
+
+  | | `d_model` 256 (batch 16) | 512 (batch 8) | 1024 (batch 4) |
+  |---|---|---|---|
+  | `n=1` | 35.9 ms | 38.9 ms | 56.7 ms |
+  | `n=2` | 46.7 ms (1.30x) | 51.0 ms (1.31x) | 69.0 ms (1.22x) |
+  | `n=4` | 50.7 ms (1.41x) | 53.4 ms (1.37x) | 71.8 ms (1.27x) |
+
+  The overhead falls with width, as the `n*d` vs `d^2` scaling predicts, but slowly. Unlooped
+  (`loop_count: 1`) it is much smaller — 1.10x/1.14x at `d_model: 256` — because the loop body is what
+  multiplies the number of residual writes. Measure compiled, not eager: inductor fuses the write's elementwise
+  epilogue and the dynamic branch's norm/tanh, and eager overstates the cost by roughly 10 points. Three
+  formulations were measured and the fast ones are in the code: a `matmul` read rather than an einsum
+  contracting dim -2 (3.6x), a `movedim` pair around the write's matmul (1.3x), one fused `dyn_proj` matmul
+  rather than three (3.9x), and an fp32 `rsqrt` reduction that never materialises an fp32 copy of the
+  `n`-times-wider hidden (1.3x).
+
+  Because the step is ~30-40% more expensive in the looped regime, a fixed-step A/B is *not* a fixed-compute
+  comparison here: the recorded A/B pins steps, so it already flatters hyper-connections relative to what an
+  equal-wall-clock comparison would show. See "Measured results" — it does not help even on the generous
+  reading.
 
   `cfg.model.use_moe` replaces `blocks[1:]`'s `FeedForward` with `MoEFeedForward` — `n_experts` parallel
   experts (`BatchedExperts`) plus an `MoERouter` (same `RMSNorm + Linear` shape as `ACTRouter`, but softmax over
@@ -740,12 +810,52 @@ yet real. Worth re-running at a longer `max_seq_len` before drawing a final conc
 for its own approximation error, and this A/B measured quality only, not the compute saving that's NSA's other
 selling point at genuinely long context.
 
+**Hyper-connections (`hyper_conn_streams`) do not pay for themselves at this scale, and the interesting result
+is the learning rate rather than the architecture.** A/B on the looped shape they are aimed at — `d_model: 256`,
+`n_layers: 4`, `loop_count: 6` (19 executed blocks), pinned `batch_size: 16`, `auto_batch_size: false`,
+`lr: 1.0e-2`, 400 steps:
+
+| `hyper_conn_streams` | `hyper_conn_lr` | step 100 | 200 | 300 | 400 |
+|---|---|---|---|---|---|
+| 1 (baseline) | — | 3.3285 | 2.7206 | 2.4225 | **2.2821** |
+| 2 | `1.0e-2` (= `lr`) | 4.1753 | 3.1816 | 2.8383 | **2.6744** |
+| 2 | `1.0e-3` | 3.2490 | 2.7054 | 2.4195 | **2.2858** |
+| 2 | `1.0e-4` | 3.2652 | 2.7172 | 2.4280 | **2.2881** |
+| 4 | `1.0e-3` | 3.3389 | 2.7812 | 2.4928 | **2.3570** |
+| 4 | `1.0e-4` | 3.2617 | 2.7293 | 2.4400 | **2.2964** |
+
+Read the first two rows before anything else: sharing `lr` costs **0.39 val/loss**, far and away the largest
+effect in the table and larger than any *feature* win recorded on this page. That is not hyper-connections being
+bad, it is the `embed_lr` lesson repeating — `lr` reaches a grab-bag of tensors whose ideal step sizes differ by
+orders of magnitude, and AdamW's update is ~`lr` per step almost regardless of gradient scale, so 400 steps at
+`1e-2` moves a coefficient by O(1). For a *structural* coefficient (one-hot read, identity mix) an O(1) move
+erases the routing rather than refining it. Hence `train.hyper_conn_lr`, and hence it defaults to `1e-3` rather
+than to `None` — the usual range-collapsed default would have shipped the feature in its broken configuration.
+Note also that the best LR falls as `n` rises (at `n=4`, `1e-4` beats `1e-3` by 0.06): more streams means more
+coefficients, so more total drift at a given step size.
+
+With that fixed, the honest verdict is **neutral-to-slightly-negative**: the best arm (`n=2`, `1e-3`) lands
+0.004 *behind* the single-stream baseline, which is at the edge of this setup's ~0.002 noise floor, and `n=4` is
+clearly behind. Since hyper-connections also cost 30-40% of step time in this regime (see the table under
+`model.py`), a fixed-*compute* comparison is worse still than a fixed-step one. So `hyper_conn_streams` stays at
+`1`, on the same terms `use_nsa` stays off: implemented, tested, documented, and not defaulted on because the
+measurement doesn't support it.
+
+Worth re-testing before treating this as settled, because the conditions the mechanism targets were only
+partially met here. The paper's argument is about depth, and 19 executed blocks at `d_model: 256` over 400 steps
+is a small instance of it; the `n*d` vs `d^2` scaling also means the step-time penalty shrinks with width, so a
+wider, deeper, longer run is where the trade could plausibly flip. Nothing here rules that out — it rules out
+turning it on by default today.
+
 Two cautions when running your own A/B, both learned the hard way here. **Pin `batch_size` and set
 `auto_batch_size: false`** — otherwise a change that reduces memory (sparsity, checkpointing) is silently handed a
 larger batch, and the arms differ in two ways at once. And **check for `ending run early`** in the output: an
 OOM-terminated arm still exits 0 and still prints a few evals, so it looks like a valid short run rather than a
 failed one. `configs/tinystories_router.yaml` at the default `vram_safety_margin` does OOM on a 32 GB card —
-`estimate_batch_size` is optimistic for router mode, where the loop body is re-run `max_loops` times.
+`estimate_batch_size` is optimistic for router mode, where the loop body is re-run `max_loops` times. A third,
+learned on this change: **give each arm the whole GPU.** Two of the first hyper-connection arms were invalidated
+by a diagnostic run started alongside them, and the symptom was an OOM-shaped early exit in the *other* process,
+not the one at fault.
 
 **Startup compile cost**, measured at the same size on the first forward/backward with `mode=None`
 (`d_model: 256`, `n_layers: 4`, `loop_count: 6`, batch 8 x 512):
@@ -793,8 +903,18 @@ inductor's FX graph cache makes later configurations look far cheaper than they 
   `loop_iter_conditioning` is the reference example. Anything grad-carrying stays a positional argument (see
   `LoopContext`'s docstring), and remember to check `tests/test_loop_identity.py::test_no_dead_parameters` — a
   parameter bank that some loop mode never reaches trains at its init value forever, silently.
+- Changing the residual stream itself (rather than what writes into it): `HyperConnection` /
+  `cfg.model.hyper_conn_streams` is the reference example, and the one to read for what such a change touches.
+  Widening the hidden state changes the *rank* of every tensor between sublayers, so the work is mostly in the
+  places that reimplement the residual write or index it positionally — `TransformerBlock.forward`,
+  `_run_loop_body`'s sparse closure, `_run_loop_body_sparse`'s gather/scatter, `_forward_act`'s halting
+  broadcasts, and `activation_bytes_per_token`. Everything *below* the sublayer boundary (attention, FFN, MoE,
+  the KV cache, `generate.py`) stays untouched, because the read hands them the same `(batch, seq, d_model)`
+  tensor as before — preserve that and the blast radius stays small. Watch for blocks built outside the trunk:
+  `MTPHead` constructs its own `TransformerBlock` and must keep the single-stream path.
 - New default-on feature: make its parameters inert (zero-init, identity-valued, or range-collapsed — see the
   defaults convention under `config.py`), then add the pair of tests that pins it: bit-identical to the
   feature-off model at init, *and* demonstrably different once its weights move. `tests/test_inert_defaults.py`
   is the pattern. The second half matters as much as the first — an "inert" feature with no second test could be
-  inert forever and nobody would notice.
+  inert forever and nobody would notice. And check the *cost* before deciding "on": `hyper_conn_streams` is
+  perfectly inert at `n > 1` and still defaults off, because inert is not the same as free.

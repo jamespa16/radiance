@@ -109,7 +109,14 @@ def test_head_depth_targets_the_right_future_token(tiny_ids):
 
 
 def test_mtp_composes_with_router_and_moe(tiny_ids):
-    for extra in (dict(use_router=True, max_loops=3), dict(use_moe=True, n_experts=4, loop_count=2)):
+    # hyper_conn_streams is here specifically because MTPHead builds a TransformerBlock of its own
+    # and feeds it a plain (batch, seq, d_model) tensor from outside the recursion — it must keep
+    # the single-stream residual path while the trunk carries n streams.
+    for extra in (
+        dict(use_router=True, max_loops=3),
+        dict(use_moe=True, n_experts=4, loop_count=2),
+        dict(hyper_conn_streams=4, loop_count=2),
+    ):
         model = _build(mtp_heads=2, **extra).train()
         out = model(tiny_ids(batch=2, seq=16))
         assert out.mtp_hidden is not None and len(out.mtp_hidden) == 1

@@ -24,6 +24,7 @@ MODES = {
     "moe_router": dict(use_moe=True, n_experts=4, use_router=True, max_loops=3),
     "gqa": dict(n_kv_heads=2, loop_count=2),
     "nsa": dict(use_nsa=True, nsa_block_size=4, nsa_top_k_blocks=2, doc_attention_mask=False, loop_count=2),
+    "hyper": dict(hyper_conn_streams=4, loop_count=2),
 }
 
 

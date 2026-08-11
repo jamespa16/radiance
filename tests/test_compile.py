@@ -54,10 +54,17 @@ def _build(**overrides) -> DenseTransformer:
 @slow
 @requires_cuda
 @pytest.mark.parametrize("grad_checkpoint", [False, True])
-def test_doc_masking_compiles_for_train_and_eval(grad_checkpoint):
+@pytest.mark.parametrize("streams", [1, 4])
+def test_doc_masking_compiles_for_train_and_eval(grad_checkpoint, streams):
     """Both paths matter: grad_checkpoint is disabled under eval, so eval traces a *different*
-    graph — and that was the one that blew up while training compiled fine."""
-    model = _build(loop_count=2, grad_checkpoint=grad_checkpoint)
+    graph — and that was the one that blew up while training compiled fine.
+
+    Parametrized over hyper_conn_streams because it changes the rank of every tensor flowing
+    between sublayers, and the doc-mask path is where a rank surprise would surface: the flex
+    BlockMask is built against (batch, seq) document ids while the hidden state carries an extra
+    stream dimension.
+    """
+    model = _build(loop_count=2, grad_checkpoint=grad_checkpoint, hyper_conn_streams=streams)
     compiled = torch.compile(model)
     ids = torch.randint(0, TINY_VOCAB, (2, 64), device="cuda")
 

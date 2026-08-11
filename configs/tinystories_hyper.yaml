@@ -1,0 +1,98 @@
+# Worked example: hyper-connections — n parallel residual streams instead of one.
+#
+# Every sublayer normally reads and writes one shared residual accumulator. With
+# hyper_conn_streams: n, the hidden state becomes n parallel streams and each sublayer learns
+# three things instead: which stream to read (alpha_m), how the streams mix with each other
+# (alpha_r), and how its own output is distributed back across them (beta).
+#
+# This config loops deliberately, because that is where the mechanism is supposed to matter.
+# blocks[1:] is weight-shared and re-run loop_count times, so the settings below execute
+# 1 + 6 * 3 = 19 blocks — 38 residual writes — per forward. That is the depth regime the paper's
+# gradient-vanishing/representation-collapse argument is about, and it is the same regime
+# _scale_residual_init already exists to patch up.
+#
+# The second half of the payoff is specific to a weight-shared loop: because the connection
+# coefficients get one variant per iteration (loop_iter_conditioning, below), each pass learns its
+# *own* routing over the streams — so a stream that a given iteration never writes into carries
+# information across the whole recursion untouched. That is a stronger answer to "which pass am I
+# on" than per-iteration norm gains alone, which can only rescale channels.
+#
+# Cost: essentially no FLOPs (the read/write are O(n * d_model) per token against a block's
+# O(12 * d_model^2)) and a handful of parameters, but n times the residual stream's *activation
+# memory*. That is why hyper_conn_streams defaults to 1 rather than defaulting on the way the free
+# inert features do — see the defaults convention in configs/README.md.
+#
+# At hyper_conn_streams: 1 this file trains exactly as it would without the setting: no
+# hyper-connection parameters are allocated at all. At n > 1 the model still *starts* as the plain
+# residual network (streams begin identical, alpha_m one-hot, alpha_r identity, beta all-ones), so
+# the only thing that changes at step 0 is what the model is able to learn.
+#
+# READ THIS BEFORE USING IT: on the A/B this config is set up for, hyper-connections did **not**
+# win. At 400 steps, n=2 landed 0.004 val/loss behind the single-stream baseline (2.2858 vs
+# 2.2821) — neutral within noise — and n=4 landed 0.075 behind, while costing 30-40% more step
+# time. See "Measured results" in CLAUDE.md for the full table. This file exists as a worked
+# example of the mechanism and as the starting point for re-testing it somewhere it might pay off
+# (wider, deeper, longer), not as a recommended recipe. Set hyper_conn_streams: 1 to get the
+# baseline arm.
+
+run_name: tinystories-hyper
+
+data:
+  dataset: roneneldan/TinyStories
+  text_column: text
+  tokenizer: gpt2
+  seq_len: 512
+  num_workers: 4
+  cache_dir: .cache/radiance/tokenized
+
+model:
+  d_model: 256
+  head_dim: 64
+  n_layers: 4
+  ffn_mult: 4.0
+  ffn_depth: 2
+  loop_count: 6
+
+  # The expansion rate, and 2 is both the paper's choice and the best-measured one here: n=4 was
+  # 0.07 val/loss worse on the A/B below while costing more memory and more step time. Raising it
+  # also wants a smaller hyper_conn_lr (more coefficients, more total drift per step).
+  hyper_conn_streams: 2
+  # Condition the connection weights on the hidden state as well: coeff = static + s * tanh(H W),
+  # with W zero-initialised so this is bit-identical to the static version at init. Free to leave
+  # on; the parameters are ~d_model * (n + 2) per sublayer.
+  hyper_conn_dynamic: true
+
+  # Load-bearing for hyper-connections, not just for norm gains: this is what gives the connection
+  # coefficients one variant per loop iteration. Set it to "none" and every iteration shares a
+  # single routing over the streams, which throws away half the reason to use them here.
+  loop_iter_conditioning: norm_gains
+  loop_input_injection: true
+
+  dropout: 0.0  # doc_attention_mask uses flex_attention, which has no attention-weight dropout
+  max_seq_len: 512
+
+train:
+  # Pinned rather than auto-sized. auto_batch_size would hand the single-stream baseline a larger
+  # micro-batch than the 4-stream arm (hyper-connections cost activation memory), so an A/B run
+  # against configs/tinystories_looped.yaml would differ in two ways at once. See the A/B cautions
+  # in CLAUDE.md.
+  batch_size: 32
+  auto_batch_size: false
+  lr: 1.0e-2  # the retuned post-Muon value; the older configs still pin 3.0e-4, which is wrong
+  # The connection coefficients need their own, much smaller LR — and this is the single setting
+  # that decides whether hyper-connections help or actively hurt. AdamW's step is ~lr per step
+  # almost regardless of gradient scale, and alpha_m/alpha_r/beta are *structural* (a one-hot read,
+  # an identity mix, an all-ones write), so at lr's 1e-2 a few hundred steps erase the routing
+  # rather than refine it. See the sweep under "Measured results" in CLAUDE.md.
+  hyper_conn_lr: 1.0e-3
+  muon_lr: 0.02
+  warmup_ratio: 0.2
+  max_steps: 2000
+  eval_every: 100
+  save_every: 500
+  output_dir: checkpoints/tinystories_hyper
+  dtype: bf16
+
+wandb:
+  project: radiance
+  mode: online

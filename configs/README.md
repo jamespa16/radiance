@@ -40,6 +40,8 @@ Only the fields you need to change — everything else falls back to the datacla
 - **`loop_input_injection`** — re-injects `blocks[0]`'s output at the start of each loop iteration via a zero-initialised `W_inj`, stabilising deep recurrences. Required by `loop_bptt_window`.
 - **`loop_count_min` / `loop_count_max`** — sample loop count uniformly from this range each training step for stochastic depth; both `None` collapses to `loop_count`. Eval/generation always use `loop_count_max`. Each distinct count compiles a separate graph.
 - **`loop_bptt_window`** — backpropagate through only the last N loop iterations, making activation memory O(N). Requires `loop_input_injection` or it raises.
+- **`hyper_conn_streams`** — expansion rate `n` for hyper-connections: the residual stream becomes `n` parallel streams, and each sublayer learns which stream to read, how the streams mix, and how its output is distributed back across them. `1` (default) is exactly one residual stream and allocates nothing. At `n > 1` the model still starts as the plain residual network (one-hot read, identity mix, all-ones write, identical streams), but costs `n` times the residual stream's activation memory — which is why it does not default on. Aimed at the weight-shared loop, where per-iteration variants give each pass its own routing. See `configs/tinystories_hyper.yaml`.
+- **`hyper_conn_dynamic`** — additionally condition the connection coefficients on the hidden state (`static + s·tanh(norm(H) W)`, `W` zero-initialised). Bit-identical to static hyper-connections at init; free at `hyper_conn_streams: 1`, where none exist.
 - **`use_router`** — replace fixed `loop_count` with per-token ACT halting via a sigmoid router.
 - **`max_loops`** — hard cap on loop iterations in router mode.
 - **`ponder_weight`** — coefficient on the ACT ponder-cost loss term (encourages tokens to halt sooner).
@@ -80,6 +82,7 @@ Only the fields you need to change — everything else falls back to the datacla
 - **`optimizer`** — `"muon"` (default, Newton-Schulz orthogonalisation on hidden weights) or `"adamw"`.
 - **`muon_lr`** — learning rate for the Muon group only; ~50x larger than AdamW's since the spectral norm is normalised.
 - **`muon_momentum`** — momentum coefficient for the Muon group.
+- **`hyper_conn_lr`** — learning rate for the hyper-connection coefficients alone (default `1.0e-3`); only consulted when `model.hyper_conn_streams > 1`, so it is inert otherwise. Not `null`-by-default like `embed_lr`, because AdamW's step is ~`lr` per step regardless of gradient scale and these coefficients are *structural* (one-hot read, identity mix) — at `lr`'s post-Muon `1e-2` a few hundred steps erase that structure instead of refining it.
 - **`weight_decay`** — weight decay for AdamW groups.
 - **`warmup_ratio`** — fraction of `max_steps` spent warming up; `warmup_steps = round(max_steps * warmup_ratio)`.
 - **`min_lr_ratio`** — schedule decays to this fraction of `lr` rather than to 0. `0.0` restores decay-to-zero.

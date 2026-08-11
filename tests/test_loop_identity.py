@@ -35,6 +35,7 @@ LOOP_MODES = {
     "router": dict(use_router=True, max_loops=4),
     "moe": dict(loop_count=3, use_moe=True, n_experts=4),
     "nsa": dict(loop_count=3, use_nsa=True, nsa_block_size=4, nsa_top_k_blocks=2, doc_attention_mask=False),
+    "hyper": dict(loop_count=3, hyper_conn_streams=4),
 }
 
 

@@ -28,6 +28,7 @@ MODES = {
     "moe": dict(use_moe=True, n_experts=4, loop_count=2),
     "gqa": dict(n_kv_heads=2, loop_count=2),
     "grad_checkpoint": dict(loop_count=2, grad_checkpoint=True),
+    "hyper": dict(loop_count=2, hyper_conn_streams=4),
 }
 
 

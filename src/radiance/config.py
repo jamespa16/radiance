@@ -80,6 +80,21 @@ class ModelConfig:
     # a stronger lever than grad_checkpoint on this axis, and composable with it. Off (full BPTT)
     # by default: truncating the gradient is an approximation you reach for deliberately, not a
     # free win like the zero-init features above.
+    hyper_conn_streams: int = 1  # expansion rate n for hyper-connections (Zhu et al., ICLR 2025):
+    # the residual stream is replaced by n parallel streams, and each sublayer learns which stream
+    # to read, how to mix the streams with each other, and how to distribute its output back across
+    # them. 1 (default) collapses this to exactly today's single residual stream and allocates no
+    # parameters at all. Aimed squarely at the weight-shared loop: at loop_count 6 a 6-layer model
+    # performs 62 residual writes into one accumulator, which is the regime the paper's
+    # gradient-vanishing/representation-collapse argument is about — and giving the connection
+    # matrices per-iteration variants (see loop_iter_conditioning) lets each pass learn its own
+    # routing, so a stream an iteration doesn't write into carries information across the whole
+    # recursion untouched. Costs n * the residual stream's activation memory, which is why it
+    # stays at 1 by default rather than defaulting on like the free/inert features above — the
+    # same reasoning that keeps mtp_heads at 1.
+    hyper_conn_dynamic: bool = True  # additionally condition the connection weights on the hidden
+    # state: coeff = static + s * tanh(norm(H) @ W), with W zero-initialised. Exactly bit-identical
+    # to static hyper-connections at init, and free at n=1 where no hyper-connections exist at all.
     use_router: bool = False  # opt-in: replace fixed loop_count with per-token ACT halting
     max_loops: int = 6  # hard cap on loop iterations when use_router=True; independent of loop_count
     ponder_weight: float = 1.0e-2  # tau: coefficient on the ponder-cost loss term
@@ -293,6 +308,19 @@ class TrainConfig:
     # too small for "just the embedding". The embedding also wants a different LR from the other
     # tensors AdamW still holds (norm gains, biases, routers, gates), whose scale is load-bearing —
     # hence its own field rather than simply raising `lr`. See embed_lr_resolved.
+    hyper_conn_lr: float | None = 1.0e-3  # LR for the hyper-connection coefficients only (see
+    # model.hyper_conn_streams). None resolves to `lr`; unlike embed_lr this does *not* default to
+    # None, because at `lr`'s post-Muon value of 1e-2 hyper-connections are not merely mistuned but
+    # actively destructive, and a feature whose default setting breaks it is not a usable default.
+    #
+    # The reason is that AdamW's update magnitude is ~lr per step almost regardless of gradient
+    # scale, so 400 steps at 1e-2 can move a coefficient by O(1) — and these coefficients are
+    # *structural*: alpha_m starts one-hot, alpha_r the identity, beta all-ones. A drift of O(1)
+    # there does not refine the routing, it erases it (the read becomes a blend of every stream and
+    # the depth mix becomes arbitrary), whereas the same drift on an RMSNorm gain is just a
+    # rescale. This is the same lesson embed_lr records from the other direction: `lr` reaches a
+    # grab-bag of tensors whose ideal step sizes differ by orders of magnitude, and the fix is a
+    # separate field rather than a compromise value. Measured: see the sweep in CLAUDE.md.
     muon_momentum: float = 0.95
     weight_decay: float = 0.01
     warmup_ratio: float = 0.04  # warmup_steps = round(max_steps * warmup_ratio)
@@ -357,6 +385,16 @@ class TrainConfig:
         shared AdamW's decayed group, so the update is unchanged.
         """
         return self.lr if self.embed_lr is None else self.embed_lr
+
+    @property
+    def hyper_conn_lr_resolved(self) -> float:
+        """The hyper-connection coefficients' LR, falling back to `lr` when unset.
+
+        Only ever consulted when model.hyper_conn_streams > 1, since no such parameters exist
+        otherwise — so this field is inert for every config that hasn't enabled them, despite not
+        defaulting to None.
+        """
+        return self.lr if self.hyper_conn_lr is None else self.hyper_conn_lr
 
     @property
     def warmup_steps(self) -> int:

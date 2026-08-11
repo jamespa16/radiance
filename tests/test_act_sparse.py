@@ -174,6 +174,7 @@ def test_requires_router_mode():
         pytest.param(dict(n_kv_heads=2), id="gqa"),
         pytest.param(dict(loop_iter_conditioning="lora"), id="lora"),
         pytest.param(dict(value_residual=False, attn_out_gate=False), id="no_attn_extras"),
+        pytest.param(dict(hyper_conn_streams=4), id="hyper"),
     ],
 )
 def test_sparse_composes_with_other_features(tiny_ids, extra):

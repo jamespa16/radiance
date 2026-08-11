@@ -34,6 +34,8 @@ model:
   loop_count_min: null
   loop_count_max: null
   loop_bptt_window: null
+  hyper_conn_streams: 1  # 1 = one residual stream, i.e. hyper-connections off and unallocated
+  hyper_conn_dynamic: true
   use_router: false
   max_loops: 6
   ponder_weight: 1.0e-2
@@ -73,6 +75,9 @@ train:
   embed_lr: null  # null resolves to `lr`. LR for the tied token_emb/lm_head matrix alone — the one
   # large tensor AdamW still owns once Muon takes the hidden weights, and the one most badly served
   # by `lr`'s default. See "Measured results" in CLAUDE.md: raising it is worth ~0.4 val/loss.
+  hyper_conn_lr: 1.0e-3  # LR for the hyper-connection coefficients alone; only consulted when
+  # model.hyper_conn_streams > 1. Unlike embed_lr this is not null-by-default, because at `lr`'s
+  # post-Muon 1e-2 these structural coefficients are actively destroyed rather than tuned.
   weight_decay: 0.01
   warmup_ratio: 0.04
   min_lr_ratio: 0.1

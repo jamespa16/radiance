@@ -16,7 +16,10 @@ from radiance.config import Config
 
 
 def build_param_groups(
-    model: torch.nn.Module, weight_decay: float, embed_lr: float | None = None
+    model: torch.nn.Module,
+    weight_decay: float,
+    embed_lr: float | None = None,
+    hyper_conn_lr: float | None = None,
 ) -> list[dict]:
     """Split parameters into decayed / non-decayed groups.
 
@@ -30,12 +33,24 @@ def build_param_groups(
     decayed group exactly as before, so the group list is unchanged for any config that hasn't set
     it — which also keeps migrate_optimizer_to_cpu_offload's positional group zip valid, since both
     call sites pass the same value.
+
+    `hyper_conn_lr` (cfg.train.hyper_conn_lr) does the same for the hyper-connection coefficients,
+    for a sharper reason: they are structural (a one-hot read, an identity depth mix) and AdamW's
+    step is ~lr regardless of gradient scale, so sharing `lr`'s post-Muon value erases the routing
+    within a few hundred steps rather than tuning it. Appended last and only when non-empty, so the
+    positional zip stays valid here too.
     """
-    decay, no_decay, embed = [], [], []
+    decay, no_decay, embed, hyper_static, hyper_dyn = [], [], [], [], []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if param.dim() < 2:
+        if hyper_conn_lr is not None and "hyper" in name:
+            # Only the dynamic *projection* is decayed. The static coefficients must not be (see
+            # _is_hyper_static), and dyn_scale_* are 1-D scale parameters that the ordinary
+            # `dim() < 2` rule would have left undecayed anyway.
+            decayed = param.dim() >= 2 and not _is_hyper_static(name)
+            (hyper_dyn if decayed else hyper_static).append(param)
+        elif param.dim() < 2 or _is_hyper_static(name):
             no_decay.append(param)
         elif embed_lr is not None and _is_embedding(name):
             embed.append(param)
@@ -47,6 +62,12 @@ def build_param_groups(
     ]
     if embed:
         groups.append({"params": embed, "weight_decay": weight_decay, "lr": embed_lr})
+    # Appended last and only when non-empty, so the positional group zip in
+    # migrate_optimizer_to_cpu_offload stays valid — both call sites pass the same arguments.
+    if hyper_static:
+        groups.append({"params": hyper_static, "weight_decay": 0.0, "lr": hyper_conn_lr})
+    if hyper_dyn:
+        groups.append({"params": hyper_dyn, "weight_decay": weight_decay, "lr": hyper_conn_lr})
     return groups
 
 
@@ -54,10 +75,13 @@ def build_param_groups(
 #   - token_emb / lm_head: these are the *tied* embedding matrix. Its rows are per-token, not a
 #     linear map between two hidden spaces, so orthogonalising it is not meaningful — and it is the
 #     largest tensor in the model, so Newton-Schulz on it would also be the dominant step cost.
-#   - router / out_gate: tiny tensors whose exact scale is load-bearing (a router's softmax
-#     calibration, a gate's zero-init). Muon's update has a fixed spectral norm regardless of how
-#     small the gradient is, which is the wrong behaviour for these.
-_MUON_EXCLUDED_SUBSTRINGS = ("token_emb", "lm_head", "router", "out_gate")
+#   - router / out_gate / hyper: tiny tensors whose exact scale is load-bearing (a router's softmax
+#     calibration, a gate's zero-init, a hyper-connection's one-hot read and identity depth mix).
+#     Muon's update has a fixed spectral norm regardless of how small the gradient is, which is the
+#     wrong behaviour for these. "hyper" matters because HyperConnection's alpha_r is (variants, n,
+#     n) and its dynamic weights are (variants, d_model, n) — both >= 2-D, so without this entry
+#     they would fall straight through to Muon.
+_MUON_EXCLUDED_SUBSTRINGS = ("token_emb", "lm_head", "router", "out_gate", "hyper")
 
 # The tied embedding matrix, split out of the AdamW-decayed group so it can carry its own LR
 # (cfg.train.embed_lr). It is the one *large* tensor AdamW still owns once Muon takes the hidden
@@ -68,6 +92,19 @@ _EMBEDDING_SUBSTRINGS = ("token_emb", "lm_head")
 
 def _is_embedding(name: str) -> bool:
     return any(s in name for s in _EMBEDDING_SUBSTRINGS)
+
+
+def _is_hyper_static(name: str) -> bool:
+    """A hyper-connection's *static* connection coefficients (beta / alpha_m / alpha_r).
+
+    They are >= 2-D — alpha_r is (n_variants, n, n) — so the plain `dim() < 2` rule would decay
+    them, but they are connection coefficients initialised to exact structural values (a one-hot
+    read, an identity depth mix, an all-ones write) rather than weights with a shrink-to-zero
+    prior; decaying them would pull the model off that initialisation for no reason. The paper
+    makes the same split, decaying only the dynamic projections, which is why this keys on the
+    "dyn" prefix HyperConnection gives those.
+    """
+    return "hyper" in name and "dyn" not in name
 
 
 def build_muon_param_groups(model: torch.nn.Module, cfg: Config) -> list[dict]:
@@ -84,10 +121,21 @@ def build_muon_param_groups(model: torch.nn.Module, cfg: Config) -> list[dict]:
     """
     width_mult = cfg.model.mup_width_mult
     muon, adam_embed, adam_decay, adam_no_decay = [], [], [], []
+    # Hyper-connections get their own pair of groups, at cfg.train.hyper_conn_lr: these are
+    # structural coefficients (a one-hot read, an identity depth mix), and AdamW's ~lr-per-step
+    # update at `lr`'s post-Muon value erases that structure rather than refining it. See
+    # TrainConfig.hyper_conn_lr. Split static/dynamic only so the static half escapes weight decay.
+    hyper_static, hyper_dyn = [], []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if param.dim() < 2:
+        if "hyper" in name:
+            # Only the dynamic *projection* is decayed. The static coefficients must not be (see
+            # _is_hyper_static), and dyn_scale_* are 1-D scale parameters that the ordinary
+            # `dim() < 2` rule would have left undecayed anyway.
+            decayed = param.dim() >= 2 and not _is_hyper_static(name)
+            (hyper_dyn if decayed else hyper_static).append(param)
+        elif param.dim() < 2:
             adam_no_decay.append(param)
         elif _is_embedding(name):
             adam_embed.append(param)
@@ -127,6 +175,22 @@ def build_muon_param_groups(model: torch.nn.Module, cfg: Config) -> list[dict]:
             "algorithm": "adamw",
             "lr": cfg.train.lr,
             "weight_decay": 0.0,
+            "mup_lr_scale": 1.0,
+        },
+        {
+            "params": hyper_static,
+            "algorithm": "adamw",
+            "lr": cfg.train.hyper_conn_lr_resolved,
+            # Undecayed: decaying a one-hot read or an identity depth mix drags the model off
+            # precisely the initialisation that makes it a residual network.
+            "weight_decay": 0.0,
+            "mup_lr_scale": 1.0,
+        },
+        {
+            "params": hyper_dyn,
+            "algorithm": "adamw",
+            "lr": cfg.train.hyper_conn_lr_resolved,
+            "weight_decay": cfg.train.weight_decay,
             "mup_lr_scale": 1.0,
         },
     ]
@@ -308,7 +372,9 @@ def build_optimizer(model: torch.nn.Module, cfg: Config, device: str) -> torch.o
         from torch.optim import AdamW
 
         return AdamW(
-            build_param_groups(model, cfg.train.weight_decay, cfg.train.embed_lr),
+            build_param_groups(
+                model, cfg.train.weight_decay, cfg.train.embed_lr, cfg.train.hyper_conn_lr
+            ),
             lr=cfg.train.lr,
             fused=(device.split(":")[0] == "cuda"),
         )
@@ -447,7 +513,9 @@ def _adamw_to_cpu_offload(
     training OOM'd before its first successful step) are left to lazy-init on first step(), matching
     fresh-AdamW behavior."""
     new_optimizer = CPUOffloadAdamW(
-        build_param_groups(model, cfg.train.weight_decay, cfg.train.embed_lr),
+        build_param_groups(
+            model, cfg.train.weight_decay, cfg.train.embed_lr, cfg.train.hyper_conn_lr
+        ),
         lr=cfg.train.lr,
         weight_decay=cfg.train.weight_decay,
         device=device,
