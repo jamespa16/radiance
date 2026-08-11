@@ -68,9 +68,6 @@ Only the fields you need to change — everything else falls back to the datacla
 - **`rope_theta`** — RoPE base frequency.
 - **`doc_attention_mask`** — mask attention at document boundaries in packed sequences so tokens cannot attend across unrelated documents. Uses `flex_attention` on CUDA; falls back to plain SDPA on CPU and during generation.
 - **`loop_attn_windows`** — per-iteration attention window sizes (e.g. `[128, 128, 512, 512]` for local-then-global). Requires `doc_attention_mask` (rides the same flex_attention machinery). `None` = fully global.
-- **`use_nsa`** — opt-in DeepSeek NSA-style learned block-sparse attention: a coarse "compression" branch over mean-pooled KV blocks plus a fine "selection" branch over the top-k historical blocks a learned score picks per query token (plus that token's own local block), combined by a per-token gate. Incompatible with `doc_attention_mask`, `loop_attn_windows`, and `act_capacity_ratio`/`act_ffn_capacity_ratio` below 1.0 — see `DenseTransformer.__init__` for why.
-- **`nsa_block_size`** — granularity of compression/selection. Must stay `128` (the default) unless you've confirmed a different value's `flex_attention` kernel actually compiles on your GPU.
-- **`nsa_top_k_blocks`** — non-local historical blocks the selection branch attends to per query token, per head, beyond that token's own local block.
 - **`grad_checkpoint`** — recompute activations during backward instead of storing them; trades ~20-25% throughput for large memory savings, especially under looping. Training-only.
 - **`vocab_pad_multiple`** — round vocab size up to this multiple for tensor-core alignment on `lm_head`. `1` disables. Padding rows are unreachable by any tokenizer id.
 

@@ -177,33 +177,7 @@ class ModelConfig:
     # loop iteration and clamped at the end of the list. A knob that only exists because the
     # architecture loops — the same weights get a different receptive field on each pass. Requires
     # doc_attention_mask (it rides the same flex_attention BlockMask). None = every pass is global.
-    use_nsa: bool = False  # opt-in: DeepSeek NSA-style learned block-sparse attention. Replaces plain
-    # dense/doc-masked attention with two branches: a coarse "compression" branch attending against
-    # mean-pooled KV blocks (cheap, always dense), and a fine "selection" branch attending against
-    # only the top-k historical KV blocks a learned score picks per query *token*, plus that token's
-    # own local block. A per-token gate (NSAGate) combines the two. Unlike value_residual/attn_out_gate,
-    # there is no zero/identity init that makes a learned key-selection mechanism equivalent to dense
-    # attention, so this follows the use_moe/use_router/n_kv_heads precedent: off by default, a
-    # genuinely different computation you opt into, not a free inert addition. Incompatible with
-    # doc_attention_mask (mean-pooling raw KV blocks has no document-boundary awareness, so a block
-    # straddling a packed-document join would blend two documents together before any attention mask
-    # gets applied — masking the attention step can't undo that), with loop_attn_windows (the
-    # selection branch's forced local block already covers recency; combining two receptive-field
-    # mechanisms is unscoped), and with act_capacity_ratio/act_ffn_capacity_ratio < 1.0 (two
-    # independent sparsity axes). See DenseTransformer.__init__ for the raised errors.
-    nsa_block_size: int = 128  # granularity, in raw KV positions, of both compression pooling and
-    # selection. Selection is decided per query *token* (not per query block — a shared per-block
-    # decision would need to average in later tokens' scores that don't exist yet during incremental
-    # decoding, which is impossible; see _nsa_select_blocks), so unlike doc_attention_mask's window
-    # BlockMask, a mismatched value here doesn't just lose sparsity at the tile level — the selection
-    # branch's BlockMask is built with BLOCK_SIZE=nsa_block_size, and flex_attention's Triton kernel
-    # only accepts a BLOCK_SIZE that's a multiple of its own internal tile size (128 on the hardware
-    # this was verified against) — anything smaller raises at the first compiled forward, not just
-    # runs slower. Leave this at 128 unless you've confirmed a different value's kernel actually
-    # compiles on your GPU.
-    nsa_top_k_blocks: int = 8  # non-local historical blocks the selection branch attends to, per
-    # query token, per head, in addition to that token's own always-included local block. Clamped to
-    # the number of causally-valid candidate blocks when the sequence is shorter than that.
+
     grad_checkpoint: bool = False  # opt-in: recompute each block's activations during backward instead
     # of storing them. Trades ~20-30% throughput for a large drop in activation memory, and it pays off
     # disproportionately here because blocks[1:] is re-run loop_count/max_loops times per forward with

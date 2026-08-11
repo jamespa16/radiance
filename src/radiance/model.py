@@ -56,10 +56,6 @@ class LoopContext:
     record_kv: bool = False  # have blocks hand back their post-RoPE (k, v) so an ACT iteration can
     # seed the retained K/V store the sparse iterations read from. Off by default so the common path
     # returns None there and nothing extra is kept alive for backward.
-    nsa_cache: "NSACompressedCache | None" = None  # cfg.use_nsa's compressed-block cache during
-    # generation. Like kv_cache, this only ever holds no-grad buffers and is only populated when
-    # kv_cache is also set — generation always runs under torch.no_grad(), so it never needs to
-    # survive a torch.utils.checkpoint recompute the way this dataclass's docstring warns about.
 
     @property
     def variant(self) -> int:
@@ -440,16 +436,6 @@ class CausalSelfAttention(nn.Module):
 
         self.qkv_lora = _make_iter_lora(cfg, cfg.d_model, cfg.d_model + 2 * kv_dim, n_variants)
 
-        # NSA-lite (cfg.use_nsa): replaces the block_mask/plain-SDPA dispatch below with a
-        # compression + selection branch pair, gated by NSAGate. Named nsa_router (not e.g.
-        # nsa_gate) so it lands in optim.py's Muon-exclusion group via the existing "router"
-        # substring match, alongside ACTRouter/MoERouter, with no optim.py change needed.
-        self.use_nsa = cfg.use_nsa
-        if self.use_nsa:
-            self.nsa_block_size = cfg.nsa_block_size
-            self.nsa_top_k_blocks = cfg.nsa_top_k_blocks
-            self.nsa_router = NSAGate(cfg)
-
     def forward(
         self,
         x: torch.Tensor,
@@ -493,11 +479,6 @@ class CausalSelfAttention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        # NSA's compression branch (cfg.use_nsa) mean-pools *pre-RoPE* keys — captured here, the
-        # last point before rotation. apply_rope isn't in-place, so this is just holding a
-        # reference, not an extra tensor.
-        k_pre_rope = k
-
         q = apply_rope(q, cos[None, None, :, :], sin[None, None, :, :])
         k = apply_rope(k, cos[None, None, :, :], sin[None, None, :, :])
 
@@ -511,12 +492,7 @@ class CausalSelfAttention(nn.Module):
             is_causal = kv_cache.seq_len == 0
             k, v = kv_cache.write(k, v)
 
-        if self.use_nsa:
-            if kv_cache is None:
-                attn_out = self._nsa_train_eval(q, k_pre_rope, k, v, cos, sin, x, ctx)
-            else:
-                attn_out = self._nsa_generate(q, k_pre_rope, k, v, cos, sin, x, ctx)
-        elif ctx.block_mask is not None:
+        if ctx.block_mask is not None:
             # No dropout_p here: flex_attention has no attention-weight dropout. See
             # DenseTransformer._doc_masks, which warns once when a config combines
             # doc_attention_mask with a nonzero dropout. The FFN's residual dropout is unaffected.
@@ -544,163 +520,6 @@ class CausalSelfAttention(nn.Module):
         # the shape the sparse path's retained store needs.
         recorded = (k, v) if ctx.record_kv else None
         return self.out_proj(attn_out), v_own, recorded
-
-    def _nsa_train_eval(
-        self,
-        q: torch.Tensor,
-        k_pre_rope: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        x: torch.Tensor,
-        ctx: LoopContext,
-    ) -> torch.Tensor:
-        """NSA-lite (cfg.use_nsa) for a full sequence — training, eval, or generation's prefill
-        call (which is offset 0 with nothing cached yet, identical in shape to a training forward).
-
-        q, k, v: post-RoPE (batch, heads, seq_len, head_dim); k_pre_rope: pre-RoPE k, same shape as
-        k but at n_kv_heads. Returns (batch, n_heads, seq_len, head_dim), the same pre-transpose
-        shape the block_mask/plain-SDPA branches produce, so the caller's gate/reshape/out_proj
-        tail applies unchanged regardless of which branch ran.
-        """
-        batch, n_heads, seq_len, head_dim = q.shape
-        block_size = self.nsa_block_size
-
-        k_compressed, v_compressed = _nsa_compress(k_pre_rope, v, cos, sin, block_size)
-        group = self.n_heads // self.n_kv_heads
-        k_compressed_rep = k_compressed.repeat_interleave(group, dim=1)
-        v_compressed_rep = v_compressed.repeat_interleave(group, dim=1)
-        n_compressed = k_compressed.size(2)  # seq_len // block_size — only complete blocks
-
-        scores = (q @ k_compressed_rep.transpose(-2, -1)) / (head_dim**0.5)  # (batch, n_heads, seq_len, n_compressed)
-        # Every compressed block is, by construction, exactly complete — its last (representative)
-        # position is (j+1)*block_size - 1, always < seq_len, no clamping needed.
-        block_last_pos = torch.arange(1, n_compressed + 1, device=q.device) * block_size - 1
-        q_pos = torch.arange(seq_len, device=q.device)
-        compress_causal = q_pos.unsqueeze(-1) >= block_last_pos.unsqueeze(0)  # (seq_len, n_compressed)
-        compress_scores = scores.masked_fill(~compress_causal[None, None, :, :], float("-inf"))
-        compress_weights = torch.softmax(compress_scores, dim=-1)
-        # Positions before the first block completes (e.g. every row within block 0 except its
-        # last) have zero causally-visible compressed blocks — an all -inf row, whose softmax is
-        # nan. Those rows contribute nothing from this branch; the selection branch's forced local
-        # block already covers them with real (uncompressed) attention.
-        compress_weights = torch.nan_to_num(compress_weights, nan=0.0)
-        compress_out = compress_weights @ v_compressed_rep  # (batch, n_heads, seq_len, head_dim)
-
-        selected = _nsa_select_blocks(scores, block_size, self.nsa_top_k_blocks, seq_len)
-        use_flex = q.device.type == "cuda" and self.head_dim >= _FLEX_MIN_HEAD_DIM
-        if use_flex:
-            mask = _nsa_build_select_mask(selected, seq_len, block_size)
-            select_out = _flex_attention()(q, k, v, block_mask=mask, enable_gqa=(self.n_kv_heads != self.n_heads))
-        else:
-            # Off-CUDA or head_dim < 16: no compute/memory saving (a full (seq, seq) mask is
-            # materialised, same as _doc_masks' own non-flex fallback), but correct — this repo
-            # treats non-flex paths as CPU-sanity-check-only, never a real run.
-            kv_block = torch.arange(seq_len, device=q.device) // block_size
-            causal = q_pos.unsqueeze(-1) >= q_pos.unsqueeze(0)
-            dense_selected = selected[:, :, :, kv_block]  # (batch, n_heads, seq_len, seq_len)
-            attn_mask = causal[None, None, :, :] & dense_selected
-            select_out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, enable_gqa=(self.n_kv_heads != self.n_heads)
-            )
-
-        gate = self.nsa_router(x).to(q.dtype)  # (batch, seq_len, 2)
-        gate = gate.transpose(1, 2).unsqueeze(-1)  # (batch, 2, seq_len, 1), broadcasts over heads via [:, i]
-        return gate[:, 0:1] * compress_out + gate[:, 1:2] * select_out
-
-    def _nsa_generate(
-        self,
-        q: torch.Tensor,
-        k_pre_rope_new: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        x: torch.Tensor,
-        ctx: LoopContext,
-    ) -> torch.Tensor:
-        """NSA-lite (cfg.use_nsa) during incremental generation.
-
-        k, v here are this slot's *full* post-write history from ctx.kv_cache (already including
-        this call's new token(s)); k_pre_rope_new is only this call's own new chunk, pre-RoPE.
-
-        The prompt's prefill call (nothing cached yet) is shaped exactly like a training forward,
-        so it reuses _nsa_train_eval directly and then seeds ctx.nsa_cache from the same call's
-        raw K/V for later steps to build on. Steady-state single-token decode instead does a cheap
-        manual gather: the model was *trained* attending only to selected blocks, so — unlike
-        doc_attention_mask's generation fallback, where a single prompt really is one document —
-        there is no dense computation that's equivalent to fall back to here; the sparse structure
-        has to be reproduced exactly, just without needing flex_attention's tile machinery at
-        seq_len 1.
-        """
-        kv_cache = ctx.kv_cache
-        nsa_cache = ctx.nsa_cache
-        is_prefill = kv_cache.seq_len == 0
-        if is_prefill:
-            attn_out = self._nsa_train_eval(q, k_pre_rope_new, k, v, cos, sin, x, ctx)
-            nsa_cache.update(k_pre_rope_new, v, cos, sin)
-            return attn_out
-
-        finalized_k, finalized_v = nsa_cache.update(k_pre_rope_new, v, cos, sin)
-        batch, n_heads, one, head_dim = q.shape
-        group = self.n_heads // self.n_kv_heads
-        block_size = nsa_cache.block_size
-        raw_len = k.size(2)
-        current_pos = raw_len - 1
-        current_q_block = current_pos // block_size
-
-        n_finalized = 0 if finalized_k is None else finalized_k.size(2)
-        if n_finalized > 0:
-            k_rep = finalized_k.repeat_interleave(group, dim=1)
-            v_rep = finalized_v.repeat_interleave(group, dim=1)
-            scores = (q @ k_rep.transpose(-2, -1)) / (head_dim**0.5)  # (batch, n_heads, 1, n_finalized)
-            # Every finalized block is, by construction, causally visible to this step's query — at
-            # exactly the position where a block completes, that position sees a compressed summary
-            # of *its own* block too (block_last_pos == current_pos there), matching
-            # _nsa_train_eval's compress_causal (>=, not >) exactly.
-            weights = torch.softmax(scores, dim=-1)
-            compress_out = weights @ v_rep
-        else:
-            compress_out = q.new_zeros(batch, n_heads, 1, head_dim)
-            scores = None
-
-        # The query's own current block's raw content, from its start through now — *always*
-        # attended raw regardless of whether that same block has also just been finalized/
-        # compressed above (the two are independent branches, exactly as in _nsa_train_eval, where
-        # the forced local-block selection and an at-the-boundary compress_causal hit can both fire
-        # for the same position). Deriving this from the query's absolute position rather than from
-        # n_finalized*block_size is what keeps it correct at exactly the step a block completes.
-        local_start = current_q_block * block_size
-        local_k = k[:, :, local_start:, :].repeat_interleave(group, dim=1)
-        local_v = v[:, :, local_start:, :].repeat_interleave(group, dim=1)
-
-        # Only blocks strictly before the query's own (kv_block < q_block, mirroring
-        # _nsa_select_blocks' `candidate`) are valid top-k remote picks — this excludes the
-        # just-finalized current block, which is only ever reached via the local path above.
-        n_candidates = min(n_finalized, current_q_block)
-        top_k = min(self.nsa_top_k_blocks, n_candidates)
-        if top_k > 0:
-            candidate_scores = scores.squeeze(2)[:, :, :n_candidates]
-            top_idx = candidate_scores.topk(top_k, dim=-1).indices  # (batch, n_heads, top_k)
-            pos = top_idx.unsqueeze(-1) * block_size + torch.arange(block_size, device=q.device)
-            pos = pos.reshape(batch, n_heads, -1)  # (batch, n_heads, top_k * block_size)
-            gather_idx = pos.unsqueeze(-1).expand(-1, -1, -1, head_dim)
-            k_full_rep = k.repeat_interleave(group, dim=1)
-            v_full_rep = v.repeat_interleave(group, dim=1)
-            selected_k = k_full_rep.gather(2, gather_idx)
-            selected_v = v_full_rep.gather(2, gather_idx)
-            sel_k = torch.cat([selected_k, local_k], dim=2)
-            sel_v = torch.cat([selected_v, local_v], dim=2)
-        else:
-            sel_k, sel_v = local_k, local_v
-
-        # k/v were already expanded to n_heads above (repeat_interleave), so no enable_gqa here.
-        select_out = F.scaled_dot_product_attention(q, sel_k, sel_v, dropout_p=0.0)
-
-        gate = self.nsa_router(x).to(q.dtype)  # (batch, 1, 2)
-        gate = gate.transpose(1, 2).unsqueeze(-1)  # (batch, 2, 1, 1)
-        return gate[:, 0:1] * compress_out + gate[:, 1:2] * select_out
 
     def forward_sparse(
         self,
@@ -836,33 +655,10 @@ class MoERouter(nn.Module):
         return F.softmax(logits.float(), dim=-1)  # (n_tokens, n_experts)
 
 
-class NSAGate(nn.Module):
-    """Per-token gate combining NSA's two attention branches (cfg.use_nsa). Mirrors ACTRouter's/
-    MoERouter's RMSNorm -> Linear shape, softmaxed over the 2 branches {compression, selection}
-    instead of over experts/a single halting probability."""
-
-    def __init__(self, cfg: ModelConfig):
-        super().__init__()
-        self.norm = RMSNorm(cfg.d_model)
-        self.proj = nn.Linear(cfg.d_model, 2)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # fp32 for a stable softmax under bf16/fp16 autocast, mirroring MoERouter.
-        return F.softmax(self.proj(self.norm(x)).float(), dim=-1)  # (batch, seq_len, 2)
-
-
-# Quantum for eval-time expert capacity: bounds how many distinct MoE dispatch shapes
-# torch.compile has to trace. See _moe_capacity.
+# MoE capacity is quantised to this many tokens so torch.compile doesn't retrace on every batch.
 _CAPACITY_QUANTUM = 128
 
 
-# Runs eagerly even when the model is compiled. assigned.max().item() is a data-dependent host
-# sync — dynamo can't fold it into the graph without capture_scalar_outputs, and left undecorated
-# it hits that unsupported op mid-trace and graph-breaks with a warning. Disabling dynamo here
-# turns that into one deliberate break at a call boundary instead, same idea as
-# DenseTransformer._doc_masks. Only the eval (assigned is not None) path needs this: the training
-# formula below is pure cfg arithmetic and already traces without a break.
-@torch._dynamo.disable
 def _moe_eval_capacity(assigned: torch.Tensor, n_tokens: int) -> int:
     """True per-expert load, quantised, for cfg.moe_eval_full_capacity. See _moe_capacity."""
     # One sync to read the real load. Acceptable outside training, where the alternative is a
@@ -1208,91 +1004,6 @@ class KVCache:
             self._k[slot] = torch.cat([self._k[slot], k], dim=2)
             self._v[slot] = torch.cat([self._v[slot], v], dim=2)
         return self._k[slot], self._v[slot]
-
-
-class NSACompressedCache:
-    """Alongside an ordinary KVCache, tracks NSA's (cfg.use_nsa) finalized compressed-block K/V
-    during incremental generation. Same implicit-call-order slot scheme as KVCache — the two
-    caches must be driven in exact lockstep (one begin_step()/update() pair per attention call,
-    matching KVCache's begin_step()/write()) or their cursors desync.
-
-    Deliberately does *not* duplicate KVCache's raw K/V storage: v is never rotated, so a
-    finalized block's compressed v is pooled directly from KVCache's own retained v at update()
-    time; only k needs a small side buffer, and only for the *pre-RoPE* raw k of the still-pending
-    (not yet block_size-long) tail, since KVCache stores k post-RoPE and pooling already-rotated
-    keys from different positions has no clean geometric meaning (see _nsa_compress).
-    """
-
-    def __init__(self, num_slots: int, block_size: int):
-        self.block_size = block_size
-        self._pending_k: list[torch.Tensor | None] = [None] * num_slots  # pre-RoPE, not yet a block
-        self._k: list[torch.Tensor | None] = [None] * num_slots  # finalized compressed k (post-RoPE)
-        self._v: list[torch.Tensor | None] = [None] * num_slots  # finalized compressed v
-        self._cursor = 0
-
-    def begin_step(self) -> None:
-        self._cursor = 0
-
-    def update(
-        self,
-        k_pre_rope_new: torch.Tensor,
-        v_full: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Append this call's new pre-RoPE k to the pending tail, finalize (pool + RoPE) any
-        block(s) that just completed, and return this slot's finalized (k, v) — None if zero
-        blocks have finalized yet.
-
-        k_pre_rope_new: (batch, n_kv_heads, new_len, head_dim) — only this call's new tokens.
-        v_full: (batch, n_kv_heads, raw_len, head_dim) — KVCache's full retained v for this slot
-        (already including this call's new tokens), used to pool whatever range just completed.
-        cos/sin: this call's own (new_len, head_dim) RoPE tables. A newly-completed block's
-        representative (last) position always falls within *this* call's new tokens — the pending
-        tail can only ever hold up to block_size - 1 positions (a full block is finalized the
-        moment it completes), so the first position that can possibly complete a block is one of
-        this call's own — meaning this call's own cos/sin slice always suffices and no historical
-        RoPE lookup is ever needed.
-        """
-        slot = self._cursor
-        self._cursor += 1
-        pending = self._pending_k[slot]
-        combined = k_pre_rope_new if pending is None else torch.cat([pending, k_pre_rope_new], dim=2)
-
-        block_size = self.block_size
-        n_finalized = 0 if self._k[slot] is None else self._k[slot].size(2)
-        boundary = n_finalized * block_size
-        raw_len = v_full.size(2)
-        n_complete = raw_len // block_size
-
-        if n_complete > n_finalized:
-            end = n_complete * block_size
-            n_new = n_complete - n_finalized
-            # The newly-completing range's pre-RoPE k lives entirely in `combined` (old pending
-            # tail + this call's new tokens); its v lives in KVCache's full retained v.
-            new_k_raw = combined[:, :, : end - boundary, :]
-            new_v_raw = v_full[:, :, boundary:end, :]
-            new_k = _block_mean(new_k_raw, block_size)
-            new_v = _block_mean(new_v_raw, block_size)
-            rep_local_idx = torch.arange(block_size - 1, new_k_raw.size(2), block_size, device=combined.device)
-            # rep_local_idx indexes into *this call's* cos/sin: the representative position of the
-            # first newly-completing block is at raw offset `boundary + block_size - 1`, which is
-            # `block_size - 1 - (old pending length)` positions into this call's own new tokens —
-            # always >= 0, since the pending tail never holds a full block's worth. Later
-            # newly-completing blocks (possible during a long prefill) follow every block_size after.
-            old_pending_len = 0 if pending is None else pending.size(2)
-            rep_local_idx = rep_local_idx - old_pending_len
-            cos_rep, sin_rep = cos[rep_local_idx], sin[rep_local_idx]
-            new_k = apply_rope(new_k, cos_rep[None, None, :, :], sin_rep[None, None, :, :])
-            self._k[slot] = new_k if self._k[slot] is None else torch.cat([self._k[slot], new_k], dim=2)
-            self._v[slot] = new_v if self._v[slot] is None else torch.cat([self._v[slot], new_v], dim=2)
-            self._pending_k[slot] = combined[:, :, end - boundary :, :]
-        else:
-            self._pending_k[slot] = combined
-
-        return self._k[slot], self._v[slot]
-
-
 class ACTRouter(nn.Module):
     """Per-token halting-probability head for ACT (Graves 2016) adaptive looping.
 
@@ -1428,151 +1139,6 @@ def _block_mean(x: torch.Tensor, block_size: int) -> torch.Tensor:
     if pad:
         counts[-1] = block_size - pad
     return summed / counts.view(1, 1, n_blocks, 1)
-
-
-def _nsa_compress(
-    k_pre_rope: torch.Tensor, v: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, block_size: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """NSA's compression branch: mean-pool raw K/V into blocks, then RoPE the pooled key at its
-    block's last (representative) position.
-
-    k_pre_rope/v: (batch, n_kv_heads, seq_len, head_dim) — k *before* RoPE (post qk_norm), v after
-    value-residual mixing (same tensors CausalSelfAttention.forward already has in scope). cos/sin:
-    this call's own (seq_len, head_dim) RoPE tables (offset 0 for training/prefill).
-
-    Only *complete* (exactly block_size real positions) blocks are ever compressed — floor
-    division, not ceil. A trailing partial remainder is deliberately never compressed, even at the
-    very end of a full training sequence: whether the tail is "the end of this example" or "the
-    prefix seen so far in an ongoing generation" isn't knowable from inside this function, and
-    training's own trailing remainder is never queried by anything within the same sequence
-    anyway (there is no later position to query it), so compressing it would buy nothing there
-    while getting it wrong during incremental prefill — where the sequence is *not* actually
-    ending, more tokens are still coming, and a block that looks "complete" only because this call
-    happens to stop there would silently diverge from the same position's compression once later
-    calls extend it (see NSACompressedCache, which finalizes on the same floor-division rule so
-    prefill and decode never disagree). The query's own (possibly still-forming) block is always
-    covered separately, via real uncompressed attention — see _nsa_select_blocks' forced local-block
-    selection.
-
-    Averaging *pre-RoPE* keys and then rotating the *pooled* result once, rather than pooling
-    already-rotated keys, is deliberate: RoPE rotates by absolute position, so mean-pooling
-    post-RoPE vectors from different positions would average rotations together, which has no
-    clean geometric meaning. Rotating the pool once at its block's representative (last) position
-    keeps the compressed key's rotation meaningful.
-    """
-    seq_len = k_pre_rope.size(2)
-    n_blocks = seq_len // block_size  # floor: only fully-complete blocks are compressed
-    usable = n_blocks * block_size
-    batch, n_kv_heads, _, head_dim = k_pre_rope.shape
-    k_compressed = k_pre_rope[:, :, :usable, :].reshape(batch, n_kv_heads, n_blocks, block_size, head_dim).mean(dim=3)
-    v_compressed = v[:, :, :usable, :].reshape(batch, n_kv_heads, n_blocks, block_size, head_dim).mean(dim=3)
-    # Equivalent to arange(block_size - 1, usable, block_size), but also valid when n_blocks == 0
-    # (a short sequence with no complete block yet) — that form's start can exceed its end there,
-    # which torch.arange rejects regardless of the range being logically empty either way.
-    rep_pos = torch.arange(n_blocks, device=k_pre_rope.device) * block_size + (block_size - 1)
-    cos_rep, sin_rep = cos[rep_pos], sin[rep_pos]
-    k_compressed = apply_rope(k_compressed, cos_rep[None, None, :, :], sin_rep[None, None, :, :])
-    return k_compressed, v_compressed
-
-
-def _nsa_select_blocks(scores: torch.Tensor, block_size: int, top_k: int, seq_len: int) -> torch.Tensor:
-    """Per-query-TOKEN top-k selection of historical kv-blocks (cfg.use_nsa's selection branch).
-
-    scores: (batch, heads, seq_len, n_compressed) pre-softmax q @ k_compressed^T — reused from the
-    compression branch rather than scored again, mirroring NSA's own design. n_compressed =
-    seq_len // block_size (only complete blocks have a compressed representation; see
-    _nsa_compress).
-
-    Deliberately *not* shared across a query block: an earlier version of this aggregated scores
-    to one decision per query block (matching flex_attention's tile granularity, so a tile could be
-    cleanly skipped or kept whole), but that requires knowing every query in the block before
-    ranking — fine during training, where the whole sequence is known upfront, but impossible
-    during incremental decoding, where a block's later tokens don't exist yet when its first token
-    is generated. Since NSA has no dense fallback (the model is *trained* attending only to
-    selected blocks, so decode must reproduce the same selection, not an approximation of it), the
-    two must compute the identical thing — which means selection has to be per-token everywhere,
-    exactly what a single-query decode step does naturally. The cost: most flex_attention tiles
-    become "partial" (computed but masked) rather than cleanly skippable, since different query
-    rows in the same tile can select different kv-blocks — a real efficiency loss relative to a
-    block-shared design, accepted because the alternative is simply wrong.
-
-    Returns selected: (batch, heads, seq_len, n_grid) bool, n_grid = ceil(seq_len / block_size) —
-    one grid slot per possible kv-block index, including a possibly-partial trailing one with no
-    compressed representation (reachable only as some query's own local block, never a remote top-k
-    pick). A kv-block is a valid top-k *candidate* for a query only if it lies strictly before the
-    query's own block (kv_block < q_idx // block_size) — every position in an earlier, complete
-    block is unconditionally causally visible, so this block-index comparison alone is sufficient
-    without a separate per-position causal check. Each query's own local block is always
-    force-selected (causally masked within it by the caller's mask_mod) and is never itself a
-    top-k candidate.
-    """
-    batch, heads, _, n_compressed = scores.shape
-    n_grid = -(-seq_len // block_size)  # ceil: includes a possibly-partial trailing block
-
-    q_idx = torch.arange(seq_len, device=scores.device)
-    q_block = q_idx // block_size
-    kv_idx = torch.arange(n_compressed, device=scores.device)
-    candidate = kv_idx.unsqueeze(0) < q_block.unsqueeze(1)  # (seq_len, n_compressed)
-    masked_scores = scores.masked_fill(~candidate.unsqueeze(0).unsqueeze(0), float("-inf"))
-
-    selected = torch.zeros(batch, heads, seq_len, n_grid, dtype=torch.bool, device=scores.device)
-    k = min(top_k, n_compressed)
-    if k > 0:
-        top_idx = masked_scores.topk(k, dim=-1).indices  # (batch, heads, seq_len, k)
-        sub = torch.zeros(batch, heads, seq_len, n_compressed, dtype=torch.bool, device=scores.device)
-        sub = sub.scatter(-1, top_idx, True)
-        # A query with fewer than k real candidates still yields k topk indices (some -inf, ties
-        # broken arbitrarily by torch.topk) — re-AND with `candidate` so none of those leak through
-        # as a false selection.
-        selected[:, :, :, :n_compressed] = sub & candidate.unsqueeze(0).unsqueeze(0)
-    # Force each query's own local block in; causality within it is enforced by the caller's
-    # mask_mod, not here.
-    selected.scatter_(-1, q_block.view(1, 1, seq_len, 1).expand(batch, heads, seq_len, 1), True)
-    return selected
-
-
-def _nsa_select_mask_mod(selected: torch.Tensor, block_size: int):
-    """mask_mod closure for flex_attention's create_block_mask: causal AND this query selected
-    kv_idx's block. selected: (batch, heads, seq_len, n_grid) bool, per-token (see
-    _nsa_select_blocks for why this can't be shared across a query block)."""
-
-    def mask_mod(b, h, q_idx, kv_idx):
-        causal = q_idx >= kv_idx
-        return causal & selected[b, h, q_idx, kv_idx // block_size]
-
-    return mask_mod
-
-
-@torch._dynamo.disable
-def _nsa_build_select_mask(selected: torch.Tensor, seq_len: int, block_size: int):
-    """create_block_mask for NSA's selection branch (cfg.use_nsa). Must run eagerly, exactly like
-    DenseTransformer._doc_masks: create_block_mask builds data-dependent index tensors that
-    inductor can't lower when traced into a compiled region.
-
-    Unlike _doc_masks — built once per forward and reused by every block/iteration — this mask
-    depends on *this attention call's own* Q·K scores, which differ per block and per loop
-    iteration, so it is necessarily rebuilt once per NSA attention call (up to
-    n_layers * loop_multiplier times per forward). That is a real, non-amortised cost, not a free
-    cached one like _doc_masks'.
-
-    BLOCK_SIZE=block_size, matching cfg.nsa_block_size, is load-bearing: since selection is
-    decided per query *token* rather than per query block (see _nsa_select_blocks), a tile is
-    already only "empty/full" rather than "partial" when a whole kv-block is uniformly selected or
-    not across every query row inside it — aligning the tile grid to nsa_block_size is what makes
-    that possible at all on the kv axis. It's also a hard requirement, not just an efficiency one:
-    flex_attention's Triton kernel only accepts a BLOCK_SIZE that's a multiple of its own internal
-    tile size (128, confirmed against this repo's dev hardware) — passing an unsupported value
-    raises at the first compiled call (a LoweringException from inductor), not merely runs slower.
-    """
-    from torch.nn.attention.flex_attention import create_block_mask
-
-    batch, n_heads = selected.shape[0], selected.shape[1]
-    return create_block_mask(
-        _nsa_select_mask_mod(selected, block_size),
-        B=batch, H=n_heads, Q_LEN=seq_len, KV_LEN=seq_len,
-        device=selected.device, BLOCK_SIZE=block_size,
-    )
-
 
 def _maybe_checkpoint(fn, *args, enabled: bool):
     """Run fn(*args) under gradient checkpointing when `enabled`, else call it directly.
@@ -1843,29 +1409,6 @@ class DenseTransformer(nn.Module):
                 "disconnected from the loss and it never trains."
             )
 
-        if cfg.use_nsa and (cfg.act_capacity_ratio < 1.0 or cfg.act_ffn_capacity_ratio < 1.0):
-            raise ValueError(
-                "model.use_nsa is incompatible with ACT block/FFN sparsity "
-                "(model.act_capacity_ratio / model.act_ffn_capacity_ratio < 1.0): two independent "
-                "sparsity axes interacting is out of scope — pick one."
-            )
-        if cfg.use_nsa and cfg.doc_attention_mask:
-            raise ValueError(
-                "model.use_nsa is incompatible with model.doc_attention_mask: NSA's compression "
-                "branch mean-pools fixed-position blocks of raw K/V with no document-boundary "
-                "awareness, so a block straddling a packed-document join would blend two "
-                "documents' keys/values together before any attention mask is applied — masking "
-                "the attention step can't undo that contamination. Making compression "
-                "document-aware is out of scope for now; set model.doc_attention_mask: false."
-            )
-        if cfg.use_nsa and cfg.loop_attn_windows:
-            raise ValueError(
-                "model.use_nsa is incompatible with model.loop_attn_windows: NSA's selection "
-                "branch already force-includes the query's own local block, which covers the same "
-                "recency need loop_attn_windows addresses — combining two receptive-field "
-                "mechanisms is out of scope for now."
-            )
-
         # Auxiliary multi-token-prediction heads (cfg.mtp_heads). mtp_heads=1 means ordinary
         # next-token prediction and builds none.
         self.mtp_heads = nn.ModuleList(MTPHead(cfg) for _ in range(max(0, cfg.mtp_heads - 1)))
@@ -1958,13 +1501,6 @@ class DenseTransformer(nn.Module):
         """
         multiplier = loop_count if loop_count is not None else self.cfg.loop_multiplier
         return KVCache(1 + multiplier * (self.cfg.n_layers - 1))
-
-    def new_nsa_cache(self, loop_count: int | None = None) -> NSACompressedCache:
-        """Builds an empty NSACompressedCache (cfg.use_nsa), sized identically to new_kv_cache —
-        the two caches are driven in exact lockstep, one begin_step()/update() or write() pair per
-        attention call, so their slot counts and call order must match."""
-        multiplier = loop_count if loop_count is not None else self.cfg.loop_multiplier
-        return NSACompressedCache(1 + multiplier * (self.cfg.n_layers - 1), self.cfg.nsa_block_size)
 
     def resolved_loop_count(self, override: int | None = None) -> int:
         """How many times to run the loop body on this forward pass.
@@ -2160,7 +1696,6 @@ class DenseTransformer(nn.Module):
         input_ids: torch.Tensor,
         kv_cache: KVCache | None = None,
         loop_count: int | None = None,
-        nsa_cache: NSACompressedCache | None = None,
     ) -> ModelOutput:
         """Returns a ModelOutput (logits, ponder_cost, mean_loop_depth, moe_aux_loss). The latter
         three are zero scalar tensors when the corresponding feature (use_router / use_moe) is off,
@@ -2169,10 +1704,7 @@ class DenseTransformer(nn.Module):
         kv_cache is optional and defaults to None (the training/full-sequence path, unchanged).
         When given, input_ids is the *new* chunk only (the whole prompt on the first call, one
         token per call thereafter) and attention is computed against cached past K/V plus this
-        chunk; see KVCache and CausalSelfAttention.forward.
-
-        nsa_cache (cfg.use_nsa only) is generate.py's compressed-block cache, driven in lockstep
-        with kv_cache — see NSACompressedCache."""
+        chunk; see KVCache and CausalSelfAttention.forward."""
         batch, seq_len = input_ids.shape
         offset = kv_cache.seq_len if kv_cache is not None else 0
         assert offset + seq_len <= self.cfg.max_seq_len, "sequence length exceeds max_seq_len"
@@ -2186,8 +1718,6 @@ class DenseTransformer(nn.Module):
 
         if kv_cache is not None:
             kv_cache.begin_step()
-        if nsa_cache is not None:
-            nsa_cache.begin_step()
 
         self._reset_moe_aux_loss()
 
@@ -2208,7 +1738,6 @@ class DenseTransformer(nn.Module):
         # v_first for every later block on every later iteration (cfg.value_residual).
         ctx = LoopContext(
             iteration=0, kv_cache=kv_cache, block_mask=self._mask_for_iteration(doc_masks, 1),
-            nsa_cache=nsa_cache,
         )
         x, v_first, _ = _maybe_checkpoint(self.blocks[0], x, cos, sin, ctx, None, enabled=grad_checkpoint)
         if not self.cfg.value_residual:
@@ -2245,7 +1774,6 @@ class DenseTransformer(nn.Module):
                             iteration=n,
                             kv_cache=kv_cache,
                             block_mask=self._mask_for_iteration(doc_masks, n),
-                            nsa_cache=nsa_cache,
                         ),
                         v_first,
                         grad_checkpoint=grad_checkpoint,
@@ -2261,7 +1789,7 @@ class DenseTransformer(nn.Module):
 
         result = self._forward_act(
             x, cos, sin, v_first, anchor, kv_cache, grad_checkpoint, loop_count, doc_masks,
-            input_ids, doc_ids, nsa_cache,
+            input_ids, doc_ids,
         )
         if kv_cache is not None:
             kv_cache.seq_len += seq_len
@@ -2280,7 +1808,6 @@ class DenseTransformer(nn.Module):
         doc_masks: dict | None = None,
         input_ids: torch.Tensor | None = None,
         doc_ids: torch.Tensor | None = None,
-        nsa_cache: NSACompressedCache | None = None,
     ) -> ModelOutput:
         """Adaptive Computation Time (Graves 2016) over the loop body (blocks[1:]): each token
         position gets its own halting probability per iteration, halts once its cumulative
@@ -2359,7 +1886,6 @@ class DenseTransformer(nn.Module):
                 block_mask=self._mask_for_iteration(doc_masks, n),
                 # The first iteration seeds the retained K/V store the sparse ones read from.
                 record_kv=block_sparse and n == 1,
-                nsa_cache=nsa_cache,
             )
             if block_sparse and not is_first_or_last:
                 # Interior iteration: compute only the highest-priority still-running positions.

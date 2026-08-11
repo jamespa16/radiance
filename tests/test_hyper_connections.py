@@ -42,8 +42,6 @@ MODES = {
     "gqa": dict(n_kv_heads=2, loop_count=2),
     "grad_checkpoint": dict(loop_count=2, grad_checkpoint=True),
     "mtp": dict(mtp_heads=3, loop_count=2),
-    "nsa": dict(loop_count=3, use_nsa=True, nsa_block_size=4, nsa_top_k_blocks=2,
-                doc_attention_mask=False),
 }
 
 

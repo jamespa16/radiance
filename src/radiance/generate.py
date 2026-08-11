@@ -49,16 +49,13 @@ def generate(
     input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
     next_input = input_ids[:, -model.cfg.max_seq_len :]
     kv_cache = model.new_kv_cache(loop_count=loops)
-    # cfg.use_nsa needs its own compressed-block cache alongside the ordinary KV cache, driven in
-    # lockstep (see NSACompressedCache) — None for every other model, so this is a no-op elsewhere.
-    nsa_cache = model.new_nsa_cache(loop_count=loops) if model.cfg.use_nsa else None
 
     for _ in range(max_new_tokens):
         assert kv_cache.seq_len + next_input.shape[1] <= model.cfg.max_seq_len, (
             f"generation would exceed model.cfg.max_seq_len ({model.cfg.max_seq_len}); "
             "reduce --max-new-tokens or use a checkpoint trained with a larger max_seq_len"
         )
-        logits = model(next_input, kv_cache=kv_cache, loop_count=loops, nsa_cache=nsa_cache).logits[:, -1, :]
+        logits = model(next_input, kv_cache=kv_cache, loop_count=loops).logits[:, -1, :]
 
         # Mask the vocab-padding rows (see model.padded_vocab_size): no tokenizer id maps to them,
         # so sampling one would decode to nothing and corrupt the KV cache for every later step.

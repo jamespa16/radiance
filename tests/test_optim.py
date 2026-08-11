@@ -11,6 +11,7 @@ from radiance.optim import (
     MuonWithAuxAdam,
     build_muon_param_groups,
     build_optimizer,
+    build_param_groups,
     migrate_optimizer_to_cpu_offload,
     orthogonalize,
 )
@@ -106,20 +107,6 @@ def test_moe_expert_stacks_are_routed_to_muon():
     assert id(moe.experts.down_w) in muon_params
     assert id(moe.router.proj.weight) not in muon_params  # routers stay on AdamW
 
-
-def test_nsa_gate_is_not_routed_to_muon():
-    """nsa_router is a tiny gate (RMSNorm -> Linear(d_model, 2)), same treatment as every other
-    router/gate — named with the "router" substring specifically so it rides the existing
-    exclusion list with no optim.py change."""
-    model, cfg = _model_and_cfg(
-        use_nsa=True, nsa_block_size=4, nsa_top_k_blocks=2, doc_attention_mask=False
-    )
-    groups = build_muon_param_groups(model, cfg)
-    muon_params = {id(p) for g in groups if g["algorithm"] == "muon" for p in g["params"]}
-
-    for block in model.blocks:
-        assert id(block.attn.nsa_router.proj.weight) not in muon_params
-        assert id(block.attn.qkv_proj.weight) in muon_params  # the real hidden matrix still is
 
 
 def test_muon_group_uses_muon_lr():
@@ -287,3 +274,103 @@ def test_mup_scales_init_and_output_at_wider_width():
     assert wide.mup_output_mult == pytest.approx(0.25)
     assert wide.blocks[0].attn.qkv_proj.weight.std().item() == pytest.approx(0.01, rel=0.15)
     assert wide.token_emb.weight.std().item() == pytest.approx(0.02, rel=0.15)
+
+
+def _mup_model(d_model: int, base: int | None, n_layers: int = 2) -> DenseTransformer:
+    torch.manual_seed(0)
+    cfg = ModelConfig(d_model=d_model, head_dim=16, n_layers=n_layers, ffn_mult=2.0, ffn_depth=1,
+                      dropout=0.0, max_seq_len=32, vocab_pad_multiple=1, mup_base_d_model=base)
+    return DenseTransformer(cfg, vocab_size=TINY_VOCAB)
+
+
+def test_mup_scales_adamw_hidden_lr_only():
+    """muP's per-tensor LR correction for Adam is 1/m on the hidden weights and Theta(1) on
+    everything else. Under optimizer="adamw" plain AdamW owns the hidden weights, so this is the
+    path where the correction is load-bearing — see test_mup_keeps_adamw_activations_flat for what
+    its absence actually did."""
+    model = _mup_model(d_model=128, base=32)
+    assert model.cfg.mup_width_mult == 4.0
+
+    cfg = Config()
+    cfg.model, cfg.train = model.cfg, TrainConfig(lr=3.0e-4, optimizer="adamw", device="cpu")
+    groups = build_param_groups(model, 0.1, cfg.train.embed_lr, cfg.train.hyper_conn_lr,
+                                lr=cfg.train.lr, mup_width_mult=cfg.model.mup_width_mult)
+
+    hidden, no_decay, embed = groups[0], groups[1], groups[2]
+    assert hidden["lr"] == pytest.approx(3.0e-4 / 4.0)   # 1/m
+    assert "lr" not in no_decay                          # 1-D gains/biases inherit AdamW's own lr
+    assert embed["lr"] == pytest.approx(3.0e-4)          # fan-in 1, so it does not widen
+
+    # The tied embedding must be in that unscaled group even though embed_lr was left at its
+    # default of None -- otherwise it lands in `decay` and rides the 1/m correction.
+    embed_ids = {id(p) for n, p in model.named_parameters() if "token_emb" in n or "lm_head" in n}
+    assert {id(p) for p in embed["params"]} == embed_ids
+    assert not any(id(p) in embed_ids for p in hidden["params"])
+
+
+def test_mup_leaves_param_groups_untouched_when_inert():
+    """mup_base_d_model unset resolves to d_model, so width_mult is 1.0 and no group gains an `lr`
+    override at all -- the range-collapsed inert default this repo's convention asks for."""
+    model = _mup_model(d_model=128, base=None)
+    assert model.cfg.mup_width_mult == 1.0
+
+    plain = build_param_groups(model, 0.1)
+    with_mup = build_param_groups(model, 0.1, lr=3.0e-4, mup_width_mult=1.0)
+    assert [sorted(g.keys()) for g in plain] == [sorted(g.keys()) for g in with_mup]
+    assert not any("lr" in g for g in with_mup)
+
+
+def test_mup_needs_lr_to_scale_against():
+    with pytest.raises(ValueError, match="muP"):
+        build_param_groups(_mup_model(d_model=128, base=32), 0.1, mup_width_mult=4.0)
+
+
+@pytest.mark.parametrize("optimizer", ["adamw", "muon"])
+def test_mup_keeps_adamw_activations_flat(optimizer):
+    """A coordinate check, shrunk to CPU size: muP's claim is that activation scale is Theta(1) in
+    width at *every* training step, which is what makes a tuned LR transfer across width. So the
+    same quantity measured at 4x width should barely move.
+
+    This is the test that would have caught the missing 1/m correction in build_param_groups. Note
+    what would *not* have: the loss, or the logits. ln_f is RMSNorm and therefore scale-invariant,
+    so it launders a blown-up residual stream away right before the LM head -- with the correction
+    missing, hidden activations grew ~linearly in d_model while the logits stayed flat.
+
+    The mup_base_d_model=None arm is the control, and it matters as much as the assertion: without
+    it this test could pass because muP works, or because the setup is too small/short to move any
+    activation at all. Under SP the same measurement must visibly blow up.
+
+    The 16x width span and 20 steps are both load-bearing and were picked by measurement, not
+    taste. The drift accumulates with *training*, so a shorter or narrower version is not merely a
+    weaker test but a vacuous one: at 4x width over 6 steps the pre-fix code scored 1.12 and would
+    have sailed through. At 16x over 20 steps it scores 9.71 against this fixed build's 0.99.
+    """
+    def coord_size(d_model: int, base: int | None) -> float:
+        model = _mup_model(d_model, base)
+        cfg = Config()
+        cfg.model, cfg.train = model.cfg, TrainConfig(lr=3.0e-4, optimizer=optimizer, device="cpu")
+        opt = build_optimizer(model, cfg, "cpu")
+
+        seen = []
+        handles = [b.attn.out_proj.register_forward_hook(
+            lambda _m, _i, out: seen.append(out.detach().abs().mean().item())) for b in model.blocks]
+
+        gen = torch.Generator().manual_seed(1234)
+        for _ in range(20):
+            seen.clear()
+            ids = torch.randint(0, TINY_VOCAB, (4, 32), generator=gen)
+            logits = model(ids).logits
+            loss = torch.nn.functional.cross_entropy(
+                logits[:, :-1].reshape(-1, TINY_VOCAB), ids[:, 1:].reshape(-1))
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+        for h in handles:
+            h.remove()
+        return sum(seen) / len(seen)
+
+    mup_ratio = coord_size(512, base=32) / coord_size(32, base=32)
+    sp_ratio = coord_size(512, base=None) / coord_size(32, base=None)
+
+    assert mup_ratio < 1.5, f"muP activation scale grew {mup_ratio:.2f}x over 16x width"
+    assert sp_ratio > 3.0, f"control did not drift ({sp_ratio:.2f}x) — test may be vacuous"

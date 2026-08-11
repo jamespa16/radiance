@@ -124,29 +124,3 @@ def test_grad_checkpoint_compiles_under_grad_accum():
                 loss = out.logits.float().square().mean() + out.moe_aux_loss + out.ponder_cost
             loss.backward()
         assert torch.isfinite(model.token_emb.weight.grad).all()
-
-
-@slow
-@requires_cuda
-@pytest.mark.parametrize("grad_checkpoint", [False, True])
-def test_nsa_select_mask_compiles_for_train_and_eval(grad_checkpoint):
-    """cfg.use_nsa's selection-branch BlockMask is a *second* data-dependent create_block_mask call
-    site, distinct from _doc_masks': it's built once per attention call (see
-    _nsa_build_select_mask's docstring for why it can't be amortised the way _doc_masks' is), so it
-    needs its own @torch._dynamo.disable regression pin rather than assuming _doc_masks' coverage
-    extends to it. nsa_block_size must stay 128 here — flex_attention's Triton kernel only accepts
-    a BLOCK_SIZE that's a multiple of its own internal tile size, so max_seq_len needs to be large
-    enough to have more than one block."""
-    model = _build(
-        loop_count=2, grad_checkpoint=grad_checkpoint, max_seq_len=256,
-        use_nsa=True, nsa_block_size=128, nsa_top_k_blocks=1, doc_attention_mask=False,
-    )
-    compiled = torch.compile(model)
-    ids = torch.randint(0, TINY_VOCAB, (2, 256), device="cuda")
-
-    compiled.train()
-    compiled(ids).logits.square().mean().backward()
-
-    compiled.eval()
-    with torch.no_grad():
-        assert compiled(ids).logits.shape == (2, 256, TINY_VOCAB)

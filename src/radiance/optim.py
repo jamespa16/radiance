@@ -20,6 +20,8 @@ def build_param_groups(
     weight_decay: float,
     embed_lr: float | None = None,
     hyper_conn_lr: float | None = None,
+    lr: float | None = None,
+    mup_width_mult: float = 1.0,
 ) -> list[dict]:
     """Split parameters into decayed / non-decayed groups.
 
@@ -39,7 +41,31 @@ def build_param_groups(
     step is ~lr regardless of gradient scale, so sharing `lr`'s post-Muon value erases the routing
     within a few hundred steps rather than tuning it. Appended last and only when non-empty, so the
     positional zip stays valid here too.
+
+    `mup_width_mult` (cfg.model.mup_width_mult) applies muP's per-tensor LR correction, which for
+    Adam is 1/m on the *hidden* weights and Theta(1) on everything else. It is exactly 1.0 unless
+    cfg.model.mup_base_d_model is set, in which case `lr` must be given to scale against. Without
+    this correction Adam's update is width-independent where muP requires it to shrink, and hidden
+    activations grow linearly in d_model — measured at 16.7x across a 16x width sweep, which is
+    precisely the drift muP exists to remove. Note it stays invisible in `val/loss`: ln_f is
+    RMSNorm and therefore scale-invariant, so it launders the blown-up residual stream away right
+    before the LM head. A coordinate check, not a loss curve, is what catches this.
+
+    build_muon_param_groups needs no equivalent, for a real reason rather than an oversight: Muon's
+    update is spectrally normalised and so already approximately width-invariant, and the tensors
+    its auxiliary AdamW owns are exactly the ones muP leaves at Theta(1) anyway (the embedding,
+    1-D gains/biases, and the tiny routers/gates). Verified by coordinate check across a 16x width
+    sweep, looped and unlooped.
     """
+    mup = mup_width_mult != 1.0
+    if mup and lr is None:
+        raise ValueError("build_param_groups needs `lr` to apply muP's 1/width_mult correction")
+    # The tied embedding is Theta(1) under muP (a row lookup has fan-in 1, so it does not widen).
+    # It otherwise sits in `decay` whenever embed_lr is unset — which is the default — and would
+    # ride that group's 1/m correction, so give it its own unscaled group as soon as muP is live.
+    if mup and embed_lr is None:
+        embed_lr = lr
+
     decay, no_decay, embed, hyper_static, hyper_dyn = [], [], [], [], []
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -57,9 +83,15 @@ def build_param_groups(
         else:
             decay.append(param)
     groups = [
+        # `decay` is the hidden weight matrices plus the routers/gates and MoE experts — all
+        # hidden- or readout-like, i.e. all 1/m under muP. `no_decay` is 1-D gains and biases,
+        # which muP leaves alone. The key is only set when the correction is non-trivial, so an
+        # ordinary run's groups are untouched and inherit the optimizer's own lr as before.
         {"params": decay, "weight_decay": weight_decay},
         {"params": no_decay, "weight_decay": 0.0},
     ]
+    if mup:
+        groups[0]["lr"] = lr / mup_width_mult
     if embed:
         groups.append({"params": embed, "weight_decay": weight_decay, "lr": embed_lr})
     # Appended last and only when non-empty, so the positional group zip in
@@ -114,12 +146,20 @@ def build_muon_param_groups(model: torch.nn.Module, cfg: Config) -> list[dict]:
     ~50x cfg.train.lr) while the AdamW groups keep the LR every existing config already tuned.
     LambdaLR scales each group from its own initial_lr, so one schedule shape drives both.
 
-    `mup_lr_scale` implements muP's per-tensor LR correction (see ModelConfig.mup_width_mult). It
-    is 1.0 for the Muon group — Muon's update is spectrally normalised, so it is already
-    approximately width-invariant and needs no correction — and 1/width_mult for AdamW's hidden
-    weights. Embeddings and 1-D parameters are unscaled under muP.
+    `mup_lr_scale` carries muP's per-tensor LR correction (see ModelConfig.mup_width_mult). Every
+    group on *this* path is 1.0, and deliberately so rather than by omission: the Muon group needs
+    no correction (a spectrally-normalised update is already approximately width-invariant), and
+    the tensors left to the auxiliary AdamW are exactly the ones muP leaves at Theta(1) — the tied
+    embedding (fan-in 1, so it does not widen), 1-D gains and biases, and the routers/gates. That
+    last group is hidden-like and would strictly want 1/m, but it is a rounding error in both
+    parameter count and gradient norm, so it stays unscaled rather than earning a correction of
+    its own. Confirmed by coordinate check: activation scale is flat to within +-8% across a 16x
+    width sweep, looped and unlooped.
+
+    The key is kept per-group anyway, so a future group that *does* need a correction has an
+    obvious place to declare it. build_param_groups is where the non-trivial version lives, since
+    plain AdamW owns the hidden weights too.
     """
-    width_mult = cfg.model.mup_width_mult
     muon, adam_embed, adam_decay, adam_no_decay = [], [], [], []
     # Hyper-connections get their own pair of groups, at cfg.train.hyper_conn_lr: these are
     # structural coefficients (a one-hot read, an identity depth mix), and AdamW's ~lr-per-step
@@ -195,7 +235,7 @@ def build_muon_param_groups(model: torch.nn.Module, cfg: Config) -> list[dict]:
         },
     ]
     for group in groups:
-        group["lr"] *= group["mup_lr_scale"] if width_mult != 1.0 else 1.0
+        group["lr"] *= group["mup_lr_scale"]
     return [g for g in groups if g["params"]]
 
 
@@ -373,7 +413,8 @@ def build_optimizer(model: torch.nn.Module, cfg: Config, device: str) -> torch.o
 
         return AdamW(
             build_param_groups(
-                model, cfg.train.weight_decay, cfg.train.embed_lr, cfg.train.hyper_conn_lr
+                model, cfg.train.weight_decay, cfg.train.embed_lr, cfg.train.hyper_conn_lr,
+                lr=cfg.train.lr, mup_width_mult=cfg.model.mup_width_mult,
             ),
             lr=cfg.train.lr,
             fused=(device.split(":")[0] == "cuda"),
@@ -513,8 +554,11 @@ def _adamw_to_cpu_offload(
     training OOM'd before its first successful step) are left to lazy-init on first step(), matching
     fresh-AdamW behavior."""
     new_optimizer = CPUOffloadAdamW(
+        # Argument-identical to build_optimizer's call above, which is what keeps the positional
+        # group zip below valid — muP's extra embedding group must appear in both or neither.
         build_param_groups(
-            model, cfg.train.weight_decay, cfg.train.embed_lr, cfg.train.hyper_conn_lr
+            model, cfg.train.weight_decay, cfg.train.embed_lr, cfg.train.hyper_conn_lr,
+            lr=cfg.train.lr, mup_width_mult=cfg.model.mup_width_mult,
         ),
         lr=cfg.train.lr,
         weight_decay=cfg.train.weight_decay,
