@@ -42,6 +42,62 @@ def test_lm_loss_ignores_final_position():
     torch.testing.assert_close(lm_loss, expected)
 
 
+def test_single_pass_loss_matches_two_pass_reference():
+    """Both losses come from one logsumexp; that must equal computing them independently.
+
+    This is the identity the fast path rests on — cross_entropy is `logsumexp(x) - x[label]`, so
+    the z-loss regulariser's own logsumexp is the same reduction and the second pass over the
+    largest tensor in the model was redundant. If a future change reintroduces a separate
+    F.cross_entropy call the numbers should still match, so what this really pins is that the
+    hand-rolled NLL is exactly cross_entropy's mean-over-kept-positions and not, say, a mean over
+    all positions including the ignored ones.
+    """
+    torch.manual_seed(7)
+    logits = torch.randn(3, 9, 40)
+    input_ids = torch.randint(0, 40, (3, 9))
+
+    lm_loss, z_loss = compute_loss(logits, input_ids)
+
+    labels = torch.cat([input_ids[:, 1:], input_ids.new_full((3, 1), -100)], dim=1).view(-1)
+    flat = logits.view(-1, 40)
+    ref_lm = torch.nn.functional.cross_entropy(flat, labels, ignore_index=-100)
+    keep = (labels != -100).to(flat.dtype)
+    ref_z = (torch.logsumexp(flat, dim=-1).square() * keep).sum() / keep.sum()
+
+    torch.testing.assert_close(lm_loss, ref_lm)
+    torch.testing.assert_close(z_loss, ref_z)
+
+
+def test_single_pass_loss_gradients_match_cross_entropy():
+    """Equal losses aren't enough — the gradient reaching the logits has to match too."""
+    torch.manual_seed(11)
+    logits = torch.randn(2, 7, 30, requires_grad=True)
+    input_ids = torch.randint(0, 30, (2, 7))
+
+    compute_loss(logits, input_ids)[0].backward()
+    ours = logits.grad.clone()
+
+    ref_logits = logits.detach().clone().requires_grad_(True)
+    labels = torch.cat([input_ids[:, 1:], input_ids.new_full((2, 1), -100)], dim=1)
+    torch.nn.functional.cross_entropy(
+        ref_logits.view(-1, 30), labels.view(-1), ignore_index=-100
+    ).backward()
+
+    torch.testing.assert_close(ours, ref_logits.grad)
+
+
+def test_all_ignored_batch_is_zero_not_nan():
+    """A batch with no targets at all must not poison the accumulated gradient with nan.
+
+    F.cross_entropy returns nan for an all-ignored batch (0/0). Only reachable at seq_len 1, but a
+    nan here propagates through the whole accumulated step, so the kept-count is clamped instead.
+    """
+    lm_loss, z_loss = compute_loss(torch.randn(2, 1, 12), torch.randint(0, 12, (2, 1)))
+
+    assert torch.isfinite(lm_loss) and lm_loss.item() == 0.0
+    assert torch.isfinite(z_loss)
+
+
 def _lr_curve(**train_kwargs) -> list[float]:
     param = torch.nn.Parameter(torch.zeros(1))
     optimizer = torch.optim.SGD([param], lr=1.0)

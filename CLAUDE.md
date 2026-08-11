@@ -73,6 +73,13 @@ without `-m "not slow"`.** The eval path is worth particular attention there: `g
 so evaluation traces a *different* graph than training — the doc-masking bug compiled fine for training and blew
 up at the first `evaluate()` call.
 
+The same file also carries four *fast* tests (no GPU, no compile) that pin `resolve_compile_mode`'s output
+directly, because the third compile failure — doc masking under CUDA graphs, see `train.py` below — is silent.
+It raises nothing; it leaks device memory and triples step time until the card fills up. There is no cheap
+runtime assertion for that, so what gets tested is the decision. The `"reduce-overhead"` control case matters as
+much as the three `None` cases: without it they would all pass against a function that returned `None`
+unconditionally, i.e. against "never use CUDA graphs at all" as an accidental fix.
+
 Still run a tiny config end-to-end (small `seq_len`, `d_model`, `max_steps`) through `radiance.train` on CPU
 before trusting a full run — the suite covers the model, not the data pipeline or the training loop's plumbing.
 
@@ -167,6 +174,14 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   checkpoints predating this still load) and masks the padding columns before sampling, since a sampled padding
   id would decode to nothing and corrupt the KV cache. Defaults on, like everything else here — see the defaults
   convention under `config.py`.
+
+  `activation_bytes_per_token` bills the `(batch, seq, vocab_size)` logits at `2 * activation_dtype_bytes + 4`
+  (logits, their gradient, one fp32 reduction buffer). It used to bill them at a flat fp32 x3 because
+  `F.cross_entropy` sat on autocast's fp32 list and upcast the whole tensor; `train.compute_loss` no longer goes
+  through cross_entropy, so the term now shrinks with the compute dtype like every other activation. Against the
+  real measured peak the whole estimate lands 1.12x high where the fp32 assumption had it 1.58x high — still on
+  the intended over-estimating side, but no longer spending that headroom on a smaller micro-batch than the
+  model needs. Keep this in step with the loss: it is the only place that models a term `model.py` doesn't own.
 
   `forward()` returns a `ModelOutput` NamedTuple (`logits`, `ponder_cost`, `mean_loop_depth`, `moe_aux_loss`,
   `mtp_hidden`), not a bare tuple, so fields can be added without breaking every call site. Per-iteration state
@@ -376,7 +391,9 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
     is what `new_kv_cache`, `_scale_residual_init` and `activation_bytes_per_token` size themselves against.
     Note that stochastic depth forces `train.py` to compile **without CUDA graphs** (`mode=None` rather than
     `"reduce-overhead"`): a captured graph assumes a static execution path, and replaying a different loop count
-    overwrites the previous graph's gradient tensors.
+    overwrites the previous graph's gradient tensors. It is one of three such conditions — see
+    `resolve_compile_mode` under `train.py` below, and note that the default config already meets another of
+    them, so in practice most runs here never capture CUDA graphs at all.
   - `cfg.model.loop_bptt_window` backpropagates through only the last N iterations, running earlier ones under
     `no_grad`, so activation memory becomes O(N) rather than O(loop_count). **It requires
     `loop_input_injection`, and `DenseTransformer.__init__` raises if you set one without the other.** The
@@ -551,6 +568,39 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   deliberately does *not* converge: the tuned coefficients settle into a band around [0.68, 1.13], which is the
   intended operating point (it needs the spread collapsed, not the values exact).
 
+  **`_step_muon` batches by parameter shape.** The arithmetic is per-parameter but issuing it per-parameter is
+  what costs: Newton-Schulz is `ns_steps` iterations of three matmuls, so a 42-tensor group is 630 matmuls, none
+  large enough to saturate the GPU. A transformer has very few distinct weight shapes (one per projection role,
+  repeated per layer), so stacking same-shaped updates into a leading batch dimension collapses that to 630 /
+  (tensors per shape) launches — exactly the free batch dimension `BatchedExperts` already relies on. Momentum
+  and weight decay use `torch._foreach_*` for the same reason, as does `_step_adamw`'s update (its moment
+  accumulation already did). Measured on `configs/tinystories.yaml`: optimizer step **8.2 -> 4.4 ms**, of which
+  the Muon groups are 6.7 -> 3.8 and the AdamW groups 1.4 -> 0.6.
+
+  This is a launch-overhead fix, so it pays where the tensors are small. Verify it stays numerically neutral
+  rather than assuming: against an fp64 reference, batched and per-tensor orthogonalisation have **identical**
+  error (~2.7e-2 either way — the bf16 iteration's own error, far larger than the difference between them) and
+  are bit-identical for most shapes. `tests/test_optim.py::test_orthogonalize_batches_over_leading_dims` and
+  `test_muon_batched_step_matches_per_parameter_step` pin that.
+
+  **Newton-Schulz cost is per optimizer step and independent of batch size, which makes the effective batch a
+  throughput knob and not only a quality one.** For an `(m, n)` weight it is ~`30 * min(m,n) * numel` FLOPs, so
+  per parameter it costs ~`30 * d_model` against fwd+bwd's ~`6 * tokens_per_step` — Muon dominates whenever
+  `tokens_per_step < 5 * d_model`. That is not a hypothetical: `configs/fineweb_500m.yaml` ships
+  `batch_size: 4, grad_accum_steps: 1` at `seq_len: 1024`, i.e. **4096 tokens per optimizer step against
+  `d_model: 1280`**, and measures 50% of step time in the optimizer. Raising the effective batch amortises it:
+
+  | `micro x accum` | tokens/step | step | tok/s | optimizer share |
+  |---|---|---|---|---|
+  | 4 x 1 (as shipped) | 4,096 | 339 ms | 12,100 | 50% |
+  | 4 x 8 | 32,768 | 1459 ms | **22,500** | 12% |
+
+  **1.85x throughput for +0.4 GB**, and 4096 tokens/step was far too small an effective batch for a 500M model
+  anyway. Set `train.target_effective_batch_size` (the config already carries it commented out) rather than
+  raising `batch_size`, so `auto_batch_size` keeps choosing the micro-batch. Left as-is deliberately rather than
+  changed here: effective batch size reshapes `tokens_per_param`'s derived `max_steps` and interacts with the
+  tuned `lr`, so it is a run-shaping decision, not a free win to apply silently.
+
   `MuonWithAuxAdam` holds both algorithms in **one** Optimizer object with a per-group `algorithm` key, because
   everything downstream assumes a single optimizer — the `GradScaler`'s unscale_/step bookkeeping is keyed on it,
   `LambdaLR` drives its `param_groups`, `save_checkpoint` serialises its `state_dict`, and the OOM handler swaps
@@ -560,6 +610,25 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   load-bearing, where Muon's fixed-spectral-norm update is the wrong behaviour). Muon's group runs at
   `cfg.train.muon_lr` (default `0.02`, ~50x AdamW's) while the AdamW groups keep `cfg.train.lr` — a separate
   field precisely so every existing config's tuned `lr` still means what it did.
+
+  **Both param-group builders classify norm gains by their owning module (`norm_gain_param_ids`), not by
+  `param.dim() < 2`.** The rank rule was correct only while a norm gain was always `(d_model,)`.
+  `cfg.model.loop_iter_conditioning: "norm_gains"` — the *default* — gives `RMSNorm` a `(n_variants, d_model)`
+  gain bank instead, one row per loop iteration, which is still a per-channel scale but is 2-D. So the moment a
+  config set `loop_count > 1`, every `ln1`/`ln2` gain silently stopped being an AdamW no-decay tensor: on the
+  Muon path it became a **Muon** tensor, where Newton-Schulz drives its singular values to 1 (a norm gain *is*
+  its scale, so that erases the conditioning rather than refining it), and on the AdamW path it started being
+  decayed toward zero from its 1.0 init. `configs/fineweb_500m.yaml` had 44 gain banks in the Muon group.
+  Nothing raises, nothing shows up as a dead parameter, and `loop_count: 1` configs are unaffected — which is
+  why `configs/tinystories.yaml` never saw it and every looped config did.
+
+  **Measured, and it is a correctness fix rather than a quality win:** on a looped A/B (`d_model: 256`,
+  `n_layers: 4`, `loop_count: 6`, batch 16 pinned, `lr: 1.0e-2`, 1000 steps) `val/loss` at step 1000 was
+  **1.9581 gains-to-Muon vs 1.9590 fixed** — indistinguishable, and the fixed arm was ahead at every earlier
+  eval point (2.7821/2.3694/2.1681/2.0284 vs 2.7861/2.3749/2.1699/2.0304). So it buys no measurable quality
+  here; it is kept because it makes a tensor's optimizer independent of how many loop variants it happens to
+  hold, which is plainly what both builders' docstrings already intended. Worth re-testing at depth before
+  assuming it stays neutral.
 
   **That last decision left `lr` badly mistuned, and it was the single largest quality bug measured in this
   repo.** Keeping `lr` fixed across the Muon switch preserved its *value* but silently changed its *job*: it was
@@ -658,7 +727,40 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   periodic checkpointing to `cfg.train.output_dir` (raw
   `torch.save` of state dict + config), and periodic `evaluate()` against the validation split. The stdout line
   matters more than it looks: W&B was previously the only place a loss ever appeared, so a run with
-  `wandb.mode: disabled` (sweeps, CI, quick A/Bs) produced no visible signal at all.
+  `wandb.mode: disabled` (sweeps, CI, quick A/Bs) produced no visible signal at all. On CUDA it also carries
+  `mem`, the reserved VRAM — see `resolve_compile_mode` below for what a number that climbs step over step means.
+
+  **`resolve_compile_mode(raw_model, cfg, device_type)` decides whether the run gets CUDA graphs**
+  (`mode="reduce-overhead"`) or plain inductor (`mode=None`). Three things independently rule CUDA graphs out,
+  because each gives up the static execution path a captured graph assumes: **stochastic loop depth** (replaying
+  a different loop count overwrites the previous graph's gradient tensors), **`grad_checkpoint`** (the backward
+  recompute is captured as its own graph against the same static pool, overwriting a tensor the original
+  backward still needs), and **`doc_attention_mask`**.
+
+  The third one is the reason this is a named function with tests rather than an `if` in `train()`, because it
+  is the only one that fails *silently*. The others raise. This one rebuilds a `flex_attention` `BlockMask`
+  every step out of that batch's document boundaries, so its tensors land at fresh addresses; CUDA graph trees
+  treats them as static inputs (they cross the eager `_doc_masks` graph break as lifted constants), and a
+  changed data pointer forces a re-record. Every re-record instantiates another `cudaGraphExec` that is never
+  freed. Measured on the 21-executed-block looped config at batch 16 x grad_accum 2:
+
+  | | step time | process VRAM |
+  |---|---|---|
+  | `reduce-overhead` + doc masking | 282 ms | **+8 MB/step**, exhausts a 32 GB card by step ~1600 |
+  | `reduce-overhead`, doc masking off | 84 ms | flat |
+  | `mode=None` (either way) | 87 ms | flat |
+
+  Two things about this are worth carrying forward. **`torch.cuda.memory_reserved()` cannot see it** — it sat
+  flat at 6.43 GB for the entire run while the process climbed 16 -> 22.5 GB, because the growth is outside the
+  caching allocator. An earlier investigation measured reserved memory, correctly concluded the model was clean,
+  and spent its time in the DataLoader. Use `torch.cuda.mem_get_info()` (or `nvidia-smi`) to see the whole
+  picture; `(total - free) - memory_reserved()` is the non-allocator footprint and is the number that moved.
+  And **CUDA graphs were never buying anything here anyway**: 84.2 ms vs 82.7 ms in the one configuration where
+  they work correctly. Since `doc_attention_mask` defaults on, `mode="reduce-overhead"` is now nearly dead code
+  on real configs — it survives for the cases that build no per-step mask (`head_dim < 16`, non-CUDA, doc
+  masking explicitly off). If a future change makes CUDA graphs actually pay, the fix is to give the BlockMask
+  stable addresses (build once, `copy_` into it, keeping `mask_mod`'s `doc_ids` a persistent buffer so partial
+  blocks stay correct), not to relax this.
 
   `compute_loss` applies the causal-LM one-position shift to the *labels* (padding them with `ignore_index`),
   not by slicing `logits[:, :-1]`. The slice is a non-contiguous view whose `.contiguous()`/`.view()` forces a
@@ -671,6 +773,28 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   so `val/loss` stays a pure LM number, exactly as `ponder_cost` and `moe_aux_loss` already are. Note the
   reduction order: `logsumexp` over the vocab **first**, then mask, rather than `flat_logits[mask]`, which would
   copy nearly the whole logits tensor just to drop one row per sequence.
+
+  **Both losses come out of one `logsumexp`, and that was the single largest throughput win measured in this
+  repo.** Cross-entropy is exactly `logsumexp(x) - x[label]`, and z_loss squares that same `logsumexp(x)` — so
+  the old `F.cross_entropy(...)` plus a separate `torch.logsumexp(...)` reduced the largest tensor in the model
+  twice in the forward and twice again in the backward. `_nll_and_logz` computes `z` once and gathers the target
+  logit off it; `compute_loss` and `compute_mtp_loss` (one full-width logits tensor *per head*) both go through
+  it. Two things compound with that. `F.cross_entropy` sits on **autocast's fp32 list**, so it silently upcast
+  the whole `(batch, seq, vocab_size)` tensor before reducing it — nothing on the new path does, so the logits
+  stay at compute width. And `build_loss_fn` wraps the result in `torch.compile` when `cfg.train.compile` is on
+  (separately from the model's own compile, since the loss consumes the model's *output*), which lets inductor
+  fuse the whole thing into a single pass and keep the reduction in fp32 without ever materialising an fp32 copy.
+
+  Measured standalone at batch 32 x seq 512 x vocab 50304, fwd+bwd: **22.7 ms and +8.2 GB** for the two-pass
+  version, 17.0 ms eager on the new path, **5.5 ms and +5.0 GB compiled**. End-to-end on
+  `configs/tinystories.yaml` the step went **82.4 -> 37.5 ms and peak memory 22.5 -> 7.7 GB**. It is also
+  *more* accurate, not less: `F.cross_entropy` under autocast returned a bf16-rounded loss, so against an fp32
+  reference the compiled single-pass version is off by 2.5e-5 where the original was off by 3.4e-3.
+
+  The size of this is a property of the *shape*, not of the code being clever: at `d_model: 256` with a
+  50304-token vocab the logits are `196 x d_model` wide, so anything that walks them twice costs more than a
+  transformer block. Expect the win to shrink as `d_model` grows — at `configs/fineweb_500m.yaml`'s
+  `d_model: 1280` it is ~1.5% of step time and 15% of peak memory rather than 2.2x.
 
   `build_lr_scheduler`'s warmup ramps over `(step + 1)`, because `LambdaLR` evaluates the lambda at step 0 to set
   the LR for the *first* `optimizer.step()` — a plain `step / warmup_steps` ramp spends that entire first step at
@@ -914,6 +1038,35 @@ learned on this change: **give each arm the whole GPU.** Two of the first hyper-
 by a diagnostic run started alongside them, and the symptom was an OOM-shaped early exit in the *other* process,
 not the one at fault.
 
+A fourth, from the CUDA-graph leak above: **any wall-clock time recorded from a full `radiance-train` run on a
+doc-masked config before that fix is inflated by roughly 3x**, and OOM-shaped early exits on long looped runs
+were symptoms of it rather than of genuine memory demand. Quality numbers (`val/loss`) are unaffected — the leak
+changed how the graph was executed, not what it computed. The standalone fwd+bwd benchmark tables above (ACT
+sparsity, hyper-connections, MoE dispatch) do not go through `train.py` and so were never exposed to it, but
+none of them have been re-measured since; treat them as pre-fix figures until they are.
+
+**Throughput work is recorded separately from quality work, because it is supposed to change wall-clock and
+nothing else.** A/B on `configs/tinystories.yaml`'s shape (400 steps, pinned `batch_size: 32`,
+`auto_batch_size: false`, `lr: 1.0e-2`, `dropout: 0.0`), single-pass loss + batched Muon vs the two-pass loss +
+per-parameter Muon:
+
+| | wall clock | `val/loss` @400 | reserved VRAM |
+|---|---|---|---|
+| before | 55.3s | 2.1020 | 25.69 GB |
+| after | **20.3s** | 2.1040 | **9.20 GB** |
+
+**2.7x, with `val/loss` matching to within the ~0.002 noise floor** at every eval point (3.0469/2.4788/2.2285
+vs 3.0612/2.4807/2.2294). The freed memory compounds through `auto_batch_size`, which now picks micro-batch 62
+where it picked 43. See `train.py`'s `compute_loss` and `optim.py`'s `_step_muon` for the two changes; the loss
+is by far the larger of them and shrinks with width, so do not carry 2.7x across to a wide model — the same
+comparison on `configs/fineweb_500m.yaml` (`d_model: 1280`) is 343.8 -> 338.7 ms/step and 24.5 -> 20.8 GB.
+
+**A trap when timing anything here: inductor's on-disk FX graph cache persists across processes.** The first
+run of the looped A/B above took 71.8s and the second 38.9s for the *same* code and the same final loss —
+re-running the first arm warm gave 39.2s. That is a 1.8x phantom speedup available to whichever arm runs
+second. Always re-run the first arm at the end, or discard the first run of any config. This is the
+cross-process version of the caveat already noted under "Startup compile cost".
+
 **Startup compile cost**, measured at the same size on the first forward/backward with `mode=None`
 (`d_model: 256`, `n_layers: 4`, `loop_count: 6`, batch 8 x 512):
 
@@ -955,7 +1108,17 @@ inductor's FX graph cache makes later configurations look far cheaper than they 
 - New training behavior (e.g. different scheduler, mixed precision): changes belong in `train.py`; keep the loop
   step-based and keep config-driven values in `TrainConfig` rather than hardcoding. A new *optimizer* belongs in
   `optim.py` — add it to `build_optimizer` and give it a `build_*_param_groups`; `MuonWithAuxAdam` is the
-  reference for one that needs different treatment per parameter class.
+  reference for one that needs different treatment per parameter class. If a new parameter class needs
+  different treatment, classify it by **what owns it**, not by its rank — see `norm_gain_param_ids` for the bug
+  the `param.dim() < 2` shortcut caused once a gain grew a variant dimension.
+- New parameter *bank* (one slice per loop iteration, per expert, per stream): check `build_param_groups` and
+  `build_muon_param_groups` before assuming it lands in the right group. Adding a leading dimension to something
+  that was 1-D moves it across the `dim() < 2` boundary, which silently changes both its optimizer and whether
+  it is weight-decayed. `RMSNorm`'s per-iteration gains and `HyperConnection`'s coefficients have both hit this.
+- Anything touching the loss or the logits: the `(batch, seq, vocab_size)` tensor is the largest activation in
+  the model at small `d_model`, so an extra pass over it is not a rounding error — reductions belong in
+  `_nll_and_logz` where they can share the one `logsumexp`, and `model.activation_bytes_per_token` has to be
+  updated in step or `auto_batch_size` will size batches against a loss that no longer exists.
 - New per-iteration behavior for the loop body: put non-tensor state on `LoopContext` and read it in the block.
   `loop_iter_conditioning` is the reference example. Anything grad-carrying stays a positional argument (see
   `LoopContext`'s docstring), and remember to check `tests/test_loop_identity.py::test_no_dead_parameters` — a

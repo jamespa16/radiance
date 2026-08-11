@@ -7,7 +7,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import wandb
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -60,6 +59,68 @@ def build_lr_scheduler(optimizer: torch.optim.Optimizer, cfg: Config) -> LambdaL
         return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
     return LambdaLR(optimizer, lr_lambda)
+
+
+def resolve_compile_mode(raw_model: DenseTransformer, cfg: Config, device_type: str) -> str | None:
+    """Which torch.compile mode this run gets: "reduce-overhead" (CUDA graphs) or None.
+
+    mode="reduce-overhead" captures each graph as a CUDA graph sharing one memory pool, which
+    assumes a *static* execution graph. Three independent things give that up:
+
+    1. Stochastic loop depth (cfg.model.loop_count_min): replaying a different loop count
+       overwrites the previous graph's gradient tensors ("accessing gradient tensor output of
+       CUDAGraphs that has been overwritten by a subsequent run").
+    2. grad_checkpoint: torch.utils.checkpoint recomputes each block during backward, AOTAutograd
+       partitions that recompute into its own graph segment, and under reduce-overhead each
+       segment is captured against the same static pool — so the recompute's outputs overwrite a
+       tensor the original forward's backward still needs. Same failure mode as (1), different
+       trigger.
+    3. doc_attention_mask: the flex_attention BlockMask is rebuilt every step out of that batch's
+       document boundaries (see DenseTransformer._doc_masks), so its tensors land at new addresses
+       every step. CUDA graph trees treats them as *static* inputs — they reach the graph as
+       lifted constants across the eager _doc_masks graph break — so a changed data pointer forces
+       a re-record, and every re-record instantiates another cudaGraphExec whose memory the
+       caching allocator never sees.
+
+    (3) is the one that cost a run, and it is the one to be careful about, because unlike (1) and
+    (2) it never raises: it just leaks and crawls. Measured on a 21-executed-block config
+    (d_model 256, n_layers 6, loop_count 4) at batch 16 x grad_accum 2: **282 ms/step and +8 MB of
+    process VRAM per step** against **87 ms/step and dead flat** at mode=None. torch's own
+    torch.cuda.memory_reserved() stays flat through all of it — the growth is outside the caching
+    allocator, which is why an earlier investigation that watched reserved memory concluded the
+    model was clean and went looking in the DataLoader. Left on, it exhausts a 32 GB card in ~1600
+    steps and quietly triples step time before it gets there.
+
+    Dropping to plain inductor is nearly free: measured where CUDA graphs actually work (same
+    config, doc masking off) it is 84.2 ms/step captured vs 82.7 ms/step not.
+    """
+    if not cfg.train.compile:
+        return None
+
+    stochastic_depth = cfg.model.loop_count_min is not None
+    if stochastic_depth:
+        # Stochastic loop depth means the Python `for` over the loop body runs a different number
+        # of times per step, so dynamo traces one graph per distinct count. The default cache limit
+        # (8) would be exceeded by a wide range and silently fall back to eager for the rest of the
+        # run. Raise it to cover the range with headroom for the separate eval/generate traces.
+        span = (cfg.model.loop_count_max or cfg.model.loop_count) - cfg.model.loop_count_min + 1
+        torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 4 * span + 8)
+
+    reasons = []
+    if stochastic_depth:
+        reasons.append("stochastic loop depth")
+    if cfg.model.grad_checkpoint:
+        reasons.append("grad_checkpoint")
+    if raw_model.builds_doc_block_masks(device_type):
+        reasons.append("doc_attention_mask")
+    if not reasons:
+        return "reduce-overhead"
+
+    print(
+        f"[radiance] {' and '.join(reasons)} on, so compiling without CUDA graphs "
+        "(mode=None instead of 'reduce-overhead')."
+    )
+    return None
 
 
 def estimate_batch_size(raw_model: DenseTransformer, cfg: Config, device: str, device_type: str) -> tuple[int, int]:
@@ -183,11 +244,37 @@ def compute_mtp_loss(
             [input_ids[:, shift:], input_ids.new_full((input_ids.size(0), shift), -100)], dim=1
         )
         logits = model._project_logits(hidden)
-        head_loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100
-        )
+        # Same single-pass formulation as compute_loss, for the same reason: F.cross_entropy is on
+        # autocast's fp32 list, so it upcast this head's whole (batch, seq, vocab_size) tensor
+        # before reducing it. Each head materialises one of those, so the saving is per head.
+        head_loss, _ = _nll_and_logz(logits.view(-1, logits.size(-1)), labels.view(-1))
         total = head_loss if total is None else total + head_loss
     return total / len(mtp_hidden)
+
+
+def _nll_and_logz(flat_logits: torch.Tensor, flat_labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mean NLL over non-ignored positions, and the mean of logsumexp(logits)^2, from ONE pass.
+
+    cross_entropy is exactly `logsumexp(x) - x[label]`, and the z-loss regulariser squares that
+    same `logsumexp(x)`. Computing them separately — F.cross_entropy plus a torch.logsumexp — walks
+    the largest tensor in the model twice in the forward and twice again in the backward. Deriving
+    both from a single `z` halves that, and lets the whole thing stay in the compute dtype instead
+    of tripping autocast's fp32 policy on log_softmax.
+    """
+    keep = flat_labels != -100
+    # gather can't take -100, and those rows are masked out of both means below anyway.
+    safe_labels = flat_labels.masked_fill(~keep, 0)
+    z = torch.logsumexp(flat_logits, dim=-1).float()
+    target_logit = flat_logits.gather(1, safe_labels.unsqueeze(1)).squeeze(1).float()
+
+    keep_f = keep.to(torch.float32)
+    # clamp: an all-ignored batch is degenerate (it needs seq_len < 2), and 0 beats the nan
+    # F.cross_entropy returns there, which would poison the accumulated gradient.
+    n_kept = keep_f.sum().clamp(min=1)
+    # Identical to F.cross_entropy(ignore_index=-100) with the default 'mean' reduction, which also
+    # divides by the kept count rather than the total.
+    nll = ((z - target_logit) * keep_f).sum() / n_kept
+    return nll, (z.square() * keep_f).sum() / n_kept
 
 
 def compute_loss(logits: torch.Tensor, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -205,20 +292,37 @@ def compute_loss(logits: torch.Tensor, input_ids: torch.Tensor) -> tuple[torch.T
     to the training objective, while evaluate() discards it so val/loss stays a pure LM number and
     remains comparable across configurations — exactly how ponder_cost and moe_aux_loss are already
     handled.
+
+    **Both losses are derived from one logsumexp rather than two passes over the logits**, which is
+    what makes this the cheap version. cross_entropy is exactly `logsumexp(x) - x[label]`, and
+    z_loss squares that same `logsumexp(x)` — so calling F.cross_entropy *and* torch.logsumexp
+    reduced the largest tensor in the model twice over, once inside cross_entropy's fused
+    log_softmax and once again for z. Computing `z` once and gathering the target logit off it
+    collapses that to a single reduction, forward and backward.
+
+    Wrap this in torch.compile (see `build_loss_fn`) before judging it: inductor fuses the whole
+    thing into one pass and keeps the reduction in fp32 without ever materialising an fp32 copy of
+    the (batch, seq, vocab_size) logits. Measured at batch 32 x seq 512 x vocab 50304, fwd+bwd:
+    22.7 ms and +8.2 GB peak for the two-pass version, 17.0 ms eager here, **5.5 ms and +5.0 GB
+    compiled** — and the compiled result is *closer* to an fp32 reference than the original
+    (|dlm| 2.5e-5 vs 3.4e-3), because F.cross_entropy under autocast returned a bf16-rounded loss.
     """
     labels = torch.cat([input_ids[:, 1:], input_ids.new_full((input_ids.size(0), 1), -100)], dim=1)
-    flat_logits = logits.view(-1, logits.size(-1))
-    flat_labels = labels.view(-1)
-    lm_loss = F.cross_entropy(flat_logits, flat_labels, ignore_index=-100)
-
     # Reduced over the vocab first, then masked — rather than flat_logits[mask], which would
     # materialise a near-full copy of the largest activation in the model just to drop one row per
-    # sequence. logsumexp is internally max-subtracted so it's stable in the autocast dtype; only
-    # the (n_tokens,) result is upcast for the square/mean.
-    keep = (flat_labels != -100).to(flat_logits.dtype)
-    z = torch.logsumexp(flat_logits, dim=-1).float()
-    z_loss = (z.square() * keep).sum() / keep.sum().clamp(min=1)
-    return lm_loss, z_loss
+    # sequence. logsumexp is internally max-subtracted so it's stable in the autocast dtype.
+    return _nll_and_logz(logits.view(-1, logits.size(-1)), labels.view(-1))
+
+
+def build_loss_fn(cfg: Config):
+    """compute_loss, compiled when the run is compiled.
+
+    Separate from the model's own torch.compile because the loss lives outside DenseTransformer:
+    it consumes the (batch, seq, vocab_size) logits the model returns, and that tensor is large
+    enough that whether its reductions get fused is worth ~20% of step time on a small-d_model,
+    large-vocab config. Tied to cfg.train.compile so the CPU sanity-check path stays eager.
+    """
+    return torch.compile(compute_loss) if cfg.train.compile else compute_loss
 
 
 @torch.no_grad()
@@ -229,6 +333,7 @@ def evaluate(
     device_type: str,
     dtype: torch.dtype,
     max_batches: int | None = None,
+    loss_fn=compute_loss,
 ) -> float:
     """Mean LM loss over the validation loader, capped at max_batches batches.
 
@@ -245,7 +350,7 @@ def evaluate(
         input_ids = batch["input_ids"].to(device)
         with torch.autocast(device_type=device_type, dtype=dtype, enabled=dtype != torch.float32):
             out = model(input_ids)
-            loss, _ = compute_loss(out.logits, input_ids)  # z_loss discarded: val/loss stays pure LM
+            loss, _ = loss_fn(out.logits, input_ids)  # z_loss discarded: val/loss stays pure LM
         total += loss.item()
         count += 1
     model.train()
@@ -289,44 +394,9 @@ def train(cfg: Config) -> None:
                 "using configured batch_size/grad_accum_steps."
             )
 
-    stochastic_depth = cfg.model.loop_count_min is not None
-    compile_mode = "reduce-overhead"
-    if cfg.train.compile and stochastic_depth:
-        # Stochastic loop depth means the Python `for` over the loop body runs a different number
-        # of times per step, so dynamo traces one graph per distinct count. The default cache limit
-        # (8) would be exceeded by a wide range and silently fall back to eager for the rest of the
-        # run. Raise it to cover the range with headroom for the separate eval/generate traces.
-        span = (cfg.model.loop_count_max or cfg.model.loop_count) - cfg.model.loop_count_min + 1
-        torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 4 * span + 8)
-
-    if cfg.train.compile and (stochastic_depth or cfg.model.grad_checkpoint):
-        # mode="reduce-overhead" captures each graph as a CUDA graph sharing one memory pool, which
-        # assumes a *static* execution graph. Two independent things give that up:
-        #
-        # 1. Stochastic loop depth: replaying a different loop count overwrites the previous
-        #    graph's gradient tensors ("accessing gradient tensor output of CUDAGraphs that has
-        #    been overwritten by a subsequent run").
-        # 2. grad_checkpoint: torch.utils.checkpoint recomputes each block during backward:
-        #    AOTAutograd partitions that recompute into its own graph segment, and under
-        #    reduce-overhead each segment gets captured as its own CUDA graph against the same
-        #    static pool — so the recompute's outputs overwrite a tensor the original forward's
-        #    backward still needs ("accessing tensor output of CUDAGraphs that has been overwritten
-        #    by a subsequent run"). Same failure mode as (1), different trigger.
-        #
-        # Drop to plain inductor in either case: still compiled, just without the CUDA-graph
-        # capture that a varying shape or a recompute makes unsound.
-        compile_mode = None
-        reasons = []
-        if stochastic_depth:
-            reasons.append("stochastic loop depth")
-        if cfg.model.grad_checkpoint:
-            reasons.append("grad_checkpoint")
-        print(
-            f"[radiance] {' and '.join(reasons)} on, so compiling without CUDA graphs "
-            "(mode=None instead of 'reduce-overhead')."
-        )
-
+    compile_mode = resolve_compile_mode(raw_model, cfg, device_type)
     model = torch.compile(raw_model, mode=compile_mode) if cfg.train.compile else raw_model
+    loss_fn = build_loss_fn(cfg)
 
     # batch_size must be finalized (auto_batch_size, if any, already ran) before the DataLoader is built.
     train_loader, val_loader = build_dataloaders(cfg, tokenizer)
@@ -495,7 +565,7 @@ def train(cfg: Config) -> None:
                             out = model(chunk)
                             ponder_cost, mean_loop_depth = out.ponder_cost, out.mean_loop_depth
                             moe_aux_loss = out.moe_aux_loss
-                            lm_loss, z_loss = compute_loss(out.logits, chunk)
+                            lm_loss, z_loss = loss_fn(out.logits, chunk)
                             mtp_loss = compute_mtp_loss(raw_model, out.mtp_hidden, chunk)
                             chunk_loss = (
                                 lm_loss
@@ -533,10 +603,18 @@ def train(cfg: Config) -> None:
                     # Also to stdout: W&B was previously the only place a loss ever appeared, so a
                     # run with wandb.mode=disabled (sweeps, CI, quick A/Bs) produced no visible
                     # signal at all. Cheap — accum_* are already being .item()'d for the log below.
+                    # reserved VRAM on the line too: a run whose memory climbs step over step is
+                    # the signature of a torch.compile re-record (see compile_mode below), and it
+                    # is otherwise invisible until the run dies of an OOM hundreds of steps later.
+                    mem = (
+                        f" mem {torch.cuda.memory_reserved(device) / 1e9:.2f}GB"
+                        if device_type == "cuda"
+                        else ""
+                    )
                     print(
                         f"[radiance] step {step:>6}/{cfg.train.max_steps} "
                         f"loss {accum_loss.item():.4f} lm {accum_lm_loss.item():.4f} "
-                        f"lr {scheduler.get_last_lr()[0]:.3e}",
+                        f"lr {scheduler.get_last_lr()[0]:.3e}{mem}",
                         flush=True,
                     )
                     wandb.log(
@@ -557,7 +635,7 @@ def train(cfg: Config) -> None:
 
                 if val_loader is not None and step % cfg.train.eval_every == 0:
                     val_loss = evaluate(
-                        model, val_loader, device, device_type, dtype, cfg.train.eval_max_batches
+                        model, val_loader, device, device_type, dtype, cfg.train.eval_max_batches, loss_fn
                     )
                     print(f"[radiance] step {step:>6} val/loss {val_loss:.4f}", flush=True)
                     wandb.log({"val/loss": val_loss}, step=step)

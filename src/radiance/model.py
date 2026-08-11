@@ -1537,25 +1537,20 @@ class DenseTransformer(nn.Module):
     # an unresolved layout and inductor fails to lower them ("convert FlexibleLayout to FixedLayout
     # first"). Disabling dynamo here graph-breaks once at the top of forward — before any block runs
     # — and hands the compiled region a concrete BlockMask, which is what flex_attention wants.
-    @torch._dynamo.disable
-    def _doc_masks(self, input_ids: torch.Tensor, offset: int, kv_cache) -> dict[int, Any] | None:
-        """One BlockMask per distinct attention window, keyed by window size, or None when document
-        masking doesn't apply to this forward pass.
+    def builds_doc_block_masks(self, device_type: str) -> bool:
+        """Whether a full (non-cached) forward on `device_type` builds flex_attention BlockMasks.
 
-        Returns a dict rather than a single mask because cfg.loop_attn_windows can give each loop
-        iteration a different receptive field; forward() picks per iteration. With no windows
-        configured there is exactly one entry.
+        Split out of _doc_masks so train.py can answer the question *before* the first forward:
+        a BlockMask rebuilt from each batch's document boundaries is incompatible with
+        torch.compile's CUDA-graph mode, and that decision has to be made at compile time. Not a
+        cheap property — it emits the head_dim fallback note — so call it once, not per step.
         """
         if not self.cfg.doc_attention_mask or self.eos_id is None:
-            return None
-        # Generation is a single document, so the mask would be all-ones — and flex_attention
-        # against an incrementally growing cache needs different plumbing for no benefit.
-        if kv_cache is not None:
-            return None
+            return False
         # flex_attention is impractically slow outside CUDA; CLAUDE.md's CPU sanity-check workflow
         # has to keep working, so fall back to plain causal SDPA there.
-        if input_ids.device.type != "cuda":
-            return None
+        if device_type != "cuda":
+            return False
         # flex_attention's compiled kernel requires head_dim >= 16. Real configs use 64, but the
         # tiny models used for sanity checks can go below it, and the failure mode is an
         # InductorError raised from deep inside the compiler rather than anything actionable.
@@ -1567,6 +1562,23 @@ class DenseTransformer(nn.Module):
                     f"model.head_dim={self.cfg.head_dim}. Falling back to plain causal attention."
                 )
                 self._warned_head_dim = True
+            return False
+        return True
+
+    @torch._dynamo.disable
+    def _doc_masks(self, input_ids: torch.Tensor, offset: int, kv_cache) -> dict[int, Any] | None:
+        """One BlockMask per distinct attention window, keyed by window size, or None when document
+        masking doesn't apply to this forward pass.
+
+        Returns a dict rather than a single mask because cfg.loop_attn_windows can give each loop
+        iteration a different receptive field; forward() picks per iteration. With no windows
+        configured there is exactly one entry.
+        """
+        # Generation is a single document, so the mask would be all-ones — and flex_attention
+        # against an incrementally growing cache needs different plumbing for no benefit.
+        if kv_cache is not None:
+            return None
+        if not self.builds_doc_block_masks(input_ids.device.type):
             return None
 
         if self.cfg.dropout > 0 and self.training and not self._warned_dropout_with_flex:
@@ -1968,11 +1980,10 @@ class DenseTransformer(nn.Module):
         — this ignores SDPA's memory-efficient backward (no O(seq_len^2) term) and doesn't itemize
         every temporary buffer (dropout masks, norm stats), so it already overestimates before the
         caller's own safety margin is applied. The lm_head logits (batch, seq, vocab_size) are
-        counted separately since they can dominate for a large vocab relative to a small d_model,
-        and always at fp32 width regardless of activation_dtype_bytes: PyTorch's autocast policy
-        upcasts log_softmax (used internally by compute_loss's F.cross_entropy) to fp32 even under
-        bf16/fp16 autocast, so this term doesn't shrink with a lower compute dtype the way the rest
-        of the activations do.
+        counted separately since they can dominate for a large vocab relative to a small d_model —
+        at this config's 50304-token vocab they are the single largest term by a wide margin. They
+        scale with activation_dtype_bytes like everything else, plus one fp32-width reduction
+        buffer; see the comment at the logits_bytes line for why that stopped being a flat fp32.
 
         When a block's FFN is MoE (see MoEFeedForward), the dense (depth + 1) * ffn_dim term above
         is replaced by (depth + 1) * ffn_dim * moe_capacity_factor * moe_top_k + n_experts: total
@@ -2039,8 +2050,16 @@ class DenseTransformer(nn.Module):
         # token embedding only (RoPE's cos/sin have no batch dim), widened to the stream count.
         embedding_units = streams * cfg.d_model
         block_bytes = activation_dtype_bytes * (total_block_units + embedding_units)
-        # fp32, x3: logits + their gradient buffer + log_softmax's internal fp32 upcast working
-        # buffer (empirically confirmed via a real OOM sized almost exactly to a 2x estimate during
-        # GPU verification — cross_entropy's fp32 upcast needs more headroom than just logits+grad).
-        logits_bytes = 4 * 3 * self.token_emb.num_embeddings
+        # Logits + their gradient buffer, both at compute width, plus one fp32-width working buffer
+        # for the loss's reduction. This used to be a flat `4 * 3` because F.cross_entropy sits on
+        # autocast's fp32 list and so upcast the whole (batch, seq, vocab_size) tensor before
+        # reducing it — the term didn't shrink with a lower compute dtype the way the rest of the
+        # activations do. train.compute_loss no longer goes through cross_entropy (it derives both
+        # the LM loss and z_loss from one logsumexp, and inductor keeps that reduction in fp32
+        # without materialising an fp32 copy), so under bf16 this is 8 bytes per vocab element
+        # rather than 12. Measured against the real peak on configs/tinystories.yaml: the whole
+        # estimate lands 1.12x above actual, still on the intended over-estimating side, where the
+        # fp32 assumption had it at 1.58x — headroom that auto_batch_size was spending on a
+        # smaller micro-batch than the model actually needs.
+        logits_bytes = (2 * activation_dtype_bytes + 4) * self.token_emb.num_embeddings
         return block_bytes + logits_bytes

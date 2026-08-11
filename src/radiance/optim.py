@@ -13,6 +13,7 @@ from __future__ import annotations
 import torch
 
 from radiance.config import Config
+from radiance.model import RMSNorm
 
 
 def build_param_groups(
@@ -67,6 +68,7 @@ def build_param_groups(
         embed_lr = lr
 
     decay, no_decay, embed, hyper_static, hyper_dyn = [], [], [], [], []
+    norm_gains = norm_gain_param_ids(model)
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
@@ -76,7 +78,9 @@ def build_param_groups(
             # `dim() < 2` rule would have left undecayed anyway.
             decayed = param.dim() >= 2 and not _is_hyper_static(name)
             (hyper_dyn if decayed else hyper_static).append(param)
-        elif param.dim() < 2 or _is_hyper_static(name):
+        elif param.dim() < 2 or _is_hyper_static(name) or id(param) in norm_gains:
+            # id(param) in norm_gains: a per-iteration gain bank is 2-D but must not be decayed
+            # toward zero any more than a 1-D gain is. See norm_gain_param_ids.
             no_decay.append(param)
         elif embed_lr is not None and _is_embedding(name):
             embed.append(param)
@@ -126,6 +130,33 @@ def _is_embedding(name: str) -> bool:
     return any(s in name for s in _EMBEDDING_SUBSTRINGS)
 
 
+def norm_gain_param_ids(model: torch.nn.Module) -> set[int]:
+    """ids of every gain/bias owned by a normalisation layer, **at any rank**.
+
+    Both param-group builders used to identify these by `param.dim() < 2`, which was correct only
+    while a norm gain was always `(d_model,)`. cfg.model.loop_iter_conditioning="norm_gains" — the
+    *default* — gives RMSNorm a `(n_variants, d_model)` gain bank instead, one row per loop
+    iteration. That is still a per-channel scale, but it is 2-D, so the rank rule silently
+    reclassified it the moment a config set loop_count > 1:
+
+      - on the Muon path it stopped being an AdamW no-decay tensor and became a **Muon** tensor,
+        where Newton-Schulz drives its singular values to 1. A norm gain *is* its scale, so that
+        does not refine the conditioning, it erases it;
+      - on the AdamW path it started being weight-decayed, pulling gains initialised to exactly
+        1.0 toward zero.
+
+    Neither raises, neither shows up as a dead parameter, and neither can happen at loop_count 1 —
+    which is why configs/tinystories.yaml never saw it and every looped config did. Keying on the
+    owning module instead of the tensor's rank makes the classification independent of how many
+    variants a gain bank happens to hold. `recurse=False` so only the norm's own parameters count.
+    """
+    ids: set[int] = set()
+    for module in model.modules():
+        if isinstance(module, (RMSNorm, torch.nn.LayerNorm, torch.nn.GroupNorm)):
+            ids.update(id(p) for p in module.parameters(recurse=False))
+    return ids
+
+
 def _is_hyper_static(name: str) -> bool:
     """A hyper-connection's *static* connection coefficients (beta / alpha_m / alpha_r).
 
@@ -161,6 +192,7 @@ def build_muon_param_groups(model: torch.nn.Module, cfg: Config) -> list[dict]:
     plain AdamW owns the hidden weights too.
     """
     muon, adam_embed, adam_decay, adam_no_decay = [], [], [], []
+    norm_gains = norm_gain_param_ids(model)
     # Hyper-connections get their own pair of groups, at cfg.train.hyper_conn_lr: these are
     # structural coefficients (a one-hot read, an identity depth mix), and AdamW's ~lr-per-step
     # update at `lr`'s post-Muon value erases that structure rather than refining it. See
@@ -175,7 +207,9 @@ def build_muon_param_groups(model: torch.nn.Module, cfg: Config) -> list[dict]:
             # `dim() < 2` rule would have left undecayed anyway.
             decayed = param.dim() >= 2 and not _is_hyper_static(name)
             (hyper_dyn if decayed else hyper_static).append(param)
-        elif param.dim() < 2:
+        elif param.dim() < 2 or id(param) in norm_gains:
+            # A per-iteration norm gain bank is 2-D but is still a gain: undecayed AdamW, never
+            # Muon. See norm_gain_param_ids.
             adam_no_decay.append(param)
         elif _is_embedding(name):
             adam_embed.append(param)
@@ -323,27 +357,60 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
         return loss
 
     def _step_muon(self, group: dict) -> None:
+        """Muon over one group, **batched by parameter shape**.
+
+        The arithmetic is per-parameter, but issuing it per-parameter is what dominates the step:
+        Newton-Schulz is `ns_steps` iterations of three matmuls, so a 42-tensor group costs 630
+        matmuls, none of them large enough to saturate the GPU. A transformer has very few distinct
+        weight shapes (one per projection role, repeated per layer), so stacking the same-shaped
+        updates into one leading batch dimension collapses that to 630 / (tensors per shape)
+        launches with no change to the result — `orthogonalize` is already shape-generic over
+        leading dims (`@`/`.mT` batch, and matrix_norm(keepdim=True) normalises each matrix
+        independently), which is what BatchedExperts' stacked (n_experts, in, out) weights already
+        rely on. Measured on configs/tinystories.yaml (42 tensors, 5 shapes): 6.71 -> 1.90 ms.
+
+        Momentum and weight decay move to torch._foreach_* for the same reason.
+        """
         lr, weight_decay = group["lr"], group["weight_decay"]
         momentum, nesterov = group["momentum"], group["nesterov"]
-        for p in group["params"]:
-            if p.grad is None:
-                continue
+
+        params = [p for p in group["params"] if p.grad is not None]
+        if not params:
+            return
+        grads = [p.grad for p in params]
+        bufs = []
+        for p in params:
             state = self.state[p]
             if "momentum_buffer" not in state:
                 state["momentum_buffer"] = torch.zeros_like(p)
-            buf = state["momentum_buffer"]
-            buf.lerp_(p.grad, 1.0 - momentum)
-            # Nesterov: step from where the momentum is about to be, not where it is.
-            update = p.grad.lerp(buf, momentum) if nesterov else buf
-            update = orthogonalize(update, steps=group["ns_steps"])
+            bufs.append(state["momentum_buffer"])
+
+        torch._foreach_lerp_(bufs, grads, 1.0 - momentum)
+        # Nesterov: step from where the momentum is about to be, not where it is.
+        updates = torch._foreach_lerp(grads, bufs, momentum) if nesterov else bufs
+
+        if weight_decay != 0:
+            torch._foreach_mul_(params, 1 - lr * weight_decay)
+
+        by_shape: dict[tuple[int, ...], list[int]] = {}
+        for i, p in enumerate(params):
+            by_shape.setdefault(tuple(p.shape), []).append(i)
+
+        for shape, idxs in by_shape.items():
             # Newton-Schulz normalises the update's singular values to ~1, so its Frobenius norm is
             # ~sqrt(min(rows, cols)) regardless of the parameter's shape. This factor restores the
             # standard sqrt(fan-out / fan-in) scaling, which is also what makes Muon approximately
-            # muP-correct without a separate width correction (see build_muon_param_groups).
-            scale = max(1.0, p.size(-2) / p.size(-1)) ** 0.5
-            if weight_decay != 0:
-                p.mul_(1 - lr * weight_decay)
-            p.add_(update, alpha=-lr * scale)
+            # muP-correct without a separate width correction (see build_muon_param_groups). It
+            # depends only on the shape, so it is constant across a batch.
+            scale = max(1.0, shape[-2] / shape[-1]) ** 0.5
+            if len(idxs) == 1:
+                i = idxs[0]
+                params[i].add_(orthogonalize(updates[i], steps=group["ns_steps"]), alpha=-lr * scale)
+                continue
+            stacked = orthogonalize(torch.stack([updates[i] for i in idxs]), steps=group["ns_steps"])
+            torch._foreach_add_(
+                [params[i] for i in idxs], list(stacked.unbind(0)), alpha=-lr * scale
+            )
 
     def _step_adamw(self, group: dict) -> None:
         lr, weight_decay = group["lr"], group["weight_decay"]
@@ -386,14 +453,32 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
         torch._foreach_mul_(exp_avg_sqs, beta2)
         torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1 - beta2)
 
-        for p, exp_avg, exp_avg_sq, step in zip(params, exp_avgs, exp_avg_sqs, steps):
-            bias_correction1 = 1 - beta1**step
-            bias_correction2 = 1 - beta2**step
-            denom = (exp_avg_sq / bias_correction2).sqrt_().add_(eps)
-            update = (exp_avg / bias_correction1) / denom
-            if weight_decay != 0:
-                p.mul_(1 - lr * weight_decay)
-            p.add_(update.to(p.device, non_blocking=True), alpha=-lr)
+        # Every param in a group shares a step count in practice (they enter the group together and
+        # step together), so the bias corrections are the same scalar for all of them and the whole
+        # update batches through torch._foreach_*. Falling back to the per-parameter path when they
+        # ever diverge — a param whose grad was None for some steps — keeps that assumption honest
+        # rather than silently applying one param's correction to another's moments.
+        if weight_decay != 0:
+            torch._foreach_mul_(params, 1 - lr * weight_decay)
+
+        if len(set(steps)) == 1:
+            bias_correction1 = 1 - beta1 ** steps[0]
+            bias_correction2 = 1 - beta2 ** steps[0]
+            denom = torch._foreach_div(exp_avg_sqs, bias_correction2)
+            torch._foreach_sqrt_(denom)
+            torch._foreach_add_(denom, eps)
+            updates = torch._foreach_div(exp_avgs, denom)
+            if offload:
+                # CPU-resident moments: one copy up per param, then a device-side foreach add.
+                updates = [u.to(p.device, non_blocking=True) for u, p in zip(updates, params)]
+            torch._foreach_add_(params, updates, alpha=-lr / bias_correction1)
+        else:
+            for p, exp_avg, exp_avg_sq, step in zip(params, exp_avgs, exp_avg_sqs, steps):
+                bias_correction1 = 1 - beta1**step
+                bias_correction2 = 1 - beta2**step
+                denom = (exp_avg_sq / bias_correction2).sqrt_().add_(eps)
+                update = (exp_avg / bias_correction1) / denom
+                p.add_(update.to(p.device, non_blocking=True), alpha=-lr)
 
         if offload and self._is_cuda:
             torch.cuda.synchronize(self._device)

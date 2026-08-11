@@ -374,3 +374,82 @@ def test_mup_keeps_adamw_activations_flat(optimizer):
 
     assert mup_ratio < 1.5, f"muP activation scale grew {mup_ratio:.2f}x over 16x width"
     assert sp_ratio > 3.0, f"control did not drift ({sp_ratio:.2f}x) — test may be vacuous"
+
+
+def test_orthogonalize_batches_over_leading_dims():
+    """Stacking same-shaped updates into a leading batch dim must not change the result.
+
+    This is what _step_muon's shape-grouping relies on: Newton-Schulz is `ns_steps` iterations of
+    three matmuls per tensor, so a group of 42 weights costs 630 individually-launched matmuls,
+    none big enough to saturate the GPU. `@`/`.mT` batch over leading dims and matrix_norm is taken
+    with keepdim, so each matrix is still normalised and iterated independently.
+
+    The tolerance is loose on purpose: the iteration runs in bf16 by design (it is self-correcting
+    and does not converge to machine-precision orthogonality), so batched and per-tensor matmuls
+    pick different reduction orders. Measured against an fp64 reference the two are *equally* far
+    from exact — ~2.7e-2 either way — so this asserts they agree far better than the method's own
+    error, not that they are bit-identical.
+    """
+    torch.manual_seed(0)
+    mats = [torch.randn(24, 16) for _ in range(5)]
+
+    separate = torch.stack([orthogonalize(m) for m in mats])
+    batched = orthogonalize(torch.stack(mats))
+
+    torch.testing.assert_close(batched, separate, rtol=2e-2, atol=2e-2)
+
+
+def test_muon_batched_step_matches_per_parameter_step():
+    """A Muon step over N same-shaped tensors must match N one-tensor Muon steps.
+
+    _step_muon groups a param group by shape and orthogonalises each shape as one batched tensor.
+    Grouping changes which tensors share a kernel launch, and must change nothing else — not the
+    momentum buffers, not the sqrt(fan-out/fan-in) scale (which depends only on shape), and not the
+    weight decay.
+    """
+    torch.manual_seed(0)
+    shared = [torch.randn(12, 8) for _ in range(4)]
+    grads = [torch.randn(12, 8) * 0.1 for _ in range(4)]
+
+    grouped = [p.detach().clone().requires_grad_(True) for p in shared]
+    per_param = [p.detach().clone().requires_grad_(True) for p in shared]
+    for p, q, g in zip(grouped, per_param, grads):
+        p.grad, q.grad = g.clone(), g.clone()
+
+    kwargs = dict(algorithm="muon", lr=0.02, weight_decay=0.01)
+    batched_opt = MuonWithAuxAdam([{"params": grouped, **kwargs}])
+    # One group per parameter: each has a single shape, so the batching path is never taken.
+    single_opts = [MuonWithAuxAdam([{"params": [q], **kwargs}]) for q in per_param]
+
+    for _ in range(3):
+        batched_opt.step()
+        for o in single_opts:
+            o.step()
+
+    for i, (p, q) in enumerate(zip(grouped, per_param)):
+        torch.testing.assert_close(p, q, rtol=2e-2, atol=1e-3, msg=f"param {i} diverged")
+
+
+def test_muon_mixed_shapes_in_one_group():
+    """Shape-grouping must handle a group holding several distinct shapes, including 3-D.
+
+    BatchedExperts' stacked (n_experts, in, out) weights are 3-D, so a group can mix ranks; each
+    shape becomes its own batch and a shape with only one tensor must skip stacking entirely.
+    """
+    torch.manual_seed(1)
+    params = [
+        torch.randn(10, 6, requires_grad=True),
+        torch.randn(10, 6, requires_grad=True),
+        torch.randn(6, 10, requires_grad=True),  # only one of this shape
+        torch.randn(3, 8, 4, requires_grad=True),  # 3-D, stacked-experts layout
+        torch.randn(3, 8, 4, requires_grad=True),
+    ]
+    for p in params:
+        p.grad = torch.randn_like(p) * 0.1
+    before = [p.detach().clone() for p in params]
+
+    MuonWithAuxAdam([{"params": params, "algorithm": "muon", "lr": 0.02, "weight_decay": 0.0}]).step()
+
+    for i, (p, b) in enumerate(zip(params, before)):
+        assert torch.isfinite(p).all(), f"param {i} went non-finite"
+        assert not torch.equal(p, b), f"param {i} was not updated"

@@ -124,3 +124,57 @@ def test_grad_checkpoint_compiles_under_grad_accum():
                 loss = out.logits.float().square().mean() + out.moe_aux_loss + out.ponder_cost
             loss.backward()
         assert torch.isfinite(model.token_emb.weight.grad).all()
+
+
+# The remaining tests need no GPU and no compile: they pin the *decision* about which compile mode
+# a run gets. That decision is what the three cases above turn on, and getting the third one wrong
+# was silent — nothing raised, the run just leaked ~8 MB/step of process VRAM (outside torch's
+# caching allocator, so invisible to torch.cuda.memory_reserved) and ran 3x slower until the card
+# filled up. Asserting the mode directly is the only cheap way to catch a regression.
+
+
+def _mode(tiny_cfg, device_type="cuda", **overrides) -> str | None:
+    """resolve_compile_mode for a tiny config with `overrides` applied to cfg.model.
+
+    Fields are set after construction rather than passed through the fixture because the fixture
+    pins head_dim (and train.compile) itself, and these cases need to vary exactly those.
+    """
+    from radiance.train import resolve_compile_mode
+
+    cfg = tiny_cfg()
+    cfg.train.compile = True  # every case here is a compiled run
+    for field, value in overrides.items():
+        setattr(cfg.model, field, value)
+    model = DenseTransformer(cfg.model, vocab_size=TINY_VOCAB, eos_id=5)
+    return resolve_compile_mode(model, cfg, device_type)
+
+
+def test_cuda_graphs_off_when_doc_masking_builds_a_mask_per_step(tiny_cfg):
+    """The leak. doc_attention_mask rebuilds a flex BlockMask from each batch's document
+    boundaries, so its tensors change address every step; CUDA graph trees re-records on that and
+    never frees the previous cudaGraphExec. head_dim >= 16 because below it doc masking falls back
+    to plain SDPA and builds no mask at all."""
+    assert _mode(tiny_cfg, d_model=64, head_dim=16, doc_attention_mask=True) is None
+
+
+def test_cuda_graphs_off_for_stochastic_depth_and_grad_checkpoint(tiny_cfg):
+    assert _mode(tiny_cfg, doc_attention_mask=False, loop_count=4, loop_count_min=2, loop_count_max=4) is None
+    assert _mode(tiny_cfg, doc_attention_mask=False, grad_checkpoint=True) is None
+
+
+def test_cuda_graphs_kept_when_nothing_rules_them_out(tiny_cfg):
+    """The control the other three need: without it they could all pass on a function that
+    returned None unconditionally, and the fix would be "never use CUDA graphs" by accident."""
+    assert _mode(tiny_cfg, doc_attention_mask=False) == "reduce-overhead"
+    # head_dim < 16 and non-CUDA both fall back to plain SDPA, so no per-step mask is built and
+    # there is nothing for CUDA graphs to trip over.
+    assert _mode(tiny_cfg, head_dim=8, doc_attention_mask=True) == "reduce-overhead"
+    assert _mode(tiny_cfg, d_model=64, head_dim=16, doc_attention_mask=True, device_type="cpu") == "reduce-overhead"
+
+
+def test_compile_disabled_means_no_mode(tiny_cfg):
+    from radiance.train import resolve_compile_mode
+
+    cfg = tiny_cfg()  # the fixture's compile=False
+    model = DenseTransformer(cfg.model, vocab_size=TINY_VOCAB, eos_id=5)
+    assert resolve_compile_mode(model, cfg, "cuda") is None
