@@ -645,6 +645,41 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   are bit-identical for most shapes. `tests/test_optim.py::test_orthogonalize_batches_over_leading_dims` and
   `test_muon_batched_step_matches_per_parameter_step` pin that.
 
+  **That batching is capped, at `_MUON_MAX_STACK = 32` — and the unit of the cap is *matrices*, not tensors,
+  which is the whole subtlety.** Newton-Schulz's transient buffers (`A = X @ X.mT`, `B = b*A + c*(A@A)`,
+  `B @ X`) scale with the *stacked batch size*, not with the parameter count being orthogonalised, so an
+  unbounded stack turns a throughput win into an OOM on a model with many same-shaped matrices. That is
+  exactly MoE: shape is keyed on `(in, out)`, so every expert's projection in every MoE layer shares one
+  shape. `auto_batch_size` has no model of this cost whatsoever — it sizes params/grads/optimizer state and
+  activations, and this is none of those — so it picks a batch that looks safe and the run dies on the first
+  optimizer step. Neither OOM tier saves it: tier one shrinks the micro-batch, which this cost is independent
+  of, and tier two offloads only AdamW-owned tensors (the embedding, norms, routers), while the pressure is
+  entirely Muon-side.
+
+  **The first version of this cap counted tensors, and it silently never fired.** `BatchedExperts` already
+  stores each projection role as *one* tensor shaped `(n_experts, in, out)`, so a 4-MoE-layer model has ~16
+  tensors of a given shape no matter how many experts it has — `len(idxs) <= 32` is always true, nothing ever
+  chunks, and stacking those 16 hands `orthogonalize` an effective batch of `16 * 48 = 768` matrices. A
+  48-expert model OOM'd on the first optimizer step exactly as it had before the "fix". The correction operates
+  one level down: unbind every Muon-owned tensor into its individual `(in, out)` matrices first (a 2-D weight
+  unbinds to itself; an `(n_experts, in, out)` tensor unbinds to `n_experts` of them), group and chunk over
+  *that* flat list, and scatter the updates back through `(param index, expert index)`. Dense models are
+  untouched — every tensor is already a single matrix, and the deepest shipped config
+  (`configs/fineweb_500m.yaml`, 22 layers) is under the cap — so they keep the full batching win above.
+  `test_muon_step_chunks_within_batched_expert_tensors` pins the distinction with a single `(12, 10, 6)`
+  tensor against a patched cap of 4: one tensor, twelve matrices, so a tensor-count cap cannot see it.
+
+  **What it buys, and what it doesn't.** For a MoE-*dominant* model the fix is large: no router, no
+  hyper-connections, `d_model: 1024`, 4 MoE layers at `moe_expert_ffn_mult: 0.25` on a 32 GB card,
+  `n_experts: 64` (1329M total, 322M active) now fits at 27.1 GB where 32 experts had been the practical
+  ceiling. For the three-feature config it did essentially nothing, and the reason is worth keeping: chunking
+  bounds the *transient* buffer only, while the persistent params + grads + momentum still scale linearly with
+  `n_experts`, and in that config activation memory from `max_loops` and `hyper_conn_streams` was the binding
+  constraint anyway. `configs/fineweb_moe_hyper_router.yaml` therefore still ships `n_experts: 16`; its header
+  carries the full per-feature measurement table. **A fix aimed at one architecture's bottleneck can be a
+  no-op for another architecture whose bottleneck is elsewhere — re-measure the config you actually intend to
+  run.**
+
   **Newton-Schulz cost is per optimizer step and independent of batch size, which makes the effective batch a
   throughput knob and not only a quality one.** For an `(m, n)` weight it is ~`30 * min(m,n) * numel` FLOPs, so
   per parameter it costs ~`30 * d_model` against fwd+bwd's ~`6 * tokens_per_step` — Muon dominates whenever
