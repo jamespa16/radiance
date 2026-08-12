@@ -13,6 +13,14 @@ architectures/training ideas, not a production framework — prefer explicit, re
 
 No manual setup step — `uv run` creates/syncs `.venv` from `pyproject.toml`/`uv.lock` automatically on first use.
 
+## Git
+
+**Commit straight to `main`. Do not create a branch, and do not open a pull request.** This overrides the usual
+"branch before committing on the default branch" default, which is wrong here: this is a single-maintainer
+experimental repo whose entire history is linear on `main`, so a branch adds a merge step and a stale remote ref
+for no review benefit. Commit and push only when asked, as usual — the instruction here is about *where*, not
+*when*.
+
 ## Running training
 
 ```bash
