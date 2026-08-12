@@ -119,12 +119,15 @@ def build_param_groups(
 #     they would fall straight through to Muon.
 _MUON_EXCLUDED_SUBSTRINGS = ("token_emb", "lm_head", "router", "out_gate", "hyper")
 
-# Cap on how many same-shaped tensors _step_muon stacks into a single orthogonalize() call. Chosen
-# to comfortably exceed any dense model's per-shape tensor count in this repo's shipped configs (one
-# tensor per shape per layer, and the deepest is fineweb_500m.yaml's 22 layers) so ordinary dense
-# runs keep the full batching win, while bounding the transient Newton-Schulz buffer size for a
-# fine-grained MoE model where many experts across many MoE layers can share one shape. See
-# _step_muon's docstring for the OOM this fixes and why CPU-offload can't stand in for it.
+# Cap on how many individual (in, out) matrices _step_muon stacks into a single orthogonalize()
+# call — counted after unbinding any BatchedExperts-style (n_experts, in, out) tensor into its
+# n_experts separate matrices, not per *tensor*. Chosen to comfortably exceed any dense model's
+# per-shape matrix count in this repo's shipped configs (one tensor per shape per layer, and the
+# deepest is fineweb_500m.yaml's 22 layers) so ordinary dense runs keep the full batching win, while
+# bounding the transient Newton-Schulz buffer size for a fine-grained MoE model where many experts
+# across many MoE layers can share one (in, out) shape. See _step_muon's docstring for the OOM this
+# fixes, why counting whole tensors rather than matrices doesn't fix it, and why CPU-offload can't
+# stand in for it.
 _MUON_MAX_STACK = 32
 
 # The tied embedding matrix, split out of the AdamW-decayed group so it can carry its own LR
@@ -379,22 +382,35 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
 
         Momentum and weight decay move to torch._foreach_* for the same reason.
 
-        Stacking is capped at `_MUON_MAX_STACK` tensors per orthogonalize() call, **not** one stack
-        per shape. A dense model has at most `n_layers`-ish tensors of any given shape, well under
-        the cap, so it gets the full win described above. A fine-grained MoE model does not: shape
-        is keyed only on (in, out), so every expert's projection across every MoE layer shares one
-        shape — n_experts x n_moe_layers same-shaped tensors, e.g. 24 experts x 4 layers = 96. The
-        transient Newton-Schulz buffers (A = X @ X.mT, B = b*A + c*(A@A), B @ X) scale with the
-        stack size, not just the parameter count being orthogonalized, so stacking all 96 (or more)
-        into one call OOMs a step that would otherwise fit comfortably — measured on an RTX 5090 at
-        d_model=1024, moe_expert_ffn_mult=0.25, 4 MoE layers: n_experts=48 (1060M total, ~321M
-        active) OOMs on the very first optimizer step and survives neither the tier-1 micro-batch
-        backoff nor the tier-2 CPU-offload escalation, since the pressure is entirely Muon-side and
-        CPU-offload only migrates AdamW-owned tensors (the tied embedding, norms, routers — a small
-        fraction of a MoE model's parameters). Chunking bounds the transient buffer size independent
-        of how many same-shaped experts/layers a model has, trading back some of the launch-overhead
-        win once a shape's count exceeds the cap — still `ceil(count / _MUON_MAX_STACK)` launches
-        rather than `count` of them.
+        Stacking is capped at `_MUON_MAX_STACK` *matrices* per orthogonalize() call, not tensors —
+        this distinction is load-bearing and was the bug in this function's first chunking attempt.
+        `BatchedExperts` already stores each MoE projection role as one tensor shaped
+        `(n_experts, in, out)` (see model.py), so grouping-and-counting by whole *tensor* (e.g. "16
+        tensors of shape (48, 1024, 1024), well under a cap of 32, so don't chunk") completely
+        misses that each of those 16 tensors already carries 48 experts stacked in its own leading
+        dim. `torch.stack`-ing those 16 tensors produces one `(16, 48, 1024, 1024)` tensor, and
+        orthogonalize's batched matmuls see an effective batch of 16*48=768 matrices, not 16 — a
+        tensor-count cap of 32 lets that straight through untouched. Confirmed empirically: with the
+        first attempt (capping tensor count), n_experts=48 (1060M total, ~321M active, 4 MoE layers,
+        d_model=1024, moe_expert_ffn_mult=0.25) still OOMs on the very first optimizer step on an
+        RTX 5090, identically to before that fix — because the shape group in question has only 16
+        distinct tensors, so `len(idxs) <= _MUON_MAX_STACK` and no chunking ever triggers.
+
+        The fix here operates one level down: every same-shaped Muon-owned tensor — 2-D or
+        BatchedExperts' 3-D — is first unbound along any leading batch dim into its individual
+        (in, out) matrices (a 2-D tensor unbinds to just itself), and the actual chunking/stacking
+        happens over that flat list of matrices, keyed by (in, out) alone. A dense model still gets
+        exactly the batching described above (every tensor is already a single matrix). A MoE model
+        now gets what the cap is supposed to guarantee: `_MUON_MAX_STACK` matrices per orthogonalize
+        call regardless of whether they came from many layers, many experts within one layer, or
+        both — e.g. 4 MoE layers x 48 experts = 192 matrices chunks into ceil(192/32)=6 calls of
+        <=32 each, the same transient buffer size a plain 32-tensor dense stack would need.
+
+        The transient Newton-Schulz buffers (A = X @ X.mT, B = b*A + c*(A@A), B @ X) scale with this
+        matrix-batch size, not with total parameter count, which is why the fix bounds it directly
+        rather than trying to predict a safe n_experts from parameter counts. CPU-offload can't
+        stand in for this: it only migrates AdamW-owned tensors (the tied embedding, norms, routers
+        — a small fraction of a MoE model's parameters), while this pressure is entirely Muon-side.
         """
         lr, weight_decay = group["lr"], group["weight_decay"]
         momentum, nesterov = group["momentum"], group["nesterov"]
@@ -417,31 +433,39 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
         if weight_decay != 0:
             torch._foreach_mul_(params, 1 - lr * weight_decay)
 
-        by_shape: dict[tuple[int, ...], list[int]] = {}
+        # Flatten every tensor into its individual (in, out) matrices: a plain 2-D weight unbinds to
+        # itself (one entry), a BatchedExperts-style (n_experts, in, out) tensor unbinds to
+        # n_experts entries. Each entry remembers where its update belongs — (param index, expert
+        # index or None) — so the result can be scattered back after orthogonalizing.
+        by_shape: dict[tuple[int, ...], list[tuple[int, int | None, torch.Tensor]]] = {}
         for i, p in enumerate(params):
-            by_shape.setdefault(tuple(p.shape), []).append(i)
+            u = updates[i]
+            if u.dim() == 2:
+                by_shape.setdefault(tuple(u.shape), []).append((i, None, u))
+            else:
+                mat_shape = tuple(u.shape[-2:])
+                for e, sub in enumerate(u.unbind(0)):
+                    by_shape.setdefault(mat_shape, []).append((i, e, sub))
 
-        for shape, idxs in by_shape.items():
+        for shape, entries in by_shape.items():
             # Newton-Schulz normalises the update's singular values to ~1, so its Frobenius norm is
             # ~sqrt(min(rows, cols)) regardless of the parameter's shape. This factor restores the
             # standard sqrt(fan-out / fan-in) scaling, which is also what makes Muon approximately
             # muP-correct without a separate width correction (see build_muon_param_groups). It
-            # depends only on the shape, so it is constant across a batch.
+            # depends only on the matrix shape, so it is constant across a batch.
             scale = max(1.0, shape[-2] / shape[-1]) ** 0.5
-            for start in range(0, len(idxs), _MUON_MAX_STACK):
-                chunk = idxs[start : start + _MUON_MAX_STACK]
+            for start in range(0, len(entries), _MUON_MAX_STACK):
+                chunk = entries[start : start + _MUON_MAX_STACK]
                 if len(chunk) == 1:
-                    i = chunk[0]
-                    params[i].add_(
-                        orthogonalize(updates[i], steps=group["ns_steps"]), alpha=-lr * scale
-                    )
+                    i, e, u = chunk[0]
+                    target = params[i] if e is None else params[i][e]
+                    target.add_(orthogonalize(u, steps=group["ns_steps"]), alpha=-lr * scale)
                     continue
                 stacked = orthogonalize(
-                    torch.stack([updates[i] for i in chunk]), steps=group["ns_steps"]
+                    torch.stack([u for _, _, u in chunk]), steps=group["ns_steps"]
                 )
-                torch._foreach_add_(
-                    [params[i] for i in chunk], list(stacked.unbind(0)), alpha=-lr * scale
-                )
+                targets = [params[i] if e is None else params[i][e] for i, e, _ in chunk]
+                torch._foreach_add_(targets, list(stacked.unbind(0)), alpha=-lr * scale)
 
     def _step_adamw(self, group: dict) -> None:
         lr, weight_decay = group["lr"], group["weight_decay"]

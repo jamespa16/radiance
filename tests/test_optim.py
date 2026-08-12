@@ -485,3 +485,32 @@ def test_muon_step_chunks_large_same_shape_groups(monkeypatch):
 
     for i, (p, q) in enumerate(zip(chunked, unbounded)):
         torch.testing.assert_close(p, q, rtol=2e-2, atol=1e-3, msg=f"param {i} diverged")
+
+
+def test_muon_step_chunks_within_batched_expert_tensors(monkeypatch):
+    """Regression test for the bug in this repo's first chunking attempt: counting *tensors* per
+    shape (len(idxs) <= _MUON_MAX_STACK) rather than *matrices*. A single BatchedExperts-style
+    tensor of shape (n_experts, in, out) is one tensor but n_experts matrices — a tensor-count cap
+    lets it straight through uncapped regardless of how large n_experts is. This test uses n_experts
+    (12) larger than the patched cap (4) on its own, with only ONE such tensor in the group, so the
+    old (fixed at the tensor level) logic would never chunk it at all while the matrix-level fix
+    must split it into multiple orthogonalize() calls yet still match the unbounded result.
+    """
+    torch.manual_seed(3)
+    shared = torch.randn(12, 10, 6)  # one BatchedExperts-shaped tensor: 12 experts, one call each
+    grad = torch.randn_like(shared) * 0.1
+
+    def run(max_stack: int) -> torch.Tensor:
+        monkeypatch.setattr(optim_module, "_MUON_MAX_STACK", max_stack)
+        param = shared.detach().clone().requires_grad_(True)
+        param.grad = grad.clone()
+        opt = MuonWithAuxAdam(
+            [{"params": [param], "algorithm": "muon", "lr": 0.02, "weight_decay": 0.01}]
+        )
+        opt.step()
+        return param
+
+    chunked = run(max_stack=4)  # 12 experts / 4 per chunk -> 3 orthogonalize() calls
+    unbounded = run(max_stack=1000)  # 1 orthogonalize() call over all 12 at once
+
+    torch.testing.assert_close(chunked, unbounded, rtol=2e-2, atol=1e-3)

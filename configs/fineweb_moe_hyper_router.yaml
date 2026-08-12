@@ -1,0 +1,171 @@
+# A single config combining the three largest independent architecture axes in this repo: MoE,
+# hyper-connections, and learned loop-depth (ACT router) — sized to the largest combination that
+# fits safely, and verified empirically rather than estimated, on a single 32GB card (RTX 5090).
+#
+# ~523M total parameters, 288M active per token (55% active — denser than a typical MoE ratio;
+# see below for why active ratio lost out to fitting all three features at once). Verified via
+# DenseTransformer(...).num_parameters()/num_active_parameters() against this exact config.
+#
+# HOW THIS WAS SIZED — each of the three features taxes VRAM on a different axis, and they don't
+# trade off the way a single naive "total params" budget would suggest:
+#
+#   MoE (n_experts)         taxes the *optimizer step*, not activations. optim.py's Muon optimizer
+#                            batches every same-shaped weight matrix into one torch.stack(...) call
+#                            before Newton-Schulz orthogonalization (a real throughput win for dense
+#                            models — see CLAUDE.md's optim.py section). For MoE, that means all
+#                            n_experts x n_moe_layers expert matrices of a given shape get stacked
+#                            into one tensor, and Newton-Schulz's transient buffers on that mega-
+#                            tensor are far larger than the parameters being orthogonalized. This
+#                            cost is independent of moe_top_k (active params) and of batch size.
+#
+#   use_router (max_loops)  taxes *activations*: every loop-body pass retains its own activations
+#                            for backward (same mechanism as fixed loop_count — ACT in its default,
+#                            dense mode always runs max_loops iterations regardless of per-token
+#                            halting, see CLAUDE.md's model.py section on act_capacity_ratio). This
+#                            cost scales with max_loops and is what dominated the sizing below.
+#
+#   hyper_conn_streams      taxes activations too (n_streams x the residual stream at every
+#                            sublayer boundary), but turned out to be the *cheapest* of the three
+#                            here — going from streams=1 to streams=2 cost under 1GB on top of a
+#                            26GB base, an order of magnitude less than one extra unit of max_loops.
+#
+# Measured directly on this card, this architecture's dims (d_model=1024, n_layers=6), one real
+# training step (fwd+bwd+opt.step, torch.compile on, doc_attention_mask on, hyper_conn_streams=2):
+#
+#   n_experts=24, max_loops=2               -> 26.41 GB, flat across 15 steps + eval + checkpoint
+#   n_experts=20, max_loops=6               -> 30.33 GB, climbing (28.99 -> 30.33 across steps)
+#   n_experts=24, max_loops=6               -> 30.67 GB, one transient OOM warning during warmup
+#   n_experts=24, max_loops=6, grad_checkpoint -> 31.89 GB (checkpointing made it WORSE here, not
+#                                                   better — contrary to CLAUDE.md's general
+#                                                   guidance that it trades throughput for memory;
+#                                                   apparently doesn't hold once Muon's Newton-
+#                                                   Schulz stack and hyper-connection buffers are
+#                                                   also competing for the same allocator headroom)
+#   n_experts=24, max_loops=4               -> 27.18 GB, one transient OOM warning during warmup
+#   n_experts=16, max_loops=4               -> 27.73 GB, flat, zero warnings  <- this config
+#
+# max_loops=2 alone (the first row) leaves the most headroom, but gives ACT almost no range to
+# learn a *variable* depth over — 2 iterations is barely different from a fixed loop_count=2. The
+# chosen config (max_loops=4, n_experts=16) trades expert count down to buy that range back while
+# staying clear of the OOM warnings seen at higher expert counts. The margin here (~2.6GB free on
+# a 32GB card) is real but not generous — see the train section below for how that's handled.
+#
+# Why not push n_experts back up by switching train.optimizer to "adamw" (which sidesteps the
+# Muon-stacking cost entirely — verified elsewhere at 1060M total params, 17GB peak)? Because
+# CLAUDE.md's own A/B has optimizer: muon beating adamw by a wide margin on the same active-param
+# budget (2.826 vs 3.300 val/loss, tinystories.yaml 400-step A/B — muon hit adamw's *final* loss in
+# about half the steps), and more experts here doesn't add any active/inference compute anyway
+# (moe_top_k and expert width are what's fixed) — it only adds routing capacity, which is a smaller
+# and unvalidated win to trade a proven optimizer advantage for. See git history for a plain-MoE
+# (no hyper-connections/router) variant of this sizing exercise that reached 657M/288M active at
+# n_experts=24 without the other two features competing for the same VRAM.
+#
+# mup_base_d_model: 256 carries this repo's one validated Muon lr (1.0e-2, muon_lr 0.02, tuned at
+# TinyStories' d_model=256 — see CLAUDE.md's lr sweep) across the 4x width jump to d_model=1024, via
+# muP's per-tensor correction — the documented mechanism for exactly this, rather than guessing a
+# fineweb-scale lr from nothing. hyper_conn_lr stays at its non-null default (1.0e-3): CLAUDE.md's
+# hyper-connection A/B found that sharing lr with the connection coefficients costs 0.39 val/loss on
+# its own — the single largest effect measured on that page — because they're structural (one-hot
+# read, identity mix) and an O(1) move erases them rather than refining them.
+
+run_name: fineweb-moe-hyper-router
+
+data:
+  dataset: HuggingFaceFW/fineweb # ~15TB, train split only (no validation split exists)
+  text_column: text
+  tokenizer: gpt2
+  seq_len: 1024
+  num_workers: 4
+  cache_dir: .cache/radiance/tokenized
+  streaming: true # required: fineweb is far too large to tokenize/cache to disk up front
+  shuffle_buffer_size: 10000
+  eval_split_size: 2000 # fineweb has no validation split — carve a deterministic held-out slice
+  disk_cache_max_gb: 50 # avoid re-fetching/re-tokenizing already-streamed data on restarts
+  disk_cache_shard_size: 100
+  prefetch_factor: 2
+
+model:
+  d_model: 1024
+  head_dim: 64
+  n_layers: 6
+  ffn_mult: 4.0
+  ffn_depth: 2
+
+  # Learned loop-depth (ACT). See file header: max_loops=4 is a compromise between giving the
+  # router real range to learn a variable depth and staying clear of this card's memory ceiling.
+  use_router: true
+  max_loops: 4
+  ponder_weight: 1.0e-2
+  halt_epsilon: 0.01
+
+  # Hyper-connections. streams=2 (not 4): CLAUDE.md's own A/B found n=2 beating n=4 at every step
+  # count tested (both still behind n=1 on quality, though this combination — with MoE and a
+  # learned loop, at a longer horizon than that A/B used — hasn't itself been re-measured), and it
+  # was also the cheaper of the two on VRAM. Requires loop_iter_conditioning + loop_input_injection
+  # for its per-iteration routing — see configs/tinystories_hyper.yaml for the mechanism.
+  hyper_conn_streams: 2
+  hyper_conn_dynamic: true
+  loop_iter_conditioning: norm_gains
+  loop_input_injection: true
+
+  # MoE. n_experts=16 (not 24+): see file header's measured table — this is the largest expert
+  # count that ran completely clean (zero OOM warnings) alongside the router+hyper-connections
+  # combination above.
+  use_moe: true
+  n_experts: 16
+  moe_top_k: 2 # keeps active params (~288M) independent of n_experts — top_k and expert width are
+  # what determine active compute, not how many total experts exist to route among
+  moe_expert_ffn_mult: 0.25
+  moe_n_shared: 1
+  moe_dense_every: 3 # every 3rd block of the loop body stays dense (matches configs/fineweb_moe.yaml)
+  moe_capacity_factor: 1.25
+  moe_aux_loss_weight: 1.0e-3 # moe_balance defaults to "both", so the bias term does most of the
+  # balancing work and the aux loss only needs to nudge — see configs/tinystories_moe_v2.yaml
+
+  mup_base_d_model: 256 # see file header: carries the TinyStories-tuned lr across the width jump
+
+  dropout: 0.0 # doc_attention_mask uses flex_attention, which has no attention-weight dropout
+  max_seq_len: 1024
+
+train:
+  # Pinned, not estimated — auto_batch_size's estimate_batch_size() has no model of the Muon
+  # batching cost described in the file header, so it sizes a batch that looks safe on paper and
+  # OOMs on the first real optimizer step. batch_size=4 is exactly the value verified above; do not
+  # raise it without re-verifying, given how little headroom this combination has (~2.6GB free).
+  batch_size: 4
+  grad_accum_steps: 64 # effective_batch_size = 256; raise this (not batch_size) for a bigger
+  # effective batch — grad_accum doesn't cost additional VRAM (Newton-Schulz and the loop body's
+  # retained activations are both sized per micro-batch, not per accumulated step), and it also
+  # keeps tokens/optimizer-step (262,144) far above the ~5*d_model threshold where Muon's per-step
+  # cost stops amortizing well (see CLAUDE.md's optim.py section).
+  auto_batch_size: false
+
+  optimizer: muon # default, kept explicit given the file header's alternative-path discussion
+  lr: 1.0e-2 # TinyStories-tuned value, carried across width by mup_base_d_model above
+  muon_lr: 0.02
+  hyper_conn_lr: 1.0e-3 # NOT train.lr's 1.0e-2 — see file header for why sharing it erases the
+  # hyper-connection routing rather than refining it
+  warmup_ratio: 0.05
+
+  tokens_per_param: 5 # as requested — well below Chinchilla-optimal (~20); max_steps derives from
+  # num_active_parameters() (~288M), giving ~5,500 steps at effective_batch_size=256, seq_len=1024
+  # (printed/logged at run start once the real active-parameter count is known)
+
+  grad_clip: 1.0
+  log_every: 10
+  eval_every: 200
+  eval_max_batches: 50
+  save_every: 200
+  output_dir: checkpoints/fineweb_moe_hyper_router
+  # Uncomment to resume an interrupted run from output_dir's checkpoint instead of restarting —
+  # restores optimizer moments and the LR schedule, not just the weights.
+  # resume_from: auto
+  seed: 42
+  device: auto
+  compile: true
+  dtype: bf16
+
+wandb:
+  project: radiance
+  entity: null
+  mode: online
