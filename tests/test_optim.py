@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+import radiance.optim as optim_module
 from radiance.config import Config, ModelConfig, TrainConfig
 from radiance.model import DenseTransformer
 from radiance.optim import (
@@ -453,3 +454,34 @@ def test_muon_mixed_shapes_in_one_group():
     for i, (p, b) in enumerate(zip(params, before)):
         assert torch.isfinite(p).all(), f"param {i} went non-finite"
         assert not torch.equal(p, b), f"param {i} was not updated"
+
+
+def test_muon_step_chunks_large_same_shape_groups(monkeypatch):
+    """A same-shaped group larger than _MUON_MAX_STACK must be split into multiple orthogonalize()
+    calls (bounding the transient Newton-Schulz buffer size — see _step_muon's docstring for the
+    MoE OOM this guards against) while still matching an unbounded single-stack step exactly.
+
+    Patches _MUON_MAX_STACK down to 2 so a 5-tensor group exercises multiple full chunks plus a
+    remainder chunk without needing a real MoE-sized parameter count.
+    """
+    torch.manual_seed(2)
+    shared = [torch.randn(10, 6) for _ in range(5)]
+    grads = [torch.randn(10, 6) * 0.1 for _ in range(5)]
+
+    def run(max_stack: int) -> list[torch.Tensor]:
+        monkeypatch.setattr(optim_module, "_MUON_MAX_STACK", max_stack)
+        params = [p.detach().clone().requires_grad_(True) for p in shared]
+        for p, g in zip(params, grads):
+            p.grad = g.clone()
+        opt = MuonWithAuxAdam(
+            [{"params": params, "algorithm": "muon", "lr": 0.02, "weight_decay": 0.01}]
+        )
+        for _ in range(3):
+            opt.step()
+        return params
+
+    chunked = run(max_stack=2)
+    unbounded = run(max_stack=1000)
+
+    for i, (p, q) in enumerate(zip(chunked, unbounded)):
+        torch.testing.assert_close(p, q, rtol=2e-2, atol=1e-3, msg=f"param {i} diverged")
