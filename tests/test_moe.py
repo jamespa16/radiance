@@ -229,3 +229,229 @@ def test_legacy_per_expert_checkpoint_still_loads():
 
     model.load_state_dict(state, strict=False)  # must not raise
     assert layer.experts.gate_w.shape == (n_experts, d_model, ffn_dim)
+
+
+# --- counterfactual routing ---------------------------------------------------------------------
+#
+# The dispatch computes every expert on `capacity` rows whether or not it won that many tokens, so
+# an under-loaded expert's surplus rows hold its output for tokens it was *not* routed to, which
+# the forward then multiplies by zero. cfg.moe_counterfactual_weight turns that discarded compute
+# into the one thing backprop structurally cannot give the router: what the experts a token didn't
+# take would have done. These tests pin (1) that harvesting it changes nothing in the forward,
+# (2) that the gradient it deposits is exactly the counterfactual advantage, and (3) that the
+# probe rows are aimed at near-misses rather than at whatever sat earliest in the batch.
+
+
+def _layer(seed: int = 0, **overrides) -> MoEFeedForward:
+    """A standalone MoE FFN. n_shared=0 so the layer's output *is* its routed output, which is
+    what the counterfactual baseline is defined against."""
+    fields = dict(
+        d_model=16, ffn_mult=2.0, ffn_depth=1, dropout=0.0,
+        use_moe=True, n_experts=4, moe_top_k=2, moe_n_shared=0,
+    )
+    fields.update(overrides)
+    torch.manual_seed(seed)
+    return MoEFeedForward(ModelConfig(**fields)).train()
+
+
+def _routing(layer: MoEFeedForward, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(probs, weight, assigned) as forward() computes them, for tests that need to know what the
+    router decided without reaching into the dispatch."""
+    with torch.no_grad():
+        probs = layer.router(x)
+        selection = probs + layer.expert_bias if layer._bias_balancing else probs
+        topk_idx = selection.topk(layer.cfg.moe_top_k, dim=-1).indices
+        topk_probs = probs.gather(1, topk_idx)
+        topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True)
+        weight = probs.new_zeros(*probs.shape).scatter_(1, topk_idx, topk_probs)
+    return probs, weight, weight > 0
+
+
+def _probs_grad(layer: MoEFeedForward, x: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run one backward and return (gradient the router's probs received, the layer's output).
+
+    The hook sits on the router's *output*, i.e. before the softmax jacobian, so the counterfactual
+    term's contribution appears there uncoupled across experts.
+    """
+    captured: dict[str, torch.Tensor] = {}
+
+    def watch(_module, _inputs, out):
+        out.register_hook(lambda g: captured.__setitem__("grad", g))
+        # Returns None deliberately: a forward hook's return value *replaces* the module's output.
+
+    handle = layer.router.register_forward_hook(watch)
+    try:
+        out = layer(x)
+        (out * target).sum().backward()
+    finally:
+        handle.remove()
+    layer.zero_grad(set_to_none=True)
+    return captured["grad"], out.detach()
+
+
+def test_dispatch_matches_an_uncapped_reference_so_probe_rows_contribute_nothing():
+    """With capacity at n_tokens every (token, expert) pair gets a row, so ~75% of the rows here
+    are probes for experts the token never selected. The output must still be exactly the weighted
+    sum over each token's top-k, or the probes are leaking into the forward."""
+    layer = _layer(moe_capacity_factor=100.0)  # capped to n_tokens
+    x = torch.randn(24, 16)
+
+    out = layer(x)
+    _, weight, _ = _routing(layer, x)
+    with torch.no_grad():
+        per_expert = layer.experts(x.unsqueeze(0).expand(4, *x.shape).contiguous())  # (E, n, d)
+        reference = (weight.t().unsqueeze(-1) * per_expert).sum(dim=0)
+
+    torch.testing.assert_close(out, reference, rtol=1e-5, atol=1e-6)
+
+
+def test_counterfactual_term_is_inert_in_the_forward():
+    """It exists only to deposit a gradient: `p - p.detach()` is exactly 0.0, so the tensor added
+    to the routed output is exactly zero and the model computes precisely what it did before."""
+    x = torch.randn(24, 16)
+    off = _layer(moe_counterfactual_weight=0.0)
+    on = _layer(moe_counterfactual_weight=1.0)
+    on.load_state_dict(off.state_dict())
+
+    torch.testing.assert_close(on(x), off(x), rtol=0, atol=0)
+
+
+def test_counterfactual_gradient_equals_the_measured_advantage():
+    """The claim, checked against a hand-computed expectation rather than against the code.
+
+    For loss `sum(out * target)` the gradient reaching token t's output is `target_t`, so the
+    first-order utility of routing t to expert e is `u = -<target_t, out_e(t)>` and the utility it
+    actually realised is `-<target_t, routed_t>`. The router should receive `-weight * (u - u_bar)`
+    on every probe pair and nothing at all on the pairs it really routed — those already get the
+    true gradient through the gate weight.
+    """
+    lam = 0.5
+    x = torch.randn(24, 16)
+    target = torch.randn(24, 16)
+    # capacity == n_tokens, so every unassigned pair is a probe and the expectation is complete.
+    off = _layer(moe_capacity_factor=100.0, moe_counterfactual_weight=0.0)
+    on = _layer(moe_capacity_factor=100.0, moe_counterfactual_weight=lam)
+    on.load_state_dict(off.state_dict())
+
+    grad_off, _ = _probs_grad(off, x, target)
+    grad_on, routed = _probs_grad(on, x, target)
+    deposited = grad_on - grad_off  # the forward is identical, so this is exactly the new term
+
+    _, _, assigned = _routing(on, x)
+    with torch.no_grad():
+        per_expert = on.experts(x.unsqueeze(0).expand(4, *x.shape).contiguous())  # (E, n, d)
+        utility = -(per_expert * target).sum(-1).t()  # (n, E)
+        realised = -(routed * target).sum(-1, keepdim=True)  # (n, 1)
+        expected = torch.where(assigned, torch.zeros(()), -lam * (utility - realised))
+
+    torch.testing.assert_close(deposited, expected, rtol=1e-4, atol=1e-6)
+
+
+def test_counterfactual_gradient_pushes_toward_the_better_unrouted_expert():
+    """Direction, stated independently of the formula: among a token's unrouted experts, the one
+    whose output would have helped most must be the one whose probability is pushed up hardest
+    (gradient descent, so most negative gradient)."""
+    x = torch.randn(24, 16)
+    target = torch.randn(24, 16)
+    off = _layer(moe_capacity_factor=100.0, moe_counterfactual_weight=0.0)
+    on = _layer(moe_capacity_factor=100.0, moe_counterfactual_weight=1.0)
+    on.load_state_dict(off.state_dict())
+
+    grad_off, _ = _probs_grad(off, x, target)
+    grad_on, _ = _probs_grad(on, x, target)
+    deposited = grad_on - grad_off
+
+    _, _, assigned = _routing(on, x)
+    with torch.no_grad():
+        per_expert = on.experts(x.unsqueeze(0).expand(4, *x.shape).contiguous())
+        utility = -(per_expert * target).sum(-1).t()
+    masked_utility = utility.masked_fill(assigned, float("-inf"))
+    masked_grad = deposited.masked_fill(assigned, float("inf"))
+
+    assert (masked_utility.argmax(dim=1) == masked_grad.argmin(dim=1)).all()
+
+
+def test_capacity_padding_probes_the_near_misses():
+    """Which unrouted tokens fill an expert's surplus rows is free to choose, and index order — the
+    old behaviour, from every unassigned token tying at priority 0 — samples by position in the
+    batch. Ranking them by router probability puts the compute on the decision boundary instead."""
+    # top_k 1 of 4 experts at capacity_factor 2.0: each expert gets 2x its balanced load in rows,
+    # so there are real surplus rows and real leftovers to compare them against.
+    x = torch.randn(48, 16)
+    target = torch.randn(48, 16)
+    off = _layer(moe_top_k=1, moe_capacity_factor=2.0, moe_counterfactual_weight=0.0)
+    on = _layer(moe_top_k=1, moe_capacity_factor=2.0, moe_counterfactual_weight=1.0)
+    on.load_state_dict(off.state_dict())
+
+    grad_off, _ = _probs_grad(off, x, target)
+    grad_on, _ = _probs_grad(on, x, target)
+    probed = (grad_on - grad_off) != 0  # the counterfactual term touches probe pairs and no others
+
+    probs, _, assigned = _routing(on, x)
+    assert probed.any(), "no probe rows at all — the test setup stopped exercising the mechanism"
+    assert not (probed & assigned).any(), "a routed pair must not receive the counterfactual push"
+    for expert in range(4):
+        skipped = ~assigned[:, expert] & ~probed[:, expert]
+        if probed[:, expert].any() and skipped.any():
+            assert probs[probed[:, expert], expert].min() >= probs[skipped, expert].max(), (
+                f"expert {expert} probed a token it ranked below one it skipped"
+            )
+
+
+def test_counterfactual_is_off_outside_training():
+    """Gated like grad_checkpoint: eval and no_grad get the plain forward, since a term that only
+    exists to carry a gradient is pure overhead where there is no backward."""
+    layer = _layer(moe_counterfactual_weight=1.0)
+    assert layer._counterfactual_routing
+    assert not layer.eval()._counterfactual_routing
+    with torch.no_grad():
+        assert not layer.train()._counterfactual_routing
+
+
+# --- what the balancing rule balances -------------------------------------------------------------
+
+
+def test_balance_signal_count_and_weight_measure_what_they_say():
+    x = torch.randn(32, 16)
+    _, weight, assigned = _routing(_layer(moe_balance="bias"), x)
+
+    by_count = _layer(moe_balance="bias", moe_balance_signal="count")
+    by_weight = _layer(moe_balance="bias", moe_balance_signal="weight")
+    by_count(x)
+    by_weight(x)
+
+    torch.testing.assert_close(by_count.expert_load, assigned.sum(0).float())
+    torch.testing.assert_close(by_weight.expert_load, weight.sum(0))
+
+
+def test_weight_signal_sees_the_low_confidence_load_that_count_calls_full():
+    """The disagreement the option exists for, in the situation the bias mechanism itself creates.
+
+    expert_bias steers *selection* without touching the gate weights, so an expert the bias forces
+    into every token's top-k at a near-zero router probability contributes almost nothing to any
+    token's output. By token count it is the most loaded expert in the layer; by the mass it
+    actually supplies — and so by the gradient it actually receives — it is the least.
+    """
+    x = torch.randn(32, 16)
+    layers = {}
+    for signal in ("count", "weight"):
+        layer = _layer(moe_balance="bias", moe_balance_signal=signal)
+        with torch.no_grad():
+            layer.router.proj.bias[0] = -8.0  # expert 0 is what the router actually wants: nothing
+            layer.expert_bias[0] = 20.0  # ...but the balancer forces it into every top-k anyway
+        layer(x)
+        layers[signal] = layer
+
+    assert layers["count"].expert_load[0] == 32, "every token routed to expert 0"
+    assert layers["count"].expert_load.argmax() == 0, "by count it is the most loaded expert"
+    assert layers["weight"].expert_load.argmin() == 0, "by mass it is the least supplied"
+
+    for layer in layers.values():
+        layer.update_expert_bias()
+    assert layers["count"].expert_bias[0] < 20.0, "count keeps pushing the idle expert away"
+    assert layers["weight"].expert_bias[0] > 20.0, "mass keeps trying to give it real work"
+
+
+def test_unknown_balance_signal_raises():
+    with pytest.raises(ValueError, match="moe_balance_signal"):
+        _layer(moe_balance_signal="utility")

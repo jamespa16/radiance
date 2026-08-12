@@ -117,6 +117,12 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   approximation you reach for deliberately). The distinction is cost and reversibility, not novelty — a feature
   whose "on" state is free and inert defaults on; one that spends real memory or changes a tuned quantity doesn't.
 
+  There is a fifth reason a feature can stay off, and it outranks all of the above: **the measurement said no.**
+  `moe_counterfactual_weight` (`0.0`) and `moe_balance_signal` (`"count"`) are both free and both inert at their
+  defaults, so they would default on under the rule above. They don't, because the A/B came out neutral and
+  negative respectively. Keeping them means keeping the recorded result and the diagnostic that explains it —
+  see "Measured results" — not keeping a recommendation.
+
   Five settings change results at their defaults, intentionally: `doc_attention_mask`, `optimizer: muon`,
   `z_loss_weight`, MoE's `moe_n_shared`/`moe_balance`, and `train.lr`. Each is a straightforward improvement
   rather than an experiment — see the A/B numbers recorded below.
@@ -517,6 +523,54 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   `forward` — it mutates a buffer with no gradient, so keeping it out of the graph avoids a `torch.compile` break
   on every micro-batch. Under `"bias"`, `_collect_moe_aux_loss` returns an exact zero rather than a weighted-down
   term, keeping it out of the graph entirely.
+
+  `cfg.model.moe_balance_signal` selects *what* the bias rule drives toward uniformity: `"count"` (default,
+  DeepSeek-V3's rule — one per token routed to the expert) or `"weight"` (that token's gate weight). They
+  disagree about an expert selected often but weakly, and `"weight"` is the better-motivated proxy for the
+  failure the bias exists to prevent — the gradient reaching an expert's weights scales with the gate weight it
+  was applied at, not with how many tokens listed it. The `expert_bias` mechanism manufactures exactly that
+  disagreement itself, since it steers selection without touching the gate weights. Because the update is
+  sign-based the two are interchangeable with no change to `moe_bias_update_rate`. It stays at `"count"` because
+  **the A/B says `"weight"` is worse** — see "Measured results".
+
+  **Counterfactual routing (`cfg.model.moe_counterfactual_weight`, default `0.0` = off).** Backprop gives the
+  router a perfect utility signal for the experts a token *was* sent to and none at all for the experts it was
+  not: expert `e` contributes `w[t,e] * out[t,e]`, so `dL/dw[t,e] = <g_t, out[t,e]>`, but `out[t,e]` never enters
+  the graph for an unchosen `e`. The counterfactual is normally written off as unaffordable — and here it is
+  already paid for. Capacity is a fixed *shape*, so an under-loaded expert computes `capacity` rows regardless
+  and `valid` masks the surplus away: at `moe_capacity_factor: 1.25` roughly 20% of all MoE FLOPs go on running
+  experts over tokens they did not win, and discarding the answer.
+
+  Two changes harvest it. The dispatch tiebreak now ranks *unassigned* tokens by their router probability
+  instead of leaving them tied at zero (where `topk` broke the tie by index, so the surplus rows went to
+  whichever tokens sat earliest in the batch); the rows now land on the tokens each expert ranked just below its
+  top-k. That part is unconditional and free — those rows are multiplied by `valid`, so the forward output is
+  identical either way, and it only decides which counterfactuals exist. Then
+  `_counterfactual_probe_signal` turns them into router gradient: with `m_t = routed_t / sum_e w[t,e]` the
+  mixture the token actually got, the advantage of a probe is `adv[t,e] = -<g_t, out[t,e] - m_t>`, and the
+  router should raise `p[t,e]` where that is positive.
+
+  `g_t` exists only in backward, so this cannot be written as a forward loss. Rather than a custom
+  `autograd.Function` (which would break the graph under `torch.compile`), it uses the identity that
+  `p - p.detach()` is exactly `0.0` with unit gradient: adding `weight * (p - sg p) * sg(out[t,e] - m_t)` to the
+  output leaves the forward **bit-identical** while making `dL/dp[t,e] = -weight * adv[t,e]`. Three properties
+  fall out for free. It is scale-consistent with every other gradient including under fp16's `GradScaler`,
+  because it *is* an ordinary gradient rather than a separately-scaled loss. `weight` has a natural unit — at
+  `1.0` a probe's push is exactly as strong per unit of utility as the true gradient on a chosen expert's gate
+  weight, which measured as 22% of the router's own gradient norm at `configs/tinystories.yaml`'s shape. And it
+  is training-only, gated like `grad_checkpoint`, since a term that exists only to carry a gradient is pure
+  overhead where there is no backward.
+
+  Verify the compiled behaviour, not just the eager behaviour, if this is ever changed: a term that is
+  identically zero in the forward is exactly what an optimising compiler is entitled to delete, and if inductor
+  folded it away it would take the gradient with it and the feature would silently do nothing in every real run
+  while passing every eager test. Measured: the gradient survives (all 12 router tensors move), step time costs
+  0.4% and memory 0.01 GB. The compiled forward differs from the feature-off model by 4.8e-07 — not the term
+  being nonzero (eager is bit-identical, and two identical models compile bit-identically) but inductor
+  scheduling a graph with extra nodes differently, which is *smaller* than the 8.3e-07 eager-vs-compiled gap
+  every compiled run already carries.
+
+  It defaults off because the A/B does not support turning it on — see "Measured results".
 
   `cfg.model.moe_n_shared` adds an always-on expert (DeepSeekMoE) whose output is added to every token
   unconditionally, with no routing and no capacity limit — it absorbs the computation every token needs so the
@@ -1028,6 +1082,52 @@ is a small instance of it; the `n*d` vs `d^2` scaling also means the step-time p
 wider, deeper, longer run is where the trade could plausibly flip. Nothing here rules that out — it rules out
 turning it on by default today.
 
+**Counterfactual routing and `moe_balance_signal` are both measured negative, and the *diagnostic* is worth more
+than the A/B.** Arms off `configs/tinystories.yaml`'s shape with MoE (`n_layers: 6`, `loop_count: 1`,
+`n_experts: 8`, `moe_top_k: 2`, batch 32 pinned, `auto_batch_size: false`, `lr: 1.0e-2`, `dropout: 0.0`),
+`val/loss` at 1500 steps:
+
+| arm | @1500 |
+|---|---|
+| baseline | 1.6810 |
+| baseline, re-run (the noise floor) | 1.6823 |
+| `moe_counterfactual_weight: 1.0` | **1.6804** |
+| `moe_counterfactual_weight: 4.0` | 1.6947 |
+| `moe_balance_signal: weight` | 1.7003 |
+| both | 1.7107 |
+
+Run-to-run noise on this setup is 0.0013, so counterfactual routing at its natural scale is exactly neutral,
+and everything else is a real regression. Three follow-ups closed off the obvious escapes. It is **not a
+horizon effect**: at 6000 steps (4x) it is 1.4689 against the baseline's 1.4696, inside noise at all twelve
+eval points. It is **not a lack of routing decisions to get right**: fine-grained MoE (`n_experts: 32`,
+`moe_top_k: 8`, `moe_expert_ffn_mult: 0.25`, same active parameters) gives 1.7018 against 1.7026. And it is
+**not too weak to matter** — the deposited gradient measures 22% of the router's own gradient norm at
+`weight: 1.0`, and raising it to 4.0 makes things monotonically worse, which is what injecting *noise* looks
+like rather than what an ineffective term looks like.
+
+What it actually is, from the diagnostic that should have been run first: compute the per-(taken expert,
+alternative expert) mean advantage on two **disjoint** batches at identical weights, and correlate them. Real
+structure ("tokens going to expert i would do better at expert j") reproduces across data; batch noise does not.
+
+| step | 0 | 100 | 400 | 1000 | 2000 |
+|---|---|---|---|---|---|
+| corr(batch A, batch B) | 0.46 | 0.52 | -0.20 | 0.20 | 0.05 |
+| best-alternative regret / realised utility | 2.39 | 1.97 | 1.58 | 1.72 | 1.86 |
+
+In-sample regret stays large — the best unchosen expert looks ~1.8x better than what the token got — while
+out-of-sample correlation collapses to zero within a few hundred steps. That is the signature of a quantity
+that is real and unlearnable: `adv[t,e] = -<g_t, out[t,e] - m_t>` is a *first-order, single-batch* estimate,
+and once the balancer has equalised the experts the only generic component (some expert being systematically
+better aligned at init, which is what the 0.46 at step 0 measures) is gone, leaving per-batch noise. Following
+it is overfitting the current micro-batch's gradient.
+
+So the premise — that the discarded capacity-padding compute is a free counterfactual — is correct, and the
+implementation is exact and free; the conclusion that a router should follow that counterfactual is what
+fails. Reviving it means attacking the variance, not the plumbing: average the advantage over many batches
+before acting on it, or aggregate it to a coarser unit (per expert-pair rather than per token) where the noise
+cancels. **Measure the two-batch correlation before spending a run on any such variant** — it costs one
+forward/backward pair and would have predicted every A/B above.
+
 Two cautions when running your own A/B, both learned the hard way here. **Pin `batch_size` and set
 `auto_batch_size: false`** — otherwise a change that reduces memory (sparsity, checkpointing) is silently handed a
 larger batch, and the arms differ in two ways at once. And **check for `ending run early`** in the output: an
@@ -1102,6 +1202,13 @@ inductor's FX graph cache makes later configurations look far cheaper than they 
   — see `configs/tinystories_moe.yaml`. `MoEFeedForward` is the reference example for a variant that replaces a
   block's FFN sublayer wholesale while preserving `FeedForward`'s `(*, d_model) -> (*, d_model)` contract, which
   is what lets it compose with ACT's own `_sparse_ffn_delta` gather/scatter path with no changes to either.
+- A new *training signal* (an auxiliary gradient, a routing hint, a reweighting): measure whether the signal
+  carries reproducible structure **before** spending runs on an A/B of it. Compute it on two disjoint batches
+  at identical weights and correlate. A signal that doesn't reproduce across batches cannot be learned from, no
+  matter how large it looks in-sample, and a fixed-step A/B will report "neutral" rather than "this is noise" —
+  which reads as "needs a longer run" and invites spending the budget to find out. `moe_counterfactual_weight`
+  is the worked example: large in-sample regret, zero cross-batch correlation, three A/Bs to establish what one
+  forward/backward pair would have.
 - Sparse attention: `model.use_nsa` has been removed from the codebase. See the "Architecture" section above
   for the removal rationale and git history for the former `configs/tinystories_nsa.yaml` example. Not currently a win
   at TinyStories scale (see "Measured results"); a candidate for a longer-context follow-up A/B if re-introduced.

@@ -759,12 +759,25 @@ class MoEFeedForward(nn.Module):
     expert's zero padding silently clobber an earlier expert's real output at that index;
     index_add sums correctly because unassigned/padding slots are explicitly zeroed by `valid`
     before being added.
+
+    Those padding slots are not wasted twice. Because capacity is a fixed shape, an under-loaded
+    expert runs on `capacity` rows whatever its real load, so the dispatch is already computing
+    each expert's output for tokens it did not win and throwing the result away. The tiebreak in
+    forward() aims those rows at the tokens the expert ranked just below its top-k, and
+    cfg.moe_counterfactual_weight turns them into the counterfactual gradient the router otherwise
+    cannot have — see _counterfactual_probe_signal. Neither changes the forward output.
     """
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         if cfg.moe_top_k > cfg.n_experts:
             raise ValueError(f"model.moe_top_k ({cfg.moe_top_k}) must be <= model.n_experts ({cfg.n_experts})")
+        if cfg.moe_balance_signal not in ("count", "weight"):
+            # Raised rather than ignored: a typo here would silently keep the previous behaviour,
+            # which is exactly the kind of "the A/B measured nothing" failure worth failing fast on.
+            raise ValueError(
+                f"model.moe_balance_signal must be 'count' or 'weight', got {cfg.moe_balance_signal!r}"
+            )
         self.cfg = cfg
         self.router = MoERouter(cfg)
         self.experts = BatchedExperts(cfg)
@@ -844,7 +857,16 @@ class MoEFeedForward(nn.Module):
         if self._bias_balancing and self.training:
             # Accumulated here, consumed by update_expert_bias() after the optimizer step — outside
             # the compiled graph, so no graph break in the forward.
-            self.expert_load += assigned.sum(dim=0).detach().float()
+            #
+            # cfg.moe_balance_signal picks *what* is being balanced. "count" is one per routed
+            # token; "weight" is that token's gate weight, i.e. how much of its FFN output this
+            # expert actually supplies. The two differ whenever an expert is selected often but
+            # weakly, and "weight" is the better proxy for the thing the bias exists to prevent —
+            # an expert starved of gradient — because the gradient reaching an expert's weights
+            # scales with the gate weight it was applied at, not with how many tokens listed it.
+            # Both are pre-drop, matching each other and the previous behaviour.
+            signal = assigned if self.cfg.moe_balance_signal == "count" else weight
+            self.expert_load += signal.detach().sum(dim=0).float()
         f_i = assigned.float().mean(dim=0).detach()  # fraction of tokens routed to expert i (non-diff)
         p_i = probs.mean(dim=0)  # mean full-softmax prob mass on expert i (differentiable)
         aux_loss = self.cfg.n_experts * (f_i * p_i).sum()
@@ -858,28 +880,46 @@ class MoEFeedForward(nn.Module):
         # Per-expert token selection, computed for all experts at once. Priority within the
         # assigned set is the router's own weight for this expert, not a random draw: when an
         # expert is over capacity, the tokens it drops should be the ones it was least confident
-        # about. Router weights are in (0, 1], so `assigned + weight` keeps every assigned token
-        # strictly above every unassigned one (which scores < 1), preserving the "assigned always
-        # outranks capacity padding" property.
+        # about. The `* 2.0` keeps every assigned token (scoring in [2, 3]) strictly above every
+        # unassigned one (in [0, 1]), preserving the "assigned always outranks capacity padding"
+        # property.
+        #
+        # Unassigned tokens are ordered by their raw router probability rather than left tied at
+        # zero. They are ordered at all because an under-loaded expert still computes a full
+        # `capacity` rows and masks the surplus away below, so *some* unrouted tokens are pushed
+        # through it either way — at moe_capacity_factor 1.25 that is ~20% of all MoE FLOPs. Tied
+        # at zero, topk broke the tie by index and those rows went to whichever tokens sat earliest
+        # in the batch; ranked by probability they go to the tokens the expert ranked just below
+        # its top-k, which is the informative sample. The forward output is identical either way
+        # (the rows are multiplied by `valid` and contribute exactly zero), so this only decides
+        # *which* counterfactuals _counterfactual_probe_signal has to work with.
         #
         # This also makes routing deterministic. The previous random tiebreak ran in eval and
         # generation too, so val/loss and even greedy decoding varied run to run for the same
         # weights and inputs — which defeats comparing two configs' eval numbers.
-        priority = assigned.float() + weight.detach().float()  # (n_tokens, n_experts)
+        priority = assigned.float() * 2.0 + torch.where(assigned, weight, probs).detach().float()
         token_idx = priority.topk(capacity, dim=0).indices.t().contiguous()  # (n_experts, capacity)
         valid = assigned.t().gather(1, token_idx)  # (n_experts, capacity) bool
         gathered = flat_x[token_idx]  # (n_experts, capacity, d_model)
 
-        expert_out = self.experts(gathered) * valid.unsqueeze(-1).to(x.dtype)
+        # Kept unmasked: `probe_out` holds every expert's output for every row it computed,
+        # including the discarded ones, which is what the counterfactual signal reads.
+        probe_out = self.experts(gathered)
+        expert_out = probe_out * valid.unsqueeze(-1).to(x.dtype)
         w = (weight.t().gather(1, token_idx) * valid.to(weight.dtype)).to(x.dtype)
 
         # index_add, not index_copy: a token can receive nonzero contributions from more than one
         # expert (top_k >= 2 by default), and even at top_k=1 one expert's zero capacity-padding can
         # land on an index another expert legitimately wrote. index_copy would let the padding
         # clobber the real output; index_add sums correctly because `valid` zeroed the padding.
+        flat_token_idx = token_idx.reshape(-1)
         delta = flat_x.new_zeros(n_tokens, d_model).index_add(
-            0, token_idx.reshape(-1), (w.unsqueeze(-1) * expert_out).reshape(-1, d_model)
+            0, flat_token_idx, (w.unsqueeze(-1) * expert_out).reshape(-1, d_model)
         )
+        if self._counterfactual_routing:
+            delta = delta + self._counterfactual_probe_signal(
+                probs, probe_out, delta, w, valid, token_idx, flat_token_idx
+            )
         if self.shared_expert is not None:
             # Unconditional, ungated, no capacity limit: every token gets this.
             delta = delta + self.shared_expert(flat_x)
@@ -888,6 +928,82 @@ class MoEFeedForward(nn.Module):
     @property
     def _bias_balancing(self) -> bool:
         return self.cfg.moe_balance in ("bias", "both")
+
+    @property
+    def _counterfactual_routing(self) -> bool:
+        # Training-only: the term is exactly zero in the forward, so it exists purely to deposit a
+        # gradient. Skipping it under eval/no_grad costs nothing and saves the extra index_adds.
+        return self.cfg.moe_counterfactual_weight != 0.0 and self.training and torch.is_grad_enabled()
+
+    def _counterfactual_probe_signal(
+        self,
+        probs: torch.Tensor,
+        probe_out: torch.Tensor,
+        routed: torch.Tensor,
+        w: torch.Tensor,
+        valid: torch.Tensor,
+        token_idx: torch.Tensor,
+        flat_token_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        """Router gradient from the expert outputs this dispatch computes and then throws away.
+
+        Returns a tensor that is **exactly zero** — it is added to the routed output and changes
+        nothing about what the model computes — whose only effect is the gradient it deposits on
+        `probs`.
+
+        The problem it solves. Backprop already gives the router a perfect utility signal for the
+        experts a token *was* sent to: expert e contributes `w[t,e] * out[t,e]` to the layer's
+        output, so `dL/dw[t,e] = <g_t, out[t,e]>` where `g_t = dL/d(output_t)`. What it cannot give
+        is the counterfactual — how good the experts the token was *not* sent to would have been —
+        because `out[t,e]` never enters the graph for those. That is normally where the argument
+        ends, since computing it means running experts on tokens they didn't win.
+
+        Here it is already paid for. Capacity is a fixed shape, so an under-loaded expert computes
+        `capacity` rows regardless and the surplus is masked away (~20% of MoE FLOPs at the default
+        moe_capacity_factor), and the priority tiebreak in forward() steers those rows to the
+        tokens that expert ranked just below its top-k. `probe_out` holds the results. This turns
+        them into the missing gradient.
+
+        The construction. For a probe row (t, e) the first-order utility of having routed token t
+        to expert e is `u[t,e] = -<g_t, out[t,e]>`, and the utility it actually realised is
+        `-<g_t, m_t>` where `m_t` is the mixture the routed experts produced per unit of retained
+        gate weight — which is just `routed_t / sum_e w[t,e]`, already computed. The advantage is
+        `adv[t,e] = -<g_t, out[t,e] - m_t>`, and we want the router to raise `p[t,e]` where that is
+        positive.
+
+        `g_t` only exists in backward, so the term cannot be written as a forward loss. Instead of
+        a custom autograd.Function (which would break the graph under torch.compile), it uses the
+        identity that `p - p.detach()` is exactly 0.0 with unit gradient: adding
+        `weight * (p - sg p) * sg(out[t,e] - m_t)` to the output leaves the forward bit-identical
+        while making `dL/dp[t,e] = weight * <g_t, out[t,e] - m_t> = -weight * adv[t,e]`, so
+        gradient descent moves `p` up exactly where the counterfactual was better than what
+        happened. It is scale-consistent with everything else for free, including under fp16's
+        GradScaler, because it *is* an ordinary gradient rather than a separately-scaled loss.
+
+        The `sum_e coeff * m_t` half is folded into a per-token scalar rather than materialised per
+        row, since `m_t` doesn't depend on e — that keeps this to one transient (n_experts,
+        capacity, d_model) tensor instead of two retained ones.
+        """
+        n_tokens, d_model = routed.shape
+
+        # Per unit of *retained* gate weight: a token whose experts dropped it keeps a mixture
+        # that only some of its weight paid for, and the baseline has to be the average of what it
+        # got, not the sum. clamp_min guards the token that every one of its experts dropped —
+        # `routed` is exactly zero there, so the baseline is zero rather than a division blow-up.
+        den = routed.new_zeros(n_tokens).index_add(0, flat_token_idx, w.reshape(-1))
+        baseline = routed.detach() / den.clamp_min(1e-6).unsqueeze(-1)
+
+        # Exactly 0.0, unit gradient into probs, and zero on the rows that were really routed —
+        # those already get the true gradient through `w`, and pushing on them again would just
+        # double-count a signal backprop supplies correctly.
+        p = probs.t().gather(1, token_idx).to(routed.dtype)
+        coeff = (p - p.detach()) * (~valid).to(routed.dtype) * self.cfg.moe_counterfactual_weight
+
+        signal = routed.new_zeros(n_tokens, d_model).index_add(
+            0, flat_token_idx, (coeff.unsqueeze(-1) * probe_out.detach()).reshape(-1, d_model)
+        )
+        coeff_sum = routed.new_zeros(n_tokens).index_add(0, flat_token_idx, coeff.reshape(-1))
+        return signal - coeff_sum.unsqueeze(-1) * baseline
 
     @torch.no_grad()
     def update_expert_bias(self) -> None:

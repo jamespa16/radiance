@@ -136,6 +136,20 @@ class ModelConfig:
     # (default, DeepSeek-V3's actual configuration). The bias term balances load without adding a
     # gradient that competes with the LM objective, which is what the aux loss alone does.
     moe_bias_update_rate: float = 1.0e-3  # step size for the "bias"/"both" balancing update
+    moe_balance_signal: str = "count"  # what the "bias"/"both" balancing rule drives toward
+    # uniformity: "count" (default, DeepSeek-V3's rule — one per token routed to the expert) or
+    # "weight" (the token's gate weight, i.e. how much of its output the expert actually supplies).
+    # They differ for an expert chosen often but weakly, which "count" calls loaded and "weight"
+    # calls idle; gradient reaching an expert scales with the latter. The update is sign-based, so
+    # the two are interchangeable without retuning moe_bias_update_rate. Does not touch the aux
+    # loss, whose f_i is a count fraction by the Switch formulation's own definition.
+    moe_counterfactual_weight: float = 0.0  # coefficient on the counterfactual routing signal:
+    # extra router gradient derived from the expert outputs the fixed-capacity dispatch *already*
+    # computes for tokens it then discards (see MoEFeedForward._counterfactual_probe_signal). Zero
+    # (default) leaves the router trained exactly as before. This is the one MoE knob that is not
+    # defaulted on despite being free in the forward — it changes gradients, and nothing has A/B'd
+    # it yet; 1.0 is the natural scale to start from (it makes a probe's push exactly as strong per
+    # unit of utility as the true gradient on a chosen expert's gate weight).
     moe_n_shared: int = 1  # always-on expert(s) added to every token's FFN output alongside the
     # routed ones (DeepSeekMoE). Absorbs the computation every token needs, so the routed experts
     # are free to specialise instead of each re-learning the common case. 0 disables.
