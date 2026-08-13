@@ -23,6 +23,18 @@ to discover:
     layer to actually surface — a plain looped model with grad_checkpoint alone did not reproduce
     it, so the regression test below matches configs/super.yaml's combination that did.
 
+  * differential attention (cfg.model.use_diff_attn) + document masking: CausalSelfAttention.forward
+    issues *two* flex_attention calls per layer (one per branch), against the same reused BlockMask,
+    whose Q/K both trace back to one torch.split of qkv_proj's output. Traced into one inductor graph
+    together, the second call's output silently diverges from eager — no error, no warning, up to
+    ~0.85 absolute on a toy shape. Eager was correct throughout; only the compiled *combination* was
+    wrong, which is exactly the class of bug this file exists to catch — the shapes/gradients/KV-cache
+    tests in test_diff_attention.py all passed the whole time. _diff_flex_attention (model.py) is
+    marked @torch._dynamo.disable for the same structural reason _doc_masks is, though the underlying
+    cause is different (an inductor scheduling issue with two flex_attention calls sharing a BlockMask
+    and split-provenance inputs, not an unlowerable data-dependent tensor). Plain attention is
+    unaffected: it only ever issues one flex_attention call per layer.
+
 These are slow (each compiles), so they're marked and kept few.
 """
 
@@ -74,6 +86,36 @@ def test_doc_masking_compiles_for_train_and_eval(grad_checkpoint, streams):
     compiled.eval()
     with torch.no_grad():
         assert compiled(ids).logits.shape == (2, 64, TINY_VOCAB)
+
+
+@slow
+@requires_cuda
+def test_diff_attn_doc_masking_compiles_correctly():
+    """Regression test for the silent-wrong-output bug in this file's docstring: unlike the other
+    tests here, this must compare *values*, not just shapes/crashes — the bug it pins produced a
+    perfectly shaped, perfectly finite, silently wrong tensor. Multiple documents in the batch, so
+    the BlockMask is a real (non-degenerate) mask, not one that happens to reduce to plain causal.
+    """
+    model = _build(use_diff_attn=True, loop_count=2)
+    ids = torch.randint(0, TINY_VOCAB, (2, 64), device="cuda")
+    ids[:, 20] = 5  # eos_id, matching _build's fixed eos_id — forces real document boundaries
+    ids[:, 45] = 5
+
+    model.eval()
+    with torch.no_grad():
+        eager_out = model(ids).logits
+
+    compiled = torch.compile(model)
+    with torch.no_grad():
+        compiled_out = compiled(ids).logits
+
+    torch.testing.assert_close(eager_out, compiled_out, rtol=2e-2, atol=2e-2)
+
+    compiled.train()
+    out = compiled(ids)
+    out.logits.float().square().mean().backward()
+    dead = [name for name, p in compiled.named_parameters() if p.grad is None]
+    assert not dead
 
 
 @slow

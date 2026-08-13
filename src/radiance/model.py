@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import math
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
@@ -99,6 +100,44 @@ def _flex_attention():
     if _FLEX_ATTENTION is None:
         _FLEX_ATTENTION = torch.compile(flex_attention, dynamic=False)
     return _FLEX_ATTENTION
+
+
+@torch._dynamo.disable
+def _diff_flex_attention(
+    q1: torch.Tensor,
+    k1: torch.Tensor,
+    q2: torch.Tensor,
+    k2: torch.Tensor,
+    v: torch.Tensor,
+    block_mask: Any,
+    enable_gqa: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Differential attention's two flex_attention calls, forced out of the enclosing compiled
+    graph — this is a correctness fix, not a defensive measure taken on spec.
+
+    Verified directly: two flex_attention calls sharing one BlockMask, whose Q/K both trace back to
+    a common upstream torch.split (exactly the qkv_proj chunking CausalSelfAttention.forward does
+    for q1/k1/q2/k2), silently diverge from eager once torch.compile traces both into one inductor
+    graph — the second call's output was off by up to ~0.85 absolute against an identical eager
+    forward, with no error or warning. Isolated with a flex_attention-only repro independent of this
+    file (a shared 5-way split feeding two flex_attention calls against one BlockMask); .contiguous()
+    and .clone() on the inputs did not fix it and in some variants made *both* calls wrong instead of
+    just the second, and batching the two calls into one wider flex_attention call over a doubled
+    head dimension was wrong too — so this isn't a fixable data-dependency bug on our side, it's a
+    scheduling assumption flex_attention's inductor lowering makes that this call pattern violates.
+    torch._dynamo.disable forces a graph break here, so each call instead goes through
+    _flex_attention()'s eager branch (a separately compiled, cached flex_attention) rather than
+    being lowered as part of the model's single big graph — confirmed bit-identical to eager this
+    way, backward included. Plain (non-differential) attention is unaffected: it only ever issues
+    one flex_attention call per forward, which was already proven correct under compile.
+
+    Re-verify this is still needed after any PyTorch upgrade (a torch.compile.disable that turns out
+    unnecessary just costs a graph break, but silently trusting the compiled path here again without
+    re-checking would reintroduce exactly the wrong-output bug this exists to avoid).
+    """
+    a1 = _flex_attention()(q1, k1, v, block_mask=block_mask, enable_gqa=enable_gqa)
+    a2 = _flex_attention()(q2, k2, v, block_mask=block_mask, enable_gqa=enable_gqa)
+    return a1, a2
 
 
 def document_ids(input_ids: torch.Tensor, eos_id: int) -> torch.Tensor:
@@ -399,11 +438,16 @@ class HyperConnection(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, cfg: ModelConfig, is_first: bool = False, n_variants: int = 1):
+    def __init__(self, cfg: ModelConfig, is_first: bool = False, n_variants: int = 1, block_index: int = 0):
         """is_first marks blocks[0], which is always called with v_first=None (it is the block that
         *produces* v_first). Its value-residual mix would therefore never be exercised, so the
         parameter isn't created at all — otherwise it would sit in the optimizer forever collecting
-        no gradient."""
+        no gradient.
+
+        block_index is this block's structural position (0 for blocks[0], 1.. for the loop body's
+        weight-shared position) — only consumed by cfg.use_diff_attn, for its depth-dependent
+        lambda_init. The shared loop body uses one fixed value for its position, not a per-iteration
+        one (contrast loop_iter_conditioning, which does vary by iteration)."""
         super().__init__()
         assert cfg.d_model % cfg.n_heads == 0
         assert cfg.head_dim % 2 == 0, "model.head_dim must be even for RoPE's pairwise rotation"
@@ -416,10 +460,46 @@ class CausalSelfAttention(nn.Module):
         self.out_proj = nn.Linear(cfg.d_model, cfg.d_model)
         self.dropout = cfg.dropout
 
+        # Differential Attention (Ye et al. 2024, see cfg.use_diff_attn): reinterprets qkv_proj's
+        # existing Q/K chunks as two half-head_dim-wide pairs (Q1/K1, Q2/K2) instead of one
+        # full-width pair — two half-width heads sum back to the same total width, so qkv_proj's
+        # shape above is completely unaffected by this branch. Only four small per-layer vectors
+        # and a per-head output norm are new parameters.
+        self.use_diff_attn = cfg.use_diff_attn
+        if self.use_diff_attn:
+            assert cfg.head_dim % 4 == 0, (
+                "model.use_diff_attn splits each head's Q/K into two head_dim//2-wide branches, and "
+                "RoPE's pairwise rotation then needs that half-width to itself be even — "
+                "model.head_dim must be a multiple of 4. (DenseTransformer also validates this with "
+                "a friendlier message; this assert is a defensive backstop for direct construction.)"
+            )
+            diff_head_dim = self.head_dim // 2
+            self.diff_lambda_q1 = nn.Parameter(torch.randn(diff_head_dim) * 0.1)
+            self.diff_lambda_k1 = nn.Parameter(torch.randn(diff_head_dim) * 0.1)
+            self.diff_lambda_q2 = nn.Parameter(torch.randn(diff_head_dim) * 0.1)
+            self.diff_lambda_k2 = nn.Parameter(torch.randn(diff_head_dim) * 0.1)
+            # lambda_init(l) = 0.8 - 0.6*exp(-0.3*(l-1)), l the 1-indexed layer position (paper);
+            # block_index is already 0-indexed so it *is* (l - 1). A fixed Python float, not a
+            # buffer/parameter — it never changes after construction, so torch.compile specializes
+            # on it like any other constant instead of treating it as a dynamic input.
+            self.diff_lambda_init = 0.8 - 0.6 * math.exp(-0.3 * block_index)
+            # Paper: rescale the normalized, differenced output by (1 - lambda_init) to roughly
+            # match plain softmax attention's output variance (a difference of two positively
+            # correlated distributions has lower variance than either alone).
+            self.diff_out_scale = 1.0 - self.diff_lambda_init
+            # Per-head normalization before concatenation. The paper uses a non-parametric
+            # GroupNorm; this reuses the file's existing learnable RMSNorm instead, consistent with
+            # how qk_norm already reuses it elsewhere — flagged in CLAUDE.md as worth sanity-checking
+            # empirically against the paper's version rather than assumed equivalent.
+            self.diff_norm = RMSNorm(self.head_dim)
+
         self.qk_norm = cfg.qk_norm
         if self.qk_norm:
-            self.q_norm = RMSNorm(self.head_dim)
-            self.k_norm = RMSNorm(self.head_dim)
+            # Differential attention's Q1/K1/Q2/K2 are head_dim//2 wide; qk_norm applies the same
+            # (shared) norm module to both branches rather than doubling to four modules.
+            qk_norm_dim = (self.head_dim // 2) if self.use_diff_attn else self.head_dim
+            self.q_norm = RMSNorm(qk_norm_dim)
+            self.k_norm = RMSNorm(qk_norm_dim)
 
         # Learned mix between this block's values and blocks[0]'s (see cfg.value_residual). A bare
         # scalar, so it lands in the optimizer's no-decay group alongside the norm gains — decaying
@@ -460,27 +540,52 @@ class CausalSelfAttention(nn.Module):
         if self.qkv_lora is not None:
             qkv = qkv + self.qkv_lora(x, ctx.variant)
         kv_dim = self.n_kv_heads * self.head_dim
-        q, k, v = qkv.split([d_model, kv_dim, kv_dim], dim=-1)
-        q = q.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+
+        if self.use_diff_attn:
+            d = self.head_dim // 2
+            q_half, k_half = d_model // 2, kv_dim // 2
+            q1, q2, k1, k2, v = qkv.split([q_half, q_half, k_half, k_half, kv_dim], dim=-1)
+            q1 = q1.view(batch, seq_len, self.n_heads, d).transpose(1, 2)
+            q2 = q2.view(batch, seq_len, self.n_heads, d).transpose(1, 2)
+            k1 = k1.view(batch, seq_len, self.n_kv_heads, d).transpose(1, 2)
+            k2 = k2.view(batch, seq_len, self.n_kv_heads, d).transpose(1, 2)
+            v = v.view(batch, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        else:
+            q, k, v = qkv.split([d_model, kv_dim, kv_dim], dim=-1)
+            q = q.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+            k = k.view(batch, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+            v = v.view(batch, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
         v_own = v
         if self.value_residual and v_first is not None:
             # Mixed *before* the kv_cache write below, so cached values are already mixed and
             # generation needs no extra cache slot: within a decode step blocks[0] runs first and
-            # produces this token's v_first, and past tokens' mixed values are already stored.
+            # produces this token's v_first, and past tokens' mixed values are already stored. The
+            # single shared V (differential attention doesn't split V) makes this identical either way.
             lam = self.value_lambda
             v = lam * v + (1.0 - lam) * v_first
 
         if self.qk_norm:
             # Must precede RoPE: RMSNorm's learned per-channel weight is not rotation-invariant,
             # so normalizing after rotation would scale the rotated pairs asymmetrically.
-            q = self.q_norm(q)
-            k = self.k_norm(k)
+            if self.use_diff_attn:
+                q1, k1 = self.q_norm(q1), self.k_norm(k1)
+                q2, k2 = self.q_norm(q2), self.k_norm(k2)
+            else:
+                q = self.q_norm(q)
+                k = self.k_norm(k)
 
-        q = apply_rope(q, cos[None, None, :, :], sin[None, None, :, :])
-        k = apply_rope(k, cos[None, None, :, :], sin[None, None, :, :])
+        if self.use_diff_attn:
+            # cos/sin are already head_dim//2-wide here — DenseTransformer builds self.rope at
+            # head_dim // 2 whenever use_diff_attn is set (V is never rotated, and this is the only
+            # width diff-attention's Q/K ever take), so no separate table is needed.
+            q1 = apply_rope(q1, cos[None, None, :, :], sin[None, None, :, :])
+            k1 = apply_rope(k1, cos[None, None, :, :], sin[None, None, :, :])
+            q2 = apply_rope(q2, cos[None, None, :, :], sin[None, None, :, :])
+            k2 = apply_rope(k2, cos[None, None, :, :], sin[None, None, :, :])
+        else:
+            q = apply_rope(q, cos[None, None, :, :], sin[None, None, :, :])
+            k = apply_rope(k, cos[None, None, :, :], sin[None, None, :, :])
 
         if kv_cache is None:
             is_causal = True
@@ -490,15 +595,39 @@ class CausalSelfAttention(nn.Module):
             # valid for it); an empty cache means this is the initial prefill, which needs the
             # usual triangular mask.
             is_causal = kv_cache.seq_len == 0
-            k, v = kv_cache.write(k, v)
+            if self.use_diff_attn:
+                k1, k2, v = kv_cache.write3(k1, k2, v)
+            else:
+                k, v = kv_cache.write(k, v)
 
-        if ctx.block_mask is not None:
+        enable_gqa = self.n_kv_heads != self.n_heads
+        if self.use_diff_attn:
+            if ctx.block_mask is not None:
+                a1, a2 = _diff_flex_attention(q1, k1, q2, k2, v, ctx.block_mask, enable_gqa)
+            else:
+                dropout_p = self.dropout if self.training else 0.0
+                a1 = F.scaled_dot_product_attention(
+                    q1, k1, v, dropout_p=dropout_p, is_causal=is_causal, enable_gqa=enable_gqa
+                )
+                a2 = F.scaled_dot_product_attention(
+                    q2, k2, v, dropout_p=dropout_p, is_causal=is_causal, enable_gqa=enable_gqa
+                )
+            # lambda reparameterized as exp(dot) - exp(dot) + lambda_init rather than a bare
+            # parameter: at init the two exp(dot) terms nearly cancel (small random lambda_q/k),
+            # so lambda starts near lambda_init in expectation while the four vectors above still
+            # get a real (nonzero) gradient — the same "moves off zero from step 1" cold start
+            # loop_input_injection's W_inj relies on, not a dead-parameter risk.
+            lam = (
+                torch.exp((self.diff_lambda_q1 * self.diff_lambda_k1).sum())
+                - torch.exp((self.diff_lambda_q2 * self.diff_lambda_k2).sum())
+                + self.diff_lambda_init
+            )
+            attn_out = self.diff_norm(a1 - lam * a2) * self.diff_out_scale
+        elif ctx.block_mask is not None:
             # No dropout_p here: flex_attention has no attention-weight dropout. See
             # DenseTransformer._doc_masks, which warns once when a config combines
             # doc_attention_mask with a nonzero dropout. The FFN's residual dropout is unaffected.
-            attn_out = _flex_attention()(
-                q, k, v, block_mask=ctx.block_mask, enable_gqa=(self.n_kv_heads != self.n_heads)
-            )
+            attn_out = _flex_attention()(q, k, v, block_mask=ctx.block_mask, enable_gqa=enable_gqa)
         else:
             attn_out = F.scaled_dot_product_attention(
                 q,
@@ -506,7 +635,7 @@ class CausalSelfAttention(nn.Module):
                 v,
                 dropout_p=self.dropout if self.training else 0.0,
                 is_causal=is_causal,
-                enable_gqa=(self.n_kv_heads != self.n_heads),
+                enable_gqa=enable_gqa,
             )
         attn_out = attn_out.transpose(1, 2)  # (batch, seq_len, n_heads, head_dim)
         if self.attn_out_gate:
@@ -517,8 +646,10 @@ class CausalSelfAttention(nn.Module):
             attn_out = attn_out * gate.unsqueeze(-1)
         attn_out = attn_out.contiguous().view(batch, seq_len, d_model)
         # k/v here are the full-length post-RoPE tensors (after any cache concat), which is exactly
-        # the shape the sparse path's retained store needs.
-        recorded = (k, v) if ctx.record_kv else None
+        # the shape the sparse path's retained store needs. Never populated for diff attention —
+        # ctx.record_kv only ever fires from ACT's sparse path, which use_diff_attn is validated
+        # against combining with (see DenseTransformer.__init__).
+        recorded = None if self.use_diff_attn else ((k, v) if ctx.record_kv else None)
         return self.out_proj(attn_out), v_own, recorded
 
     def forward_sparse(
@@ -1037,7 +1168,7 @@ class TransformerBlock(nn.Module):
         # n_variants > 1 only for the loop body (blocks[1:]), which is the part that repeats;
         # blocks[0] runs exactly once per forward so it has nothing to be conditioned on.
         self.ln1 = RMSNorm(cfg.d_model, n_variants=n_variants)
-        self.attn = CausalSelfAttention(cfg, is_first=is_first, n_variants=n_variants)
+        self.attn = CausalSelfAttention(cfg, is_first=is_first, n_variants=n_variants, block_index=block_index)
         self.ln2 = RMSNorm(cfg.d_model, n_variants=n_variants)
         self.ffn = MoEFeedForward(cfg) if use_moe_ffn else FeedForward(cfg, n_variants=n_variants)
 
@@ -1100,10 +1231,15 @@ class KVCache:
     Slot assignment is implicit call order, not an explicit index: begin_step() resets the
     cursor at the top of a forward call, and each write() claims the next slot. This only works
     because block execution order is identical on every call (never data-dependent).
+
+    write3() is differential attention's variant, caching K1/K2/a single shared V instead of one
+    K/V pair — still exactly one call (and one slot) per CausalSelfAttention.forward invocation,
+    since V is never split between the two attention branches, so slot *count* is unaffected.
     """
 
     def __init__(self, num_slots: int):
         self._k: list[torch.Tensor | None] = [None] * num_slots
+        self._k2: list[torch.Tensor | None] = [None] * num_slots
         self._v: list[torch.Tensor | None] = [None] * num_slots
         self._cursor = 0
         self.seq_len = 0
@@ -1120,6 +1256,19 @@ class KVCache:
             self._k[slot] = torch.cat([self._k[slot], k], dim=2)
             self._v[slot] = torch.cat([self._v[slot], v], dim=2)
         return self._k[slot], self._v[slot]
+
+    def write3(
+        self, k1: torch.Tensor, k2: torch.Tensor, v: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        slot = self._cursor
+        self._cursor += 1
+        if self._k[slot] is None:
+            self._k[slot], self._k2[slot], self._v[slot] = k1, k2, v
+        else:
+            self._k[slot] = torch.cat([self._k[slot], k1], dim=2)
+            self._k2[slot] = torch.cat([self._k2[slot], k2], dim=2)
+            self._v[slot] = torch.cat([self._v[slot], v], dim=2)
+        return self._k[slot], self._k2[slot], self._v[slot]
 class ACTRouter(nn.Module):
     """Per-token halting-probability head for ACT (Graves 2016) adaptive looping.
 
@@ -1442,8 +1591,31 @@ class DenseTransformer(nn.Module):
         self.eos_id = eos_id
         self._warned_dropout_with_flex = False
         self._warned_head_dim = False
+
+        # Checked here, before any block is constructed, so this raises the friendlier message
+        # below instead of CausalSelfAttention.__init__'s bare assert (same condition, kept there
+        # too as a defensive backstop for anyone constructing CausalSelfAttention directly).
+        if cfg.use_diff_attn and cfg.head_dim % 4 != 0:
+            raise ValueError(
+                "model.use_diff_attn splits each head's Q/K into two head_dim//2-wide branches, and "
+                f"RoPE's pairwise rotation then needs that half-width to itself be even — "
+                f"model.head_dim ({cfg.head_dim}) must be a multiple of 4."
+            )
+        if cfg.use_diff_attn and cfg.act_capacity_ratio < 1.0:
+            raise ValueError(
+                "model.use_diff_attn is incompatible with model.act_capacity_ratio < 1.0: ACT's "
+                "sparse path (CausalSelfAttention.forward_sparse) has no differential-attention "
+                "variant yet. Set act_capacity_ratio: 1.0 or use_diff_attn: false."
+            )
+
         self.token_emb = nn.Embedding(vocab_size, cfg.d_model)
-        self.rope = RotaryEmbedding(cfg.head_dim, cfg.max_seq_len, cfg.rope_theta)
+        # Differential attention's Q/K live at head_dim // 2 (V is never rotated, and nothing else
+        # in the model consumes self.rope's output), so build the table at that width directly
+        # rather than building a full-width one and slicing it — RoPE's frequency spacing depends
+        # on head_dim itself, so a slice of the full-width table is a *different*, wrong rotation,
+        # not a valid subset of one built for the halved width.
+        rope_head_dim = cfg.head_dim // 2 if cfg.use_diff_attn else cfg.head_dim
+        self.rope = RotaryEmbedding(rope_head_dim, cfg.max_seq_len, cfg.rope_theta)
         self.dropout = nn.Dropout(cfg.dropout)
 
         # blocks[0] always stays dense (it runs once per forward, not part of the recursive loop
@@ -1670,12 +1842,17 @@ class DenseTransformer(nn.Module):
         # flex_attention's compiled kernel requires head_dim >= 16. Real configs use 64, but the
         # tiny models used for sanity checks can go below it, and the failure mode is an
         # InductorError raised from deep inside the compiler rather than anything actionable.
-        if self.cfg.head_dim < _FLEX_MIN_HEAD_DIM:
+        # Differential attention calls flex_attention at head_dim // 2 (its Q1/K1/Q2/K2 width), not
+        # the full head_dim, so the threshold has to apply to whichever width actually reaches it.
+        effective_head_dim = self.cfg.head_dim // 2 if self.cfg.use_diff_attn else self.cfg.head_dim
+        if effective_head_dim < _FLEX_MIN_HEAD_DIM:
             if not self._warned_head_dim:
                 print(
                     f"[radiance] note: model.doc_attention_mask is off for this run — "
-                    f"flex_attention requires head_dim >= {_FLEX_MIN_HEAD_DIM}, but "
-                    f"model.head_dim={self.cfg.head_dim}. Falling back to plain causal attention."
+                    f"flex_attention requires head_dim >= {_FLEX_MIN_HEAD_DIM}, but the effective "
+                    f"attention head_dim is {effective_head_dim} "
+                    f"({'model.head_dim // 2 under use_diff_attn' if self.cfg.use_diff_attn else 'model.head_dim'}"
+                    f"={self.cfg.head_dim}). Falling back to plain causal attention."
                 )
                 self._warned_head_dim = True
             return False
@@ -2125,6 +2302,14 @@ class DenseTransformer(nn.Module):
         # reduced (d_model-wide) sublayer input and so are unaffected.
         streams = self.hyper_streams
         stream_units = 2 * streams * cfg.d_model if streams > 1 else 0
+        # Differential attention (cfg.use_diff_attn) computes a second softmax attention branch —
+        # its own rotated q2/k2, its own attention-output tensor, plus diff_norm's activations —
+        # on top of everything plain attention already retains. Measured directly (peak allocated
+        # memory, fwd+bwd, bf16, diff on vs off, delta divided out by n_layers/batch/seq/dtype-width
+        # so it's comparable to the 10 * d_model figure below): the extra cost is ~7 * d_model per
+        # token per block, consistently across d_model in {512, 1024} (6.99-7.00x) and stable across
+        # batch/seq_len shapes — not guessed from the two-branch structure a priori.
+        attn_unit_cost = 17 * cfg.d_model if cfg.use_diff_attn else 10 * cfg.d_model
 
         def ffn_units(block: TransformerBlock) -> float:
             if isinstance(block.ffn, MoEFeedForward):
@@ -2136,8 +2321,8 @@ class DenseTransformer(nn.Module):
                 return routed + shared + cfg.n_experts
             return (depth + 1) * cfg.ffn_dim
 
-        block0_units = 10 * cfg.d_model + stream_units + ffn_units(self.blocks[0])
-        loop_body_units = sum(10 * cfg.d_model + stream_units + ffn_units(b) for b in self.blocks[1:])
+        block0_units = attn_unit_cost + stream_units + ffn_units(self.blocks[0])
+        loop_body_units = sum(attn_unit_cost + stream_units + ffn_units(b) for b in self.blocks[1:])
         loop_multiplier = cfg.loop_multiplier
         if cfg.act_capacity_ratio < 1.0:
             # Sparse ACT: the first and last iterations run dense, the interior ones over only
@@ -2158,7 +2343,7 @@ class DenseTransformer(nn.Module):
             # recomputing whichever single block is largest.
             n_blocks_executed = 1 + loop_multiplier * (cfg.n_layers - 1)
             largest_block_units = max(
-                [block0_units] + [10 * cfg.d_model + stream_units + ffn_units(b) for b in self.blocks[1:]]
+                [block0_units] + [attn_unit_cost + stream_units + ffn_units(b) for b in self.blocks[1:]]
             )
             # The tensor surviving at each block boundary is the residual stream, so it is
             # streams * d_model wide rather than d_model.

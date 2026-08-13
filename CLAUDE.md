@@ -293,6 +293,78 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   not cache memory). See the git history for the removed `configs/tinystories_nsa.yaml` worked example, and the
   "Measured results" section below for why it wasn't (yet) a win at this scale.
 
+  **`cfg.model.use_diff_attn` (opt-in, default `False`) is Differential Attention** (Ye et al. 2024,
+  "Differential Transformer"): each head computes *two* softmax attention maps at half `head_dim` each and takes
+  a learned difference, `(A1 - λ·A2) @ V`, which cancels the common-mode "attention noise" the two branches
+  share — the same trick a differential amplifier uses. It sits in the same category NSA does: a structural
+  attention variant with no zero/identity init that reduces it to plain attention's *computation*, so it follows
+  the `use_moe`/`use_router`/`n_kv_heads` precedent (opt-in, evaluated by A/B) rather than this file's usual
+  default-on convention — unlike NSA, though, **the A/B says yes** (see "Measured results").
+
+  The two branches are **not** two extra projections: `qkv_proj`'s existing output width is unchanged. A normal
+  head's Q/K is `head_dim` wide; a differential head instead splits into `Q1`/`Q2` and `K1`/`K2` at `head_dim // 2`
+  each, and two `head_dim // 2`-wide heads sum back to exactly the width one `head_dim`-wide head had — so
+  `qkv_proj`'s total output width (`d_model + 2 * kv_dim`) is identical either way, and the reshape in
+  `CausalSelfAttention.forward` is just a different way of chunking the same tensor. `head_dim % 2 == 0` is
+  already asserted for RoPE's pairwise rotation on the *full* width; splitting to `head_dim // 2` needs that
+  half-width to itself be even, so `use_diff_attn` requires **`head_dim % 4 == 0`** — checked twice, once as a
+  friendly `ValueError` at the top of `DenseTransformer.__init__` (before any block is constructed) and once as
+  a defensive `assert` in `CausalSelfAttention.__init__` for anyone constructing it directly; the assert alone
+  would have fired first with a worse message, since `DenseTransformer.__init__` builds `blocks[0]` before it
+  used to reach its own checks — this is why the guard was moved to the very top of `__init__`.
+
+  `λ` is reparameterized as `exp(λ_q1·λ_k1) − exp(λ_q2·λ_k2) + λ_init(l)` (four small learnable vectors, shape
+  `(head_dim // 2,)`, normal init std 0.1, one set per block — not per loop iteration; `blocks[1:]`'s shared
+  loop body uses one fixed `λ_init` for its structural position, the same way `value_lambda` has no per-iteration
+  variant). `λ_init(l) = 0.8 − 0.6·exp(−0.3·(l−1))`, keyed off each block's `block_index` (already 0-indexed, so
+  it *is* `l − 1`) — the paper's formula, giving deeper layers a stronger starting noise-cancellation term. This
+  is not a dead-parameter risk despite `λ`'s two `exp(dot)` terms nearly cancelling at init (small random
+  vectors): the four vectors still get a real gradient from step 0, and `λ` itself only starts moving once they
+  do — the same one-step cold start `loop_input_injection`'s zero-init `W_inj` already relies on. A per-head
+  RMSNorm (`diff_norm`, reusing the file's existing `RMSNorm` rather than the paper's non-parametric GroupNorm —
+  a deliberate deviation to stay consistent with how `qk_norm` already reuses it, not yet checked against the
+  paper's version in isolation) normalizes `A1 − λ·A2` before a fixed `(1 − λ_init)` rescale and the usual
+  `attn_out_gate`/`out_proj` tail, which is otherwise completely unaffected — the diff and non-diff branches
+  produce identically-shaped `(batch, n_heads, seq, head_dim)` tensors before that point. `qk_norm`, when also
+  enabled, applies the *same* `q_norm`/`k_norm` modules (now at width `head_dim // 2`) to both branches rather
+  than doubling to four; value residual mixing is unaffected entirely, since `V` is never split between branches.
+
+  **KVCache gained a second write path, `write3`, rather than a second slot per call.** Differential attention
+  needs to cache `K1`, `K2`, and one shared `V` — three tensors — but this is still exactly one
+  `CausalSelfAttention.forward` call per (block, iteration) pair, so slot *count* (`new_kv_cache`'s
+  `1 + loop_multiplier * (n_layers - 1)` formula) is untouched; only what one slot holds changes. `write3` mirrors
+  `write`'s implicit-call-order/concat-on-refill logic for the extra tensor. Verified exactly like the rest of
+  the KV-cache matrix: `tests/test_kv_cache.py`'s `MODES` gained `diff_attn`/`diff_attn_gqa` entries, both passing
+  `test_incremental_decode_matches_full_forward` and `test_cache_slot_count_matches_attention_calls`.
+
+  **A real `torch.compile` correctness bug was found and fixed while building this, and it is exactly the kind
+  `tests/test_compile.py` exists to catch.** Two `flex_attention` calls per layer (one per branch) sharing one
+  reused `BlockMask`, whose Q/K both trace back to one `torch.split` of `qkv_proj`'s output, silently diverged
+  from eager once inductor traced both into one graph — no error, no warning, up to ~0.85 absolute logit
+  difference on a toy shape, isolated with a minimal repro independent of this codebase. `.contiguous()` and
+  `.clone()` on the inputs did not fix it (and in some variants made *both* calls wrong instead of just the
+  second); batching the two calls into one wider `flex_attention` call over a doubled head dimension was wrong
+  too. The fix, `_diff_flex_attention` (`model.py`), is marked `@torch._dynamo.disable` for a different reason
+  than `_doc_masks` carries the same annotation (that one is about an unlowerable data-dependent tensor; this one
+  is an inductor scheduling assumption that two flex_attention calls sharing a BlockMask and split-provenance
+  inputs violate) but the same mechanism: forcing a graph break routes each call through `_flex_attention()`'s
+  eager branch — a separately compiled, cached `flex_attention` — instead of being lowered as part of the model's
+  one big graph, which measured bit-identical to eager (backward included). Plain attention is unaffected: it
+  only ever issues one `flex_attention` call per layer, already proven correct under compile.
+  `tests/test_compile.py::test_diff_attn_doc_masking_compiles_correctly` pins this — deliberately comparing
+  *values*, not just shapes or crash-freedom, since the bug produced a perfectly-shaped, perfectly-finite,
+  silently wrong tensor that every shape/gradient test in `tests/test_diff_attention.py` passed the whole time.
+  Re-verify this is still needed after any future PyTorch upgrade rather than assuming it's permanent.
+
+  `cfg.model.act_capacity_ratio < 1.0` is incompatible with `use_diff_attn` and raises — `forward_sparse` (ACT's
+  gathered-position path) has no differential-attention variant yet, matching how NSA was scoped against ACT
+  sparsity before removal. `activation_bytes_per_token` bills differential attention at `17 * d_model` per token
+  per block instead of plain attention's `10 * d_model` — measured directly (peak allocated memory, fwd+bwd,
+  bf16, diff on vs. off, delta divided out by layer count/batch/seq/dtype width), not guessed from the two-branch
+  structure: the extra `~7 * d_model` held consistently (6.99-7.00x) across `d_model` in `{512, 1024}` and across
+  batch/seq_len shapes, though a smaller `d_model: 256` run showed more noise (7.99x) — trust the larger,
+  more-stable measurements. See `configs/tinystories_diff_attn.yaml` for a worked example.
+
   Several `ModelConfig`/`TrainConfig` fields are stored as ratios rather than absolute values and expose the
   absolute quantity as a read-only derived property of the same name minus the ratio suffix, so the rest of the
   codebase (and `vars(cfg.model)`/`vars(cfg.train)` used for W&B logging) never needs to distinguish the two:
@@ -1088,6 +1160,44 @@ yet real. Worth re-running at a longer `max_seq_len` before drawing a final conc
 for its own approximation error, and this A/B measured quality only, not the compute saving that's NSA's other
 selling point at genuinely long context. The feature has since been removed from the codebase (see above).
 
+**Differential Attention (`use_diff_attn`) is the first attention-mechanism change in this repo that measured
+as a genuine win, not a neutral-or-negative result to record and move past.** Two A/Bs, both on TinyStories,
+`d_model: 256`/`head_dim: 64`/`n_layers: 6`/`loop_count: 1` (dense, no loop confound), pinned `batch_size: 32`,
+`auto_batch_size: false`, `lr: 1.0e-2`, `dropout: 0.0`, 3000 steps — deliberately not 400: the shorter horizon
+several other entries on this page use is a real risk here too, since an arm can rank differently at step 400
+than at step 1500+ once the LR schedule is far enough into its decay, so a longer run is the safer default absent
+a specific reason to trust a short one — with a *second* baseline run at the same config first, to establish this
+setup's own noise floor rather than borrow one measured elsewhere:
+
+| arm | step 200 | 400 | 600 | 1000 | 1400 | 1800 | 2200 | 2600 | 3000 |
+|---|---|---|---|---|---|---|---|---|---|
+| dense baseline (run 1) | 2.7611 | 2.3744 | 2.2227 | 1.9959 | 1.8782 | 1.7884 | 1.7164 | 1.6574 | 1.6283 |
+| dense baseline (run 2, re-run) | 2.7627 | 2.3824 | 2.2254 | 1.9944 | 1.8754 | 1.7866 | 1.7161 | 1.6568 | **1.6278** |
+| dense + `use_diff_attn` | 2.8295 | 2.3830 | 2.2222 | 1.9848 | 1.8677 | 1.7798 | 1.7046 | 1.6492 | **1.6203** |
+| MoE baseline (`n_experts: 8`, `top_k: 2`) | 2.6701 | 2.3178 | 2.1770 | 1.9495 | 1.8300 | 1.7385 | 1.6570 | 1.5976 | 1.5662 |
+| MoE + `use_diff_attn` | 2.7462 | 2.3111 | 2.1676 | 1.9405 | 1.8192 | 1.7271 | 1.6473 | 1.5890 | **1.5572** |
+
+Reading this the same way every other table on this page is read: the two baseline runs (identical config,
+different process) establish a noise floor around **0.0005-0.003** at these later steps — consistent with the
+~0.002 floor measured elsewhere in this file. Differential attention starts out clearly *worse* — step 200 is
+0.067 behind the dense baseline, a real early-training disadvantage from the two branches needing time to
+specialize — but from roughly step 600 on it is ahead at every remaining eval point, by **0.008-0.012**, 5-20x
+the noise floor, both in isolation and layered onto MoE (already one of this file's own proven wins — see
+`moe_balance`/`moe_n_shared` under "five settings [that] change results at their defaults" in `config.py`'s
+description) — the two effects add rather than one washing out the other. This is not free: compiled fwd+bwd
+step time on this shape measured **1.34x** (50.0ms -> 66.8ms), and `activation_bytes_per_token` bills it at
+`17 * d_model` vs. `10 * d_model` (see "Architecture" above), so it is not a candidate for defaulting on even
+though the quality result is positive — same category as `use_moe`, a real feature to reach for deliberately,
+not a free win.
+
+**What hasn't been checked, stated plainly rather than left implicit: a fixed-*compute* verdict.** Every number
+above is fixed-*step*, and the hyper-connections writeup below warns that a 1.3-1.4x step-time cost can
+plausibly erase a fixed-step win once compared at equal wall-clock — a rough extrapolation of the dense
+baseline's late-run improvement rate suggests it's genuinely unclear which way this one goes, not confidently
+either way. Re-run at equal compute (i.e. give the baseline arm ~1.34x the steps) before treating this as
+settled, and re-verify at `fineweb_500m.yaml` width — like every A/B on this page, these numbers are
+TinyStories-scale only.
+
 **Hyper-connections (`hyper_conn_streams`) do not pay for themselves at this scale, and the interesting result
 is the learning rate rather than the architecture.** A/B on the looped shape they are aimed at — `d_model: 256`,
 `n_layers: 4`, `loop_count: 6` (19 executed blocks), pinned `batch_size: 16`, `auto_batch_size: false`,
@@ -1255,6 +1365,14 @@ inductor's FX graph cache makes later configurations look far cheaper than they 
 - Sparse attention: `model.use_nsa` has been removed from the codebase. See the "Architecture" section above
   for the removal rationale and git history for the former `configs/tinystories_nsa.yaml` example. Not currently a win
   at TinyStories scale (see "Measured results"); a candidate for a longer-context follow-up A/B if re-introduced.
+- Changing the attention *mechanism* itself (not just what feeds it, like GQA, or what gates it, like
+  `attn_out_gate`): `use_diff_attn` is the reference example. Two things made it tractable rather than a rewrite —
+  reusing `qkv_proj`'s existing output width by re-chunking rather than adding projections (check whether a new
+  mechanism's Q/K/V shapes can be expressed as a different split of the same total width before reaching for new
+  `nn.Linear`s), and treating `KVCache` as extensible (`write3` alongside `write`) rather than forcing a new
+  mechanism's cache shape through the existing two-tensor API. And run the *compiled* forward against eager before
+  trusting either — see the `torch._dynamo.disable` fix and its regression test in `tests/test_compile.py`, which
+  caught a real inductor bug that every eager test in `tests/test_diff_attention.py` passed straight through.
 - New training behavior (e.g. different scheduler, mixed precision): changes belong in `train.py`; keep the loop
   step-based and keep config-driven values in `TrainConfig` rather than hardcoding. A new *optimizer* belongs in
   `optim.py` — add it to `build_optimizer` and give it a `build_*_param_groups`; `MuonWithAuxAdam` is the

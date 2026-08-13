@@ -39,6 +39,18 @@ class ModelConfig:
     attn_out_gate: bool = True  # per-head sigmoid gate on the attention output before out_proj.
     # Written as 2 * sigmoid(Linear(x)) with the Linear zero-initialised, so the gate is exactly
     # 1.0 at init (a plain sigmoid cannot reach 1) and the model starts identical to an ungated one.
+    use_diff_attn: bool = False  # opt-in: Differential Attention (Ye et al. 2024) — each head
+    # computes two softmax attention maps at half head_dim each (Q1K1, Q2K2) and takes a learned
+    # difference (A1 - lambda*A2) @ V, which cancels common-mode "attention noise" the two maps
+    # share. Reuses qkv_proj's existing width unchanged (two half-width Q heads sum back to
+    # d_model, two half-width K heads sum back to kv_dim), so this is not a FLOP/param increase on
+    # the projection — only how its output is chunked changes. Unlike qk_norm/value_residual/
+    # attn_out_gate there is no zero/identity init under which this reduces to the same
+    # *computation* as standard attention (splitting head_dim is structural), so — like use_moe/
+    # use_router/n_kv_heads, and like the removed use_nsa — it is opt-in and evaluated by A/B
+    # rather than defaulted on. Requires head_dim % 4 == 0 (each branch's head_dim // 2 must itself
+    # be even for RoPE's pairwise rotation) and is incompatible with act_capacity_ratio < 1.0 (no
+    # sparse/gathered variant of this attention path yet) — both raise in DenseTransformer.__init__.
     mtp_heads: int = 1  # multi-token prediction: how many future tokens each position predicts.
     # 1 (default) is ordinary next-token prediction — exactly the previous behavior. Higher values
     # add auxiliary heads predicting t+2, t+3, ... which densifies the training signal per token

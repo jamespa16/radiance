@@ -1,0 +1,45 @@
+run_name: tinystories-dense-transformer-diff-attn
+
+data:
+  dataset: roneneldan/TinyStories
+  text_column: text
+  tokenizer: gpt2
+  seq_len: 512
+  num_workers: 4
+  cache_dir: .cache/radiance/tokenized
+
+model:
+  d_model: 256
+  head_dim: 64
+  n_layers: 6
+  loop_count: 1
+  use_diff_attn: true # Differential Attention (Ye et al. 2024) — see CLAUDE.md's Architecture
+  # section. Requires head_dim % 4 == 0 (64 here, fine) and is incompatible with
+  # act_capacity_ratio < 1.0.
+  ffn_mult: 4.0
+  ffn_depth: 3
+  dropout: 0.03
+  max_seq_len: 512
+
+train:
+  batch_size: 32
+  auto_batch_size: false # pinned for a clean A/B against tinystories.yaml — see CLAUDE.md's
+  # "Measured results" cautions about auto_batch_size silently handing one arm a bigger batch.
+  lr: 3.0e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.2
+  max_steps: 1000
+  grad_clip: 1.0
+  log_every: 10
+  eval_every: 50
+  save_every: 100
+  output_dir: checkpoints/tinystories/diff_attn
+  seed: 42
+  device: auto
+  compile: true
+  dtype: bf16
+
+wandb:
+  project: radiance
+  entity: null
+  mode: online
