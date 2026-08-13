@@ -371,6 +371,11 @@ class TrainConfig:
     # relaunched with the same config unchanged). Restores model + optimizer moments + LR schedule +
     # GradScaler, so the run continues rather than restarting AdamW from zero momentum at warmup LR.
     # The DataLoader position is *not* restored — a resumed run revisits some examples. None = fresh run.
+    init_from: str | None = None  # opt-in: path to a checkpoint to seed *model weights only* from,
+    # for starting a new run (e.g. SFT) on top of a previously trained model. Unlike resume_from,
+    # the optimizer/scheduler/step are NOT restored — this run gets a fresh optimizer/scheduler
+    # from its own TrainConfig and starts at step 0. Ignored whenever resume_from finds a
+    # checkpoint (resuming an interrupted run of *this* config takes priority). None = fresh init.
     seed: int = 42
     device: str = "auto"
     compile: bool = True
@@ -413,12 +418,42 @@ class WandbConfig:
 
 
 @dataclass
+class SFTConfig:
+    """Post-training: supervised fine-tuning on chat/instruction data.
+
+    A mode switch, not an inert feature — enabling it swaps the entire data pipeline and loss
+    function, so it follows the use_moe/use_router precedent (explicit opt-in bool) rather than
+    this file's usual default-on-but-inert convention. See train.TrainConfig.init_from for
+    seeding the model from a pretrained checkpoint before this run starts.
+    """
+
+    enabled: bool = False
+    dataset: str | None = None  # HF `user/dataset`-style instruction dataset. Required when enabled.
+    messages_column: str = "messages"  # list[{"role": ..., "content": ...}] per example — the
+    # standard shape for chat-formatted HF datasets (e.g. HuggingFaceH4/no_robots). Ignored if
+    # instruction_column is set instead.
+    instruction_column: str | None = None  # Alpaca-style fallback for datasets with separate
+    input_column: str | None = None  # instruction/input/output columns rather than a messages
+    output_column: str | None = None  # column. When instruction_column is set, a 2-turn
+    # [{"role": "user", ...}, {"role": "assistant", ...}] list is built from these three columns
+    # (input_column may be empty-string per row) instead of reading messages_column.
+    seq_len: int | None = None  # None (default) resolves to data.seq_len, the range-collapsed
+    # inert default this file's convention asks for — packed SFT blocks are the same width as
+    # pretraining blocks unless told otherwise.
+    cache_dir: str = ".cache/radiance/sft"
+    eval_split_size: int = 0  # same semantics as data.eval_split_size, applied to the SFT dataset.
+    user_prefix: str = "\n\nUser: "  # plain text turn markers — not new tokens, so they tokenize
+    assistant_prefix: str = "\n\nAssistant: "  # through the existing vocab with zero model changes.
+
+
+@dataclass
 class Config:
     run_name: str = "radiance-run"
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
+    sft: SFTConfig = field(default_factory=SFTConfig)
 
 
 def resolve_device(device: str) -> str:
@@ -452,4 +487,5 @@ def load_config(path: str) -> Config:
         model=ModelConfig(**raw.get("model", {})),
         train=TrainConfig(**raw.get("train", {})),
         wandb=WandbConfig(**raw.get("wandb", {})),
+        sft=SFTConfig(**raw.get("sft", {})),
     )

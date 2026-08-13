@@ -97,10 +97,24 @@ Only the fields you need to change — everything else falls back to the datacla
 - **`save_every`** — checkpoint every N steps.
 - **`output_dir`** — directory for checkpoints.
 - **`resume_from`** — path to resume from, or `"auto"` for the highest-numbered checkpoint in `output_dir`. Restores weights, optimizer state, LR schedule, and GradScaler.
+- **`init_from`** — path to a checkpoint to seed *model weights only* from (e.g. starting SFT from a pretrained checkpoint); unlike `resume_from`, the optimizer/scheduler/step are not restored, so this run gets a fresh optimizer/scheduler and starts at step 0. Ignored whenever `resume_from` finds a checkpoint. `None` = fresh init.
 - **`seed`** — random seed.
 - **`device`** — `"auto"` (CUDA > MPS > CPU), `"cuda"`, `"mps"`, or `"cpu"`.
 - **`compile`** — enable `torch.compile` on the model.
 - **`dtype`** — precision: `"fp32"`, `"fp16"`, or `"bf16"`. Forward runs under `torch.autocast`; master weights and optimizer stay fp32. `GradScaler` is enabled only for `fp16`.
+
+## sft
+
+Post-training: supervised fine-tuning on chat/instruction data. A mode switch (like `use_moe`/`use_router`), not an inert default-on feature — enabling it swaps `train.py`'s data pipeline and loss function entirely. Pair with `train.init_from` to seed the model from a pretrained checkpoint; see `configs/tinystories_sft.yaml` for a worked example.
+
+- **`enabled`** — route `train.py` through `build_sft_dataloaders`/`compute_sft_loss` instead of the pretrain path. Default `false`.
+- **`dataset`** — HF `user/dataset`-style instruction dataset. Required when `enabled`.
+- **`messages_column`** — column holding `[{"role", "content"}, ...]` chat turns (the standard shape for chat-formatted HF datasets, e.g. `HuggingFaceH4/no_robots`). Ignored if `instruction_column` is set instead.
+- **`instruction_column` / `input_column` / `output_column`** — Alpaca-style fallback for datasets with separate instruction/input/output columns rather than a `messages` column; a 2-turn user/assistant list is built from these instead.
+- **`seq_len`** — packed block width for SFT; `None` resolves to `data.seq_len`.
+- **`cache_dir`** — tokenized+packed cache for the SFT dataset, separate from `data.cache_dir` so it can never collide with a pretrain cache entry.
+- **`eval_split_size`** — same semantics as `data.eval_split_size`, applied to the SFT dataset.
+- **`user_prefix` / `assistant_prefix`** — plain text turn markers (e.g. `"\n\nUser: "` / `"\n\nAssistant: "`) joined onto each turn before tokenizing. Not new special tokens — they tokenize through the existing vocab, so no embedding resize is needed. Assistant turns (and the trailing EOS) are what `compute_sft_loss` scores; user/system turns are masked out of the loss but still attended to causally.
 
 ## wandb
 
@@ -120,6 +134,7 @@ These are not YAML config knobs but command-line flags for `uv run radiance-gene
 - **`--loops N`** — override the checkpoint's loop count for this generation; for models trained with stochastic loop depth this enables test-time compute scaling. Per-iteration parameter banks clamp at their last entry rather than wrapping.
 - **`--device`** — device to run on; default `"auto"`.
 - **`--seed`** — random seed for reproducible generation.
+- **`--chat`** — wrap `--prompt` in the checkpoint's SFT turn template (`sft.user_prefix`/`assistant_prefix`, read back off the checkpoint's saved config) before generating. Requires a checkpoint trained with `sft.enabled: true`.
 
 ## W&B sweep configs
 

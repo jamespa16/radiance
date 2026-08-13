@@ -11,7 +11,7 @@ import wandb
 from torch.optim.lr_scheduler import LambdaLR
 
 from radiance.config import Config, load_config, resolve_device, resolve_dtype
-from radiance.data import build_dataloaders, build_tokenizer
+from radiance.data import build_dataloaders, build_sft_dataloaders, build_tokenizer
 from radiance.model import DenseTransformer, padded_vocab_size
 from radiance.optim import build_optimizer, migrate_optimizer_to_cpu_offload
 
@@ -222,6 +222,36 @@ def find_resume_checkpoint(cfg: Config) -> Path | None:
     return candidates[-1] if candidates else None
 
 
+def load_pretrained_weights(raw_model: DenseTransformer, path: str, cfg: Config, vocab_size: int, device: str) -> None:
+    """Load model weights only from a checkpoint (train.init_from) — no optimizer/scheduler/step.
+
+    The counterpart to find_resume_checkpoint's "continue this exact run" behavior: this seeds a
+    *new* run (e.g. SFT) from a previously trained model's weights, so the caller builds a fresh
+    optimizer/scheduler from its own cfg.train afterward rather than restoring saved ones.
+
+    Checks the checkpoint's saved model shape against this run's cfg.model before touching
+    load_state_dict, since a mismatch there would otherwise surface as an opaque tensor-shape
+    RuntimeError deep inside torch rather than a clear message naming the field that disagrees.
+    """
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    source_cfg = ckpt["config"].model
+    source_vocab = ckpt["model"]["token_emb.weight"].shape[0]
+    mismatches = []
+    if source_vocab != vocab_size:
+        mismatches.append(f"vocab_size: checkpoint={source_vocab}, this run={vocab_size}")
+    for field_name in ("d_model", "n_layers", "head_dim", "n_kv_heads"):
+        source_val, this_val = getattr(source_cfg, field_name), getattr(cfg.model, field_name)
+        if source_val != this_val:
+            mismatches.append(f"model.{field_name}: checkpoint={source_val!r}, this run={this_val!r}")
+    if mismatches:
+        raise ValueError(
+            f"train.init_from={path!r} has an incompatible model shape:\n  "
+            + "\n  ".join(mismatches)
+            + "\ninit_from loads weights into an already-constructed model, so shapes must match exactly."
+        )
+    raw_model.load_state_dict(ckpt["model"])
+
+
 def compute_mtp_loss(
     model: DenseTransformer, mtp_hidden: tuple[torch.Tensor, ...] | None, input_ids: torch.Tensor
 ) -> torch.Tensor:
@@ -314,15 +344,37 @@ def compute_loss(logits: torch.Tensor, input_ids: torch.Tensor) -> tuple[torch.T
     return _nll_and_logz(logits.view(-1, logits.size(-1)), labels.view(-1))
 
 
+def compute_sft_loss(
+    logits: torch.Tensor, input_ids: torch.Tensor, loss_mask: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """SFT analogue of compute_loss: the same causal shift, plus loss_mask shifted the same way
+    and folded into the ignore positions, so only supervised (assistant-turn) tokens are scored.
+
+    loss_mask is 1 at positions data.py's SFT pipeline marked as assistant-turn tokens (or the
+    trailing EOS), 0 at prompt/user-turn tokens. Position i predicts input_ids[i+1], so it should
+    be scored iff *that target* is supervised — i.e. iff loss_mask[i+1] == 1 — which is exactly
+    what shifting loss_mask the same way labels are shifted gives.
+
+    With an all-ones loss_mask this is bit-identical to compute_loss on the same inputs: it's a
+    strict generalization, not a parallel reimplementation, and _nll_and_logz needs no change at
+    all — it already treats -100 generically anywhere in the flat label tensor.
+    """
+    labels = torch.cat([input_ids[:, 1:], input_ids.new_full((input_ids.size(0), 1), -100)], dim=1)
+    shifted_mask = torch.cat([loss_mask[:, 1:], loss_mask.new_zeros((loss_mask.size(0), 1))], dim=1)
+    labels = labels.masked_fill(shifted_mask == 0, -100)
+    return _nll_and_logz(logits.view(-1, logits.size(-1)), labels.view(-1))
+
+
 def build_loss_fn(cfg: Config):
-    """compute_loss, compiled when the run is compiled.
+    """compute_loss (or, under cfg.sft.enabled, compute_sft_loss), compiled when the run is compiled.
 
     Separate from the model's own torch.compile because the loss lives outside DenseTransformer:
     it consumes the (batch, seq, vocab_size) logits the model returns, and that tensor is large
     enough that whether its reductions get fused is worth ~20% of step time on a small-d_model,
     large-vocab config. Tied to cfg.train.compile so the CPU sanity-check path stays eager.
     """
-    return torch.compile(compute_loss) if cfg.train.compile else compute_loss
+    fn = compute_sft_loss if cfg.sft.enabled else compute_loss
+    return torch.compile(fn) if cfg.train.compile else fn
 
 
 @torch.no_grad()
@@ -334,6 +386,7 @@ def evaluate(
     dtype: torch.dtype,
     max_batches: int | None = None,
     loss_fn=compute_loss,
+    sft: bool = False,
 ) -> float:
     """Mean LM loss over the validation loader, capped at max_batches batches.
 
@@ -341,6 +394,9 @@ def evaluate(
     (or a streaming one, which has no length at all) makes each eval cost a meaningful fraction of
     the run. A fixed batch count also keeps val/loss comparable across configs whose val split
     sizes differ. max_batches=None keeps the original full-pass behavior.
+
+    sft=True pulls the batch's "loss_mask" and calls loss_fn with it (compute_sft_loss's
+    signature), matching whichever loss_fn build_loss_fn(cfg) actually built.
     """
     model.eval()
     total, count = 0.0, 0
@@ -350,7 +406,11 @@ def evaluate(
         input_ids = batch["input_ids"].to(device)
         with torch.autocast(device_type=device_type, dtype=dtype, enabled=dtype != torch.float32):
             out = model(input_ids)
-            loss, _ = loss_fn(out.logits, input_ids)  # z_loss discarded: val/loss stays pure LM
+            if sft:
+                loss_mask = batch["loss_mask"].to(device)
+                loss, _ = loss_fn(out.logits, input_ids, loss_mask)  # z_loss discarded
+            else:
+                loss, _ = loss_fn(out.logits, input_ids)  # z_loss discarded: val/loss stays pure LM
         total += loss.item()
         count += 1
     model.train()
@@ -381,6 +441,20 @@ def train(cfg: Config) -> None:
     # model.document_ids) — data.py joins documents with exactly this token.
     raw_model = DenseTransformer(cfg.model, vocab_size=vocab_size, eos_id=tokenizer.eos_token_id).to(device)
 
+    if cfg.sft.enabled and cfg.model.mtp_heads > 1:
+        # compute_mtp_loss would need the same loss_mask treatment compute_sft_loss just got —
+        # mechanically identical (shift-by-depth+1 and fold the mask into -100) but not yet built.
+        # Raise rather than silently score prompt tokens through the auxiliary heads.
+        raise ValueError("sft.enabled does not support model.mtp_heads > 1 yet — set mtp_heads: 1.")
+
+    # Computed here (rather than only where it's consumed, near the bottom) so init_from below can
+    # check "is this run resuming?" before deciding whether to apply it — resuming an interrupted
+    # run of *this* config always takes priority over re-seeding from a different checkpoint.
+    resume_path = find_resume_checkpoint(cfg)
+    if resume_path is None and cfg.train.init_from:
+        load_pretrained_weights(raw_model, cfg.train.init_from, cfg, vocab_size, device)
+        print(f"[radiance] initialized model weights from {cfg.train.init_from} (fresh optimizer/scheduler/step)")
+
     if cfg.train.auto_batch_size:
         if device_type == "cuda":
             if cfg.train.target_effective_batch_size is None:
@@ -399,7 +473,8 @@ def train(cfg: Config) -> None:
     loss_fn = build_loss_fn(cfg)
 
     # batch_size must be finalized (auto_batch_size, if any, already ran) before the DataLoader is built.
-    train_loader, val_loader = build_dataloaders(cfg, tokenizer)
+    build_loader_fn = build_sft_dataloaders if cfg.sft.enabled else build_dataloaders
+    train_loader, val_loader = build_loader_fn(cfg, tokenizer)
 
     if cfg.train.tokens_per_param is not None:
         tokens_per_step = cfg.train.effective_batch_size * cfg.data.seq_len
@@ -476,7 +551,6 @@ def train(cfg: Config) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     step = 0
-    resume_path = find_resume_checkpoint(cfg)
     if resume_path is not None:
         ckpt = torch.load(resume_path, map_location=device, weights_only=False)
         raw_model.load_state_dict(ckpt["model"])
@@ -554,7 +628,15 @@ def train(cfg: Config) -> None:
                         batch = next(data_iter)
 
                     input_ids = batch["input_ids"].to(device)
-                    for chunk in input_ids.split(micro_chunk_size, dim=0):
+                    id_chunks = input_ids.split(micro_chunk_size, dim=0)
+                    # SFT batches carry a same-shape loss_mask alongside input_ids (see
+                    # build_sft_dataloaders); chunked in lockstep with input_ids below so each
+                    # chunk's loss_fn call sees the mask for exactly its own rows.
+                    if cfg.sft.enabled:
+                        mask_chunks = batch["loss_mask"].to(device).split(micro_chunk_size, dim=0)
+                    else:
+                        mask_chunks = [None] * len(id_chunks)
+                    for chunk, mask_chunk in zip(id_chunks, mask_chunks):
                         # chunk_weight reconstructs the same overall mean-of-token-losses as one
                         # micro_loss / grad_accum_steps backward would, regardless of how many
                         # (possibly uneven) chunks a micro-batch got split into.
@@ -565,7 +647,11 @@ def train(cfg: Config) -> None:
                             out = model(chunk)
                             ponder_cost, mean_loop_depth = out.ponder_cost, out.mean_loop_depth
                             moe_aux_loss = out.moe_aux_loss
-                            lm_loss, z_loss = loss_fn(out.logits, chunk)
+                            lm_loss, z_loss = (
+                                loss_fn(out.logits, chunk, mask_chunk)
+                                if cfg.sft.enabled
+                                else loss_fn(out.logits, chunk)
+                            )
                             mtp_loss = compute_mtp_loss(raw_model, out.mtp_hidden, chunk)
                             chunk_loss = (
                                 lm_loss
@@ -635,7 +721,14 @@ def train(cfg: Config) -> None:
 
                 if val_loader is not None and step % cfg.train.eval_every == 0:
                     val_loss = evaluate(
-                        model, val_loader, device, device_type, dtype, cfg.train.eval_max_batches, loss_fn
+                        model,
+                        val_loader,
+                        device,
+                        device_type,
+                        dtype,
+                        cfg.train.eval_max_batches,
+                        loss_fn,
+                        sft=cfg.sft.enabled,
                     )
                     print(f"[radiance] step {step:>6} val/loss {val_loss:.4f}", flush=True)
                     wandb.log({"val/loss": val_loss}, step=step)

@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from transformers import PreTrainedTokenizerBase
 
 from radiance.config import Config, resolve_device
-from radiance.data import build_tokenizer
+from radiance.data import build_tokenizer, format_sft_prompt
 from radiance.model import DenseTransformer
 
 
@@ -99,17 +99,33 @@ def main() -> None:
         "most useful for a model trained with stochastic loop depth.",
     )
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--chat",
+        action="store_true",
+        help="Wrap --prompt in the checkpoint's SFT turn template (cfg.sft.user_prefix/"
+        "assistant_prefix) before generating, matching how an SFT checkpoint was trained. "
+        "Requires a checkpoint trained with sft.enabled: true.",
+    )
     args = parser.parse_args()
     device = resolve_device(args.device)
 
     if args.seed is not None:
         torch.manual_seed(args.seed)
 
-    model, _, tokenizer = load_checkpoint(args.checkpoint, device)
+    model, cfg, tokenizer = load_checkpoint(args.checkpoint, device)
+    prompt = args.prompt
+    if args.chat:
+        if not cfg.sft.enabled:
+            raise ValueError(
+                f"--chat requires a checkpoint trained with sft.enabled: true; "
+                f"{args.checkpoint!r} was not (it's a plain pretrain checkpoint)."
+            )
+        prompt = format_sft_prompt(args.prompt, cfg)
+
     text = generate(
         model,
         tokenizer,
-        args.prompt,
+        prompt,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_k=args.top_k,

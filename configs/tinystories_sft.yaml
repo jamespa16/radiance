@@ -1,0 +1,72 @@
+# Worked example: SFT (post-training) on top of a pretrained checkpoint.
+#
+# This is not a from-scratch run — it fine-tunes an existing TinyStories checkpoint on chat-
+# formatted instruction data (HuggingFaceH4/no_robots), with the loss masked so only the
+# assistant's turns are scored (see train.compute_sft_loss). Two things this depends on:
+#
+#   1. `model:` below matches configs/tinystories.yaml's architecture exactly. train.init_from
+#      loads weights into an already-constructed model, so d_model/n_layers/head_dim/n_kv_heads
+#      must match the checkpoint being loaded — a mismatch raises a clear error rather than a
+#      cryptic tensor-shape crash.
+#   2. `train.init_from` needs an actual checkpoint path. First train a base model:
+#
+#        WANDB_MODE=offline uv run radiance-train --config configs/tinystories.yaml
+#
+#      then point init_from at the checkpoint it writes to output_dir (e.g.
+#      checkpoints/tinystories/run2/step_1000.pt) before running this config. Unlike
+#      train.resume_from, only the model weights are loaded — this run gets its own fresh
+#      optimizer/scheduler and starts at step 0, which is what "post-training" means here
+#      (resume_from is for continuing *this* SFT run if it gets interrupted).
+#
+# Chat turns are joined with plain text markers (sft.user_prefix/assistant_prefix) rather than
+# new special tokens, so no vocab/embedding resize is needed — they tokenize through the base
+# model's existing vocab like any other text. Multiple examples are packed per seq_len block
+# exactly like pretraining documents are (EOS-joined); doc_attention_mask (on by default) isolates
+# them from each other using the same EOS-boundary mechanism it already uses for plain text, with
+# no changes needed there. Prompt/user-turn tokens are excluded from the loss via a per-token
+# loss_mask that data.py threads alongside input_ids.
+#
+# radiance-generate --checkpoint <this run's checkpoint> --chat --prompt "..." applies the same
+# turn template automatically (reads it back off the checkpoint's saved config).
+
+run_name: tinystories-sft
+
+data:
+  # sft.enabled routes data loading through build_sft_dataloaders entirely, so data.dataset/
+  # text_column/cache_dir are unused here — only tokenizer/seq_len/num_workers still apply
+  # (tokenizer must match the base checkpoint's; seq_len is sft.seq_len's None-default fallback).
+  tokenizer: gpt2
+  seq_len: 512
+  num_workers: 4
+
+model:
+  d_model: 256
+  head_dim: 64
+  n_layers: 6
+  loop_count: 1
+  ffn_mult: 4.0
+  ffn_depth: 3
+  dropout: 0.03
+  max_seq_len: 512
+
+sft:
+  enabled: true
+  dataset: HuggingFaceH4/no_robots # small (~10k examples), native `messages` column
+  messages_column: messages
+  eval_split_size: 200 # no_robots ships train/test; this is a no-op fallback if that changes
+
+train:
+  init_from: null # fill in with e.g. checkpoints/tinystories/run2/step_1000.pt (see comment above)
+  batch_size: 16
+  lr: 1.0e-4 # lower than pretraining's 3.0e-4: fine-tuning wants gentler updates to the tensors
+  muon_lr: 5.0e-3 # AdamW still owns; same reasoning scaled onto Muon's hidden-weight group
+  warmup_ratio: 0.03
+  max_steps: 800
+  eval_every: 100
+  save_every: 200
+  output_dir: checkpoints/tinystories_sft
+  dtype: bf16
+
+wandb:
+  project: radiance
+  mode: online
