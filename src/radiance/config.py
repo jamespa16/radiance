@@ -51,6 +51,54 @@ class ModelConfig:
     # rather than defaulted on. Requires head_dim % 4 == 0 (each branch's head_dim // 2 must itself
     # be even for RoPE's pairwise rotation) and is incompatible with act_capacity_ratio < 1.0 (no
     # sparse/gathered variant of this attention path yet) — both raise in DenseTransformer.__init__.
+    fp4_linear: bool = False  # opt-in: run every hidden linear's three GEMMs (forward, dgrad,
+    # wgrad) in NVFP4 — 4-bit e2m1 operands with a per-16-element e4m3 block scale, on Blackwell's
+    # FP4 tensor cores. Master weights, gradients and optimizer state all stay fp32 and autocast
+    # still runs in train.dtype; only the GEMM operands are 4-bit. See nvfp4.py.
+    #
+    # Opt-in rather than default-on, and this file's own convention says why: features default on
+    # because their parameters default to an *inert* setting (zero-init, identity-valued, or
+    # range-collapsed). FP4 has no such setting — there is no configuration under which quantizing
+    # every hidden matmul to 4 bits is bit-identical to bf16. Structurally the same category as
+    # use_diff_attn and the removed use_nsa. And "inert is not the same as free" applies twice
+    # over: it measures 0.34x at d_model 256, so defaulting it on would make tinystories.yaml
+    # three times *slower*. Requires d_model, the qkv width and ffn_dim to be multiples of 128,
+    # and is incompatible with use_moe — both raise in DenseTransformer.__init__.
+    fp4_grad_gemms: bool = True  # run dgrad and wgrad in FP4 too. False keeps the backward in
+    # bf16, which is the lowest-risk arm and the control that separates "FP4 forward is fine, the
+    # gradient path is what hurts" from "FP4 hurts". Only consulted when fp4_linear is on.
+    fp4_stochastic_rounding: bool = True  # stochastic rounding on gradient tensors only.
+    # Round-to-nearest is a biased estimator and the bias accumulates coherently over a run; SR
+    # trades it for variance, which averages out over a batch. Weights and activations have no
+    # accumulation to protect, so they stay round-to-nearest.
+    fp4_hadamard: bool = True  # random Hadamard rotation on the wgrad GEMM's operands, to spread
+    # outliers before the per-16 block amax picks a scale. Free: the rotation group and the scale
+    # block are the same 16 elements, so it happens in-register on the tile the reduction is about
+    # to consume. Both operands must get the same rotation — see nvfp4._FP4LinearFn.
+    fp4_save_activations: bool = True  # save each quantized linear's activation for backward in
+    # its packed NVFP4 form (1.125 bytes/element) instead of bf16 (2). **Bit-identical**, not an
+    # approximation: the backward already quantized exactly this tensor with exactly these
+    # parameters, so all that changes is when. That is why it defaults on where nothing else in the
+    # fp4_* family does. Skipped automatically when fp4_grad_gemms is off, since a bf16 wgrad needs
+    # the real activation back.
+    fp4_keep_bf16_blocks: int = 0  # keep the last k *structural* blocks in bf16. blocks[1:] is a
+    # weight-shared loop body, so a bf16 block is bf16 in every loop iteration — precision cannot
+    # vary per-iteration when the weights are shared, and there is deliberately no per-iteration
+    # variant of this knob.
+    fp4_keep_bf16_first: bool = False  # keep blocks[0] in bf16. It runs once per forward rather
+    # than loop_multiplier times, so it is the cheapest block to keep in high precision, and it
+    # produces v_first and the injection anchor that the rest of the recursion depends on.
+    fp4_lm_head: bool = True  # quantize the LM head too.
+    #
+    # These three default to *maximum* FP4 coverage, and the justification is throughput only:
+    # full coverage measured 1.20x bf16 end-to-end against 1.16x for the conservative setting
+    # (fwd+bwd 1.24x vs 1.18x). **The quality side is unmeasured**, and both of the settings this
+    # departs from exist for real reasons — NVIDIA's own recipe keeps the final blocks in high
+    # precision, and lm_head is weight-tied to token_emb, the tensor the embed_lr decomposition
+    # attributes ~93% of the largest quality win recorded in this repo to. So if an FP4 run
+    # regresses on val/loss, turn these back on in this order: fp4_lm_head first (it is the one
+    # touching the embedding's gradient), then fp4_keep_bf16_blocks: 1, then fp4_keep_bf16_first.
+    # They cost ~4% of throughput between them, which is cheap insurance against a quality loss.
     mtp_heads: int = 1  # multi-token prediction: how many future tokens each position predicts.
     # 1 (default) is ordinary next-token prediction — exactly the previous behavior. Higher values
     # add auxiliary heads predicting t+2, t+3, ... which densifies the training signal per token
@@ -467,25 +515,69 @@ def resolve_device(device: str) -> str:
     return "cpu"
 
 
-_DTYPES = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
+_DTYPES = {
+    "fp32": torch.float32,
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+    # Deliberately an alias for bf16, not a dtype of its own. NVFP4 is not an autocast dtype — it
+    # is a per-GEMM operand format — so a run asking for it still autocasts in bf16 and keeps fp32
+    # masters. `_apply_dtype_sugar` turns the string into `model.fp4_linear`; the entry here exists
+    # so `resolve_dtype` needs no branching and so the GradScaler predicate (which keys on the
+    # resolved torch.dtype, not the string) correctly stays disabled.
+    "nvfp4": torch.bfloat16,
+}
 
 
 def resolve_dtype(dtype: str) -> torch.dtype:
-    """Map a config dtype string ("fp32", "fp16", "bf16") to its torch.dtype."""
+    """Map a config dtype string ("fp32", "fp16", "bf16", "nvfp4") to its torch.dtype."""
     if dtype not in _DTYPES:
         raise ValueError(f"Unknown train.dtype {dtype!r}, expected one of {sorted(_DTYPES)}")
     return _DTYPES[dtype]
+
+
+def _apply_dtype_sugar(cfg: Config) -> Config:
+    """Resolve `train.dtype: nvfp4` into `model.fp4_linear`.
+
+    Done here, in `load_config`, rather than in `train()`. Two reasons, both about the resolved
+    value being the one that gets recorded: `save_checkpoint` pickles the whole `Config` and
+    `generate.py` rebuilds the model from it, so resolving at load time makes the checkpoint
+    self-describing; and `train()` logs `vars(cfg.model)` to W&B, so the run's record shows what
+    actually ran instead of a flag that got flipped somewhere invisible.
+
+    This is also the only place that sees both `model` and `train`, so the cross-section checks
+    live here — `DenseTransformer.__init__`, where this repo's other incompatibility errors live,
+    only ever receives a `ModelConfig`.
+    """
+    if cfg.train.dtype == "nvfp4":
+        cfg.model.fp4_linear = True
+        print("[radiance] train.dtype: nvfp4 -> model.fp4_linear: true, with bf16 autocast underneath")
+    if cfg.model.fp4_linear and cfg.train.dtype == "fp16":
+        raise ValueError(
+            "model.fp4_linear is incompatible with train.dtype: fp16. Before the global scales are "
+            "folded back in, the GEMM output is ~1e5x the true product — inside bf16's exponent "
+            "range and outside fp16's — and GradScaler's loss scale would compose with the "
+            "per-tensor global scale in a way nothing here has reasoned about. Use bf16 or nvfp4."
+        )
+    return cfg
 
 
 def load_config(path: str) -> Config:
     with open(path) as f:
         raw = yaml.safe_load(f) or {}
 
-    return Config(
+    # Caught here rather than in `_apply_dtype_sugar` because only the raw YAML distinguishes
+    # "fp4_linear was left at its default" from "fp4_linear: false was written down".
+    if raw.get("train", {}).get("dtype") == "nvfp4" and raw.get("model", {}).get("fp4_linear") is False:
+        raise ValueError(
+            "train.dtype: nvfp4 and model.fp4_linear: false contradict each other. "
+            "Set one or the other, rather than leaving it to resolution order."
+        )
+
+    return _apply_dtype_sugar(Config(
         run_name=raw.get("run_name", Config.run_name),
         data=DataConfig(**raw.get("data", {})),
         model=ModelConfig(**raw.get("model", {})),
         train=TrainConfig(**raw.get("train", {})),
         wandb=WandbConfig(**raw.get("wandb", {})),
         sft=SFTConfig(**raw.get("sft", {})),
-    )
+    ))

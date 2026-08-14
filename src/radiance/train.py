@@ -12,6 +12,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from radiance.config import Config, load_config, resolve_device, resolve_dtype
 from radiance.data import build_dataloaders, build_sft_dataloaders, build_tokenizer
+from radiance import nvfp4
 from radiance.model import DenseTransformer, padded_vocab_size
 from radiance.optim import build_optimizer, migrate_optimizer_to_cpu_offload
 
@@ -140,6 +141,12 @@ def estimate_batch_size(raw_model: DenseTransformer, cfg: Config, device: str, d
     free_bytes, _ = torch.cuda.mem_get_info(device)
     num_params = raw_model.num_parameters()
     not_yet_allocated_bytes = 3 * num_params * param_dtype_bytes  # grad + 2 Adam buffers
+    # The FP4 weight caches (~1.125 bytes per covered parameter — 0.5 packed plus 0.0625 of scales,
+    # in each of two orientations) are deliberately *not* added here, unlike the three buffers
+    # above. FP4Linear.__init__ allocates them eagerly and train() has already run .to(device) by
+    # the time this is called, so mem_get_info's free_bytes already excludes them; adding them
+    # again would subtract the same memory twice and hand the run a needlessly small micro-batch.
+    # raw_model.fp4_cache_bytes() reports the figure for anyone sizing a run by hand.
     usable_bytes = max(0.0, free_bytes - not_yet_allocated_bytes) * cfg.train.vram_safety_margin
 
     activation_dtype_bytes = 4 if cfg.train.dtype == "fp32" else 2
@@ -468,6 +475,18 @@ def train(cfg: Config) -> None:
                 "using configured batch_size/grad_accum_steps."
             )
 
+    if cfg.model.fp4_linear:
+        # Printed once, next to the other resolved-setting lines, because the failure mode of FP4
+        # on an unsupported card is that everything falls back to bf16 and trains correctly at bf16
+        # speed and quality while the config claims FP4 — a silently uninterpretable measurement.
+        n_fp4 = sum(1 for m in raw_model.modules() if isinstance(m, nvfp4.FP4Linear))
+        print(
+            f"[radiance] nvfp4: {n_fp4} linears quantized "
+            f"(grad_gemms={cfg.model.fp4_grad_gemms}, stochastic_rounding="
+            f"{cfg.model.fp4_stochastic_rounding}, hadamard={cfg.model.fp4_hadamard}), "
+            f"supported={nvfp4.nvfp4_supported(device)}"
+        )
+
     compile_mode = resolve_compile_mode(raw_model, cfg, device_type)
     model = torch.compile(raw_model, mode=compile_mode) if cfg.train.compile else raw_model
     loss_fn = build_loss_fn(cfg)
@@ -586,6 +605,10 @@ def train(cfg: Config) -> None:
             return
 
     model.train()
+    # Prime the FP4 weight caches before the first forward — after any resume_from/init_from load,
+    # so they describe the weights training actually starts from. Every later refresh happens after
+    # optimizer.step(). No-op unless model.fp4_linear.
+    nvfp4.refresh_fp4_weights(raw_model)
     data_iter = iter(train_loader)
 
     grad_accum_steps = cfg.train.grad_accum_steps
@@ -682,6 +705,18 @@ def train(cfg: Config) -> None:
                 # keeping it outside the compiled region avoids a graph break on every micro-batch.
                 # No-op unless MoE and bias balancing are both on.
                 raw_model.update_expert_bias()
+                # Re-quantize every FP4Linear's weight cache against the weights that just moved,
+                # and advance the stochastic-rounding seed. Here for the same reason as the line
+                # above — it writes buffers with no gradient, so keeping it out of the compiled
+                # region avoids a graph break, and a validity check inside forward() would be a
+                # Python branch dynamo guards on and recompiles for every step.
+                #
+                # Once per *optimizer* step is also the correct semantics rather than merely the
+                # cheap one: every micro-batch of an accumulated step must be differentiated
+                # against the same weights. Omitting this call fails silently — the forward would
+                # keep using step-0 weights while the fp32 masters trained on, so the loss still
+                # falls and then plateaus. No-op unless model.fp4_linear.
+                nvfp4.refresh_fp4_weights(raw_model)
                 step += 1
                 step_done = True
 

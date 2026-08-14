@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from radiance import nvfp4
 from radiance.config import ModelConfig
 
 
@@ -1607,6 +1608,39 @@ class DenseTransformer(nn.Module):
                 "sparse path (CausalSelfAttention.forward_sparse) has no differential-attention "
                 "variant yet. Set act_capacity_ratio: 1.0 or use_diff_attn: false."
             )
+        if cfg.fp4_linear:
+            # Checked here, before any block is constructed, for the same reason use_diff_attn's
+            # checks were moved to the top: the failure would otherwise surface from inside
+            # nvfp4.quantize with a much worse message.
+            #
+            # 128, not 64. Each of these widths serves as the *row* dimension of some GEMM —
+            # dgrad makes K a row dim and wgrad makes both N and K row dims — and the
+            # SWIZZLE_32_4_4 scale layout pads rows to 128.
+            widths = {
+                "d_model": cfg.d_model,
+                "the qkv projection width (d_model + 2 * n_kv_heads * head_dim)": cfg.d_model
+                + 2 * cfg.n_kv_heads_resolved * cfg.head_dim,
+                "ffn_dim (d_model * ffn_mult)": cfg.ffn_dim,
+            }
+            bad = {name: value for name, value in widths.items() if value % 128 != 0}
+            if bad:
+                detail = "; ".join(f"{name} = {value}" for name, value in bad.items())
+                raise ValueError(
+                    f"model.fp4_linear needs every quantized width to be a multiple of 128, but {detail}. "
+                    "NVFP4's block scales are stored in 128-row tiles. Adjust d_model / head_dim / "
+                    "ffn_mult, or unset fp4_linear."
+                )
+            if cfg.use_moe:
+                raise ValueError(
+                    "model.fp4_linear is incompatible with model.use_moe. BatchedExperts applies its "
+                    "weights with torch.baddbmm over an (n_experts, in, out) stack and _scaled_mm_v2 "
+                    "is 2-D only; a per-expert Python loop would reintroduce exactly the launch "
+                    "overhead the batched dispatch exists to remove (24.0 -> 3.16 ms at 32 experts). "
+                    "With MoE on the experts *are* the FFN, so quantizing only attention would "
+                    "produce a throughput number that looks like a failure of FP4 when FP4 never "
+                    "touched the expensive part. Refusing beats a misleading measurement."
+                )
+            nvfp4.require_nvfp4("model.fp4_linear")
 
         self.token_emb = nn.Embedding(vocab_size, cfg.d_model)
         # Differential attention's Q/K live at head_dim // 2 (V is never rotated, and nothing else
@@ -1710,6 +1744,13 @@ class DenseTransformer(nn.Module):
         # d_model. Exactly 1.0 (and skipped entirely in forward) unless cfg.mup_base_d_model is set.
         self.mup_output_mult = 1.0 / cfg.mup_width_mult
 
+        # Before _init_weights, so the swapped-in modules are the ones it initialises. FP4Linear
+        # subclasses nn.Linear and the swap transplants the existing Parameter objects, so both
+        # orderings would in fact work — but keeping it here means there is exactly one place that
+        # decides which linears are quantized, the way _init_inert_gates holds the whole zero-init
+        # policy. This is the ordering-constrained block; do not scatter it.
+        self._convert_linears_to_fp4()
+
         self.apply(self._init_weights)
         # token_emb and lm_head are the *same* tensor (weight tying), and self.apply visits
         # token_emb (an nn.Embedding) before lm_head (an nn.Linear) — so under muP the Linear
@@ -1722,6 +1763,101 @@ class DenseTransformer(nn.Module):
             # Bias the halting unit against halting immediately (Graves ACT): sigmoid(-1) ≈ 0.27,
             # encouraging some early pondering rather than collapsing to a single pass at init.
             nn.init.constant_(self.router.proj.bias, -1.0)
+
+    def _convert_linears_to_fp4(self) -> None:
+        """Swap the eligible `nn.Linear`s for `FP4Linear`, in place.
+
+        **The rule is that FP4 covers exactly the tensors Muon owns**, and that is deliberate reuse
+        rather than coincidence: `optim._MUON_EXCLUDED_SUBSTRINGS` already encodes this repo's
+        judgement about which tensors are hidden linear maps and which are small tensors whose
+        exact scale is load-bearing, with the reasoning written out. A second, differently-drawn
+        taxonomy would be one more thing to keep in sync.
+
+        So the routers, the attention output gate and the tied embedding stay bf16. `out_gate` is
+        the sharpest case: it is zero-initialised precisely so that `2 * sigmoid(0) == 1.0`
+        exactly, and quantizing it would put 4-bit noise on an exact identity.
+        """
+        cfg = self.cfg
+        if not cfg.fp4_linear:
+            return
+
+        recipe = nvfp4.FP4Recipe(
+            grad_gemms=cfg.fp4_grad_gemms,
+            stochastic_rounding=cfg.fp4_stochastic_rounding,
+            hadamard=cfg.fp4_hadamard,
+            save_activations=cfg.fp4_save_activations,
+        )
+        keep_first = cfg.fp4_keep_bf16_first
+        # Structural blocks, not loop iterations: blocks[1:] is weight-shared, so a block kept in
+        # bf16 is bf16 on every iteration. Precision cannot vary per-iteration when weights are.
+        keep_last = max(0, cfg.fp4_keep_bf16_blocks)
+        bf16_blocks = set(range(cfg.n_layers - keep_last, cfg.n_layers))
+        if keep_first:
+            bf16_blocks.add(0)
+
+        for index, block in enumerate(self.blocks):
+            if index in bf16_blocks:
+                continue
+            self._convert_subtree_to_fp4(block, recipe)
+        if cfg.mtp_heads > 1:
+            for head in self.mtp_heads:
+                self._convert_subtree_to_fp4(head, recipe)
+        if cfg.fp4_lm_head and self._fp4_shape_ok(self.lm_head):
+            # Shape-guarded like every other conversion. The head's out_features is the *padded
+            # vocab*, which `vocab_pad_multiple: 128` (the default) already makes a multiple of 128
+            # — but `vocab_pad_multiple: 1`, or a small test vocab, does not, and converting anyway
+            # allocates a zero-length scale buffer and fails at the first forward rather than here.
+            self.lm_head = self._as_fp4(self.lm_head, recipe)
+
+    @staticmethod
+    def _fp4_shape_ok(linear: nn.Linear) -> bool:
+        """The kernels' shape contract, as it applies to a weight: rows (out_features) must fill a
+        128-row scale tile and the contraction dim (in_features) must be a multiple of 64."""
+        return linear.out_features % 128 == 0 and linear.in_features % 64 == 0
+
+    @staticmethod
+    def _as_fp4(linear: nn.Linear, recipe: nvfp4.FP4Recipe) -> nvfp4.FP4Linear:
+        """Rebuild `linear` as an `FP4Linear`, transplanting the Parameter objects themselves so
+        weight tying and any pre-existing initialisation survive the swap."""
+        replacement = nvfp4.FP4Linear(
+            linear.in_features, linear.out_features, bias=linear.bias is not None, recipe=recipe
+        )
+        replacement.weight = linear.weight
+        if linear.bias is not None:
+            replacement.bias = linear.bias
+        return replacement
+
+    def _convert_subtree_to_fp4(self, root: nn.Module, recipe: nvfp4.FP4Recipe) -> None:
+        for parent_name, parent in root.named_modules():
+            for child_name, child in list(parent.named_children()):
+                if type(child) is not nn.Linear:
+                    continue
+                qualified = f"{parent_name}.{child_name}" if parent_name else child_name
+                # See the docstring: same classification optim.py uses, for the same reasons.
+                if any(token in qualified for token in ("router", "out_gate", "proj_gate")):
+                    continue
+                if not self._fp4_shape_ok(child):
+                    continue
+                setattr(parent, child_name, self._as_fp4(child, recipe))
+
+    def fp4_cache_bytes(self) -> int:
+        """Bytes held by the FP4 weight caches once `refresh_fp4_weights` has filled them.
+
+        A fixed, per-parameter cost rather than a per-token one, so `estimate_batch_size` subtracts
+        it alongside the gradient and optimizer buffers rather than folding it into
+        `activation_bytes_per_token`. Roughly 1.125 bytes per covered parameter — 0.5 for the packed
+        nibbles plus 0.0625 for the block scales, in each of the two orientations the three GEMMs
+        need. Zero unless `fp4_linear` is set.
+        """
+        total = 0
+        for module in self.modules():
+            if isinstance(module, nvfp4.FP4Linear):
+                total += sum(
+                    buf.numel() * buf.element_size()
+                    for name, buf in module.named_buffers()
+                    if name.startswith("_w_")
+                )
+        return total
 
     def _init_weights(self, module: nn.Module) -> None:
         # muP: hidden weights initialise at std / sqrt(width_mult) so that activation scale is
