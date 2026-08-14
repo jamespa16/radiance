@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from radiance import nvfp4
-from radiance.config import ModelConfig
+from radiance.config import Config, ModelConfig
 
 
 class ModelOutput(NamedTuple):
@@ -179,6 +179,54 @@ def build_block_mask(
         mask_mod, B=doc_ids.size(0), H=None, Q_LEN=seq_len, KV_LEN=doc_ids.size(1),
         device=doc_ids.device,
     )
+
+
+def sequence_logprob_sum(
+    logits: torch.Tensor, input_ids: torch.Tensor, loss_mask: torch.Tensor
+) -> torch.Tensor:
+    """Per-row (batch,) sum of log p(token_{t+1} | tokens_{<=t}) at loss_mask==1 positions.
+
+    DPO's per-sequence analogue of train._nll_and_logz, which reduces to a single batch-wide mean
+    over all flattened kept positions — the right reduction for a plain LM loss, but DPO needs one
+    scalar log-probability per (prompt, completion) sequence to combine into its pairwise loss, so
+    the batch dimension has to survive the reduction. Same shift-and-mask construction
+    train.compute_sft_loss uses, same single-logsumexp-pass trick _nll_and_logz uses to avoid
+    walking the (batch, seq, vocab_size) logits twice.
+
+    Lives here rather than train.py because data.py's DPO reference-logprob precompute needs this
+    exact primitive too, and data.py must not import train.py (train.py already imports data.py —
+    that would cycle). Both data.py and train.py already import model.py, so this adds no cycle.
+    """
+    labels = torch.cat([input_ids[:, 1:], input_ids.new_full((input_ids.size(0), 1), -100)], dim=1)
+    shifted_mask = torch.cat([loss_mask[:, 1:], loss_mask.new_zeros((loss_mask.size(0), 1))], dim=1)
+    keep = shifted_mask.bool()
+    safe_labels = labels.masked_fill(~keep, 0)
+    z = torch.logsumexp(logits, dim=-1).float()
+    target_logit = logits.gather(-1, safe_labels.unsqueeze(-1)).squeeze(-1).float()
+    return ((target_logit - z) * keep.float()).sum(dim=1)
+
+
+def load_transformer_from_checkpoint(
+    path: str, device: str, eos_id: int | None = None
+) -> tuple["DenseTransformer", "Config"]:
+    """Reconstruct a DenseTransformer + its embedded Config from a train.py checkpoint .pt file.
+
+    Extracted from generate.load_checkpoint (which now calls this) so data.py's DPO
+    reference-logprob precompute can reuse the same reconstruction logic without a
+    generate.py <-> data.py <-> model.py import cycle: generate.py already imports data.py, so
+    data.py must not import generate.py, but both data.py and generate.py already import model.py.
+
+    eos_id defaults to None, preserving generate.load_checkpoint's exact prior behavior (doc
+    masking off during generation, since a single prompt is one document anyway regardless).
+    """
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    cfg = ckpt["config"]
+    vocab_size = ckpt["model"]["token_emb.weight"].shape[0]
+    model = DenseTransformer(cfg.model, vocab_size=vocab_size, eos_id=eos_id)
+    model.load_state_dict(ckpt["model"])
+    model.to(device)
+    model.eval()
+    return model, cfg
 
 
 def padded_vocab_size(vocab_size: int, multiple: int) -> int:

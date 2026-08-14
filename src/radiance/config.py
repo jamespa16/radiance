@@ -495,6 +495,43 @@ class SFTConfig:
 
 
 @dataclass
+class DPOConfig:
+    """Post-training: Direct Preference Optimization on (prompt, chosen, rejected) triples.
+
+    A second mode switch alongside SFTConfig, mutually exclusive with sft.enabled (train.py raises
+    if both are set) — swaps the data pipeline and loss function the same way sft.enabled does, and
+    reuses the rest of train() (optimizer, LR schedule, auto_batch_size, checkpointing, init_from)
+    identically. Unlike SFT, DPO's loss needs a frozen reference model's log-probabilities on the
+    same sequences; those are precomputed once during data prep and cached on disk alongside the
+    tokenized dataset (see data.py's DPO section), so training itself only ever holds the policy
+    model in memory — no second live model, no VRAM doubling.
+    """
+
+    enabled: bool = False
+    dataset: str | None = None  # HF `user/dataset`-style preference dataset. Required when enabled.
+    prompt_column: str | None = None  # None (default): chosen_column/rejected_column are full
+    # [{"role", "content"}, ...] message lists that already include the prompt turn (e.g.
+    # argilla/dpo-mix-7k). Set: chosen_column/rejected_column are plain completion strings, combined
+    # with prompt_column (+ optional system_column) into a shared 1-turn user prompt (e.g.
+    # Intel/orca_dpo_pairs). Mirrors sft.instruction_column's fallback precedent.
+    system_column: str | None = None  # only consulted when prompt_column is set.
+    chosen_column: str = "chosen"
+    rejected_column: str = "rejected"
+    seq_len: int | None = None  # None (default) resolves to data.seq_len, same range-collapsed
+    # inert default convention as sft.seq_len.
+    cache_dir: str = ".cache/radiance/dpo"
+    eval_split_size: int = 0  # same semantics as data.eval_split_size, applied to the DPO dataset.
+    beta: float = 0.1  # DPO temperature / KL-regularization strength (Rafailov et al. 2023).
+    reference_checkpoint: str | None = None  # path to a frozen checkpoint whose log-probs anchor
+    # the DPO loss. Required when enabled. Often, but not necessarily, the same checkpoint
+    # train.init_from seeds the policy from — kept as a separate field since data prep (which needs
+    # this) and the train() call (which needs init_from) are different code paths.
+    reference_batch_size: int = 32  # batch size for the one-time reference-logprob precompute pass.
+    user_prefix: str = "\n\nUser: "  # same plain-text turn-marker convention as sft.user_prefix.
+    assistant_prefix: str = "\n\nAssistant: "
+
+
+@dataclass
 class Config:
     run_name: str = "radiance-run"
     data: DataConfig = field(default_factory=DataConfig)
@@ -502,6 +539,7 @@ class Config:
     train: TrainConfig = field(default_factory=TrainConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
     sft: SFTConfig = field(default_factory=SFTConfig)
+    dpo: DPOConfig = field(default_factory=DPOConfig)
 
 
 def resolve_device(device: str) -> str:
@@ -580,4 +618,5 @@ def load_config(path: str) -> Config:
         train=TrainConfig(**raw.get("train", {})),
         wandb=WandbConfig(**raw.get("wandb", {})),
         sft=SFTConfig(**raw.get("sft", {})),
+        dpo=DPOConfig(**raw.get("dpo", {})),
     ))

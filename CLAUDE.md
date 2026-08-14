@@ -1253,8 +1253,10 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
   stays pure LM loss (ponder cost and MoE aux loss both discarded) so it's comparable across configurations.
 
 - **`generate.py`** — `load_checkpoint(path, device)` reconstructs a `DenseTransformer` + tokenizer from a saved
-  checkpoint (`torch.load(..., weights_only=False)`, since the checkpoint pickles the full `Config` object, not just
-  tensors). `generate(...)` runs autoregressive sampling (temperature/top-k) using a `KVCache`
+  checkpoint via `model.load_transformer_from_checkpoint` (`torch.load(..., weights_only=False)`, since the
+  checkpoint pickles the full `Config` object, not just tensors) plus `build_tokenizer`. The reconstruction itself
+  lives in `model.py` rather than here — see "Post-training: SFT and DPO" below for why.
+  `generate(...)` runs autoregressive sampling (temperature/top-k) using a `KVCache`
   (`DenseTransformer.new_kv_cache()`): the (possibly truncated) prompt is prefilled once, then each later step
   forwards only the newly sampled token. Because `blocks[1:]` is a weight-shared loop body re-invoked `loop_count`
   (or, in ACT mode, `max_loops`) times per forward call — always the full iteration count regardless of per-token
@@ -1276,6 +1278,102 @@ Everything lives under `src/radiance/`, driven entirely by a single YAML config 
 
 Entry points: `radiance.train:main` (`--config`) and `radiance.generate:main` (`--checkpoint`, `--prompt`,
 `--loops`, ...) — `radiance-train` / `radiance-generate` console scripts after install.
+
+## Post-training: SFT and DPO
+
+Two post-training modes, both implemented as mode switches inside `train()` rather than separate trainers —
+each swaps `data.py`'s data pipeline and `train.py`'s loss function but reuses everything else (optimizer, LR
+schedule, `auto_batch_size`, OOM backoff, checkpointing, `train.init_from`, wandb/stdout logging) unchanged.
+`cfg.sft.enabled` and `cfg.dpo.enabled` are mutually exclusive — `validate_post_training_config` raises if both
+are set, called at the top of `train()`.
+
+**SFT** (`cfg.sft.enabled`, `SFTConfig`) is chat/instruction fine-tuning on a pretrained checkpoint.
+`data._format_sft_messages`/`_tokenize_sft_example` turn each example into `(ids, loss_mask)` — plain-text turn
+markers (`sft.user_prefix`/`assistant_prefix`, not new special tokens, so no vocab/embedding resize is needed),
+`loss_mask` 1 on assistant turns plus the trailing EOS, 0 elsewhere. `_tokenize_and_pack_sft` packs many examples
+per fixed-`seq_len` block, EOS-joined exactly like pretraining documents, and `doc_attention_mask` (on by
+default) isolates them from each other using the *same* EOS-boundary mechanism (`model.document_ids`) it already
+uses for plain text — no `model.py` changes needed for SFT at all. `train.compute_sft_loss` is a strict
+generalization of `compute_loss`, not a parallel reimplementation: it shifts `loss_mask` the same way labels are
+shifted and folds it into the `-100` ignore positions, then calls the same `_nll_and_logz` helper
+`compute_loss` uses — bit-identical to `compute_loss` at an all-ones mask
+(`tests/test_sft_loss.py::test_all_ones_mask_matches_compute_loss`). See `configs/tinystories_sft.yaml`.
+
+**DPO** (`cfg.dpo.enabled`, `DPOConfig`) is Direct Preference Optimization (Rafailov et al. 2023) on
+`(prompt, chosen, rejected)` triples — deliberately *not* full PPO/reward-model RLHF: no reward model, no
+rollout/generation loop during training, just a second (data pipeline, loss function) pair plugged into the same
+`train()` loop SFT already established. Two design decisions shape everything below, both made to keep training
+at exactly one resident model's VRAM cost, consistent with how carefully this repo already budgets VRAM
+(`optim.py`'s Muon batching cap, `train.py`'s `estimate_batch_size`):
+
+- **Reference log-probabilities are precomputed once and disk-cached, never held as a second live model during
+  training.** `data._add_reference_logprobs` loads the frozen `dpo.reference_checkpoint`, forwards it once over
+  every packed pair, caches each side's summed log-probability as a `ref_chosen_logprob`/`ref_rejected_logprob`
+  column, then frees the model entirely (`del` + `torch.cuda.empty_cache()`). Not a `datasets.map()` call — a
+  model forward can't run inside a `.map()` multiprocessing worker the way plain tokenization can — so it's a
+  plain batched `DataLoader` loop instead, under `torch.no_grad()`. `data._dpo_cache_path`'s hash key includes
+  the reference checkpoint's path/mtime/size (not a content hash — hashing a multi-GB checkpoint on every run
+  start would defeat the point of a fast cache-hit path, and nothing else in this repo content-hashes checkpoint
+  files either), so changing the reference model invalidates the cache automatically.
+- **Data is packed "one pair per row," not SFT's "many examples per block."** Each side of a pair
+  (`prompt+chosen`, `prompt+rejected`) is tokenized independently via `_tokenize_sft_example` (now taking
+  explicit `user_prefix`/`assistant_prefix` arguments rather than reading `cfg.sft.*` directly, so DPO can reuse
+  it unchanged with `cfg.dpo`'s own prefixes) and padded to exactly `seq_len` by appending repeated
+  `eos_token_id` at the tail, with `loss_mask=0` on the padding — dropped, not truncated, if either side's real
+  content overflows `seq_len` (`data._tokenize_dpo_row`; truncating the completion would score a partial response
+  as fully chosen/rejected, truncating the prompt would silently change what it's conditioned on). Chosen over
+  SFT-style multi-pair packing because a pair's two halves must survive `DataLoader` shuffling together —
+  keeping both in the same dataset row makes that automatic, where reconstructing pairing from document ids after
+  shuffling a multi-pair block would be fragile. **This needs no `doc_attention_mask` support at all for
+  correctness**, for a stronger reason than "it reuses the mechanism": attention is strictly causal and the real
+  (scored) content always precedes its own trailing padding within a row, so the real tokens can never attend to
+  padding regardless of whether document-boundary masking is even active — unlike SFT's genuinely-multi-document
+  blocks, where `doc_attention_mask` *is* load-bearing. Confirmed empirically too: a CPU smoke run's step-1 DPO
+  loss came out at exactly `log(2) = 0.6931`, the value the loss must take when the policy hasn't moved from the
+  reference yet (see below) — plain SDPA on CPU, no doc masking involved.
+
+`model.sequence_logprob_sum(logits, input_ids, loss_mask)` is the primitive both the precompute pass and the
+training loss need: a per-row `(batch,)` **sum** of log-probability at `loss_mask==1` positions, using the same
+single-`logsumexp`-pass trick `train._nll_and_logz` uses but keeping the batch dimension — `_nll_and_logz`
+reduces to one batch-wide *mean*, the right reduction for a plain LM loss but not for DPO, which needs one
+log-probability scalar per sequence to combine into its pairwise loss. It lives in `model.py`, not `train.py`,
+purely because of import direction: `data.py`'s reference-logprob precompute needs this exact function too, but
+`data.py` must not import `train.py` (`train.py` already imports `data.py`) — both `data.py` and `train.py`
+already import `model.py`, so putting it there adds no cycle. `model.load_transformer_from_checkpoint(path,
+device, eos_id=None)` (reconstructs a `DenseTransformer` + its embedded `Config` from a checkpoint) moved here
+for the identical reason: `generate.py` already owns this logic and imports `data.py`, so `data.py` can't import
+`generate.py` back; `generate.load_checkpoint` is now a thin wrapper around the `model.py` version.
+
+`train.compute_dpo_loss(policy_chosen_logp, policy_rejected_logp, ref_chosen_logp, ref_rejected_logp, beta)`
+is the standard objective, `-E[logsigmoid(beta * (policy_logratio - ref_logratio))]`, plus two `no_grad`
+diagnostics logged as `train/dpo_accuracy`/`train/dpo_margin` (pairwise accuracy and implicit reward margin,
+neither used in the loss). `compute_dpo_loss_from_logits` fuses two `sequence_logprob_sum` calls plus
+`compute_dpo_loss` into one function so `build_dpo_loss_fn` can `torch.compile` it as a unit, mirroring
+`build_loss_fn`'s reasoning for `compute_loss`/`compute_sft_loss`. In `train()`'s accumulation loop, a DPO batch
+concatenates chosen+rejected along the batch dimension into **one** `model(...)` call rather than two separate
+forward passes, then splits the logits back — halves the number of forward passes at the cost of the model
+seeing 2x the token width per row, which is exactly what `estimate_batch_size`'s `width_multiplier` (`2` under
+`cfg.dpo.enabled`, `1` otherwise) exists to account for: `auto_batch_size` would otherwise size a DPO batch as if
+it were an SFT batch and OOM on the first step. `z_loss`/`mtp_loss` are deliberately omitted from the DPO chunk
+loss — `mtp_heads > 1` is already rejected by `validate_post_training_config`, and `z_loss` would need its own
+reduction pass over the concatenated logits that isn't needed for DPO correctness. `ponder_cost`/`moe_aux_loss`
+compose in for free, same as everywhere else, since both are zero scalar tensors when their feature is off.
+
+`data.format_chat_prompt(user_message, cfg)` generalizes the older `format_sft_prompt` to also cover a DPO
+checkpoint: `sft.enabled` and `dpo.enabled` are mutually exclusive on any one run's config, so a DPO checkpoint's
+own saved `cfg.sft.enabled` is always `False` even though it expects the same turn-template prompting it was
+(transitively) SFT'd with. It checks `cfg.sft.enabled` then `cfg.dpo.enabled` and picks the matching prefixes,
+raising if neither is set. `generate.py --chat` now calls this instead of `format_sft_prompt` directly.
+
+See `configs/tinystories_dpo.yaml` for a worked example — a three-stage pretrain -> SFT -> DPO chain, with
+`train.init_from` seeding the policy and `dpo.reference_checkpoint` anchoring the loss, usually (but not
+necessarily — they're separate fields) the same checkpoint. No quality A/B has been run yet; the CPU smoke run
+above establishes that the pipeline runs and the loss starts where the math says it must, not that DPO improves
+anything at this scale. `tests/test_dpo_data.py`, `tests/test_dpo_loss.py`, and
+`tests/test_dpo_reference_logprob.py` cover the data pipeline, the loss function (including the
+policy-equals-reference equivalence check that predicted the smoke run's `log(2)` observation), and the
+precompute pass respectively, at the same unit-test depth `tests/test_sft_data.py`/`test_sft_loss.py` already
+established for SFT — no end-to-end `train()` integration test exists for either mode.
 
 ## Measured results
 

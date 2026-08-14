@@ -30,7 +30,7 @@ def test_tokenize_sft_example_masks_user_turns_and_supervises_assistant_turns():
         {"role": "assistant", "content": "hi friend"},
     ]
 
-    ids, mask = _tokenize_sft_example(messages, tokenizer, cfg)
+    ids, mask = _tokenize_sft_example(messages, tokenizer, cfg.sft.user_prefix, cfg.sft.assistant_prefix)
 
     user_ids = tokenizer("U: hello there")["input_ids"]
     assistant_ids = tokenizer("A: hi friend")["input_ids"]
@@ -49,7 +49,7 @@ def test_tokenize_sft_example_multiturn_masks_every_non_assistant_turn():
         {"role": "assistant", "content": "quite well thanks"},
     ]
 
-    ids, mask = _tokenize_sft_example(messages, tokenizer, cfg)
+    ids, mask = _tokenize_sft_example(messages, tokenizer, cfg.sft.user_prefix, cfg.sft.assistant_prefix)
 
     expected_mask = []
     for turn in messages:

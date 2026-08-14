@@ -7,13 +7,14 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import wandb
 from torch.optim.lr_scheduler import LambdaLR
 
 from radiance.config import Config, load_config, resolve_device, resolve_dtype
-from radiance.data import build_dataloaders, build_sft_dataloaders, build_tokenizer
+from radiance.data import build_dataloaders, build_dpo_dataloaders, build_sft_dataloaders, build_tokenizer
 from radiance import nvfp4
-from radiance.model import DenseTransformer, padded_vocab_size
+from radiance.model import DenseTransformer, padded_vocab_size, sequence_logprob_sum
 from radiance.optim import build_optimizer, migrate_optimizer_to_cpu_offload
 
 
@@ -152,12 +153,17 @@ def estimate_batch_size(raw_model: DenseTransformer, cfg: Config, device: str, d
     activation_dtype_bytes = 4 if cfg.train.dtype == "fp32" else 2
     bytes_per_token = raw_model.activation_bytes_per_token(activation_dtype_bytes)
     max_tokens = usable_bytes / bytes_per_token
-    batch_size = max(1, int(max_tokens // cfg.data.seq_len))
+    # A DPO "row" (pair) forwards chosen AND rejected concatenated in one call — 2x the token width
+    # of one SFT/pretrain row at the same batch_size — so the token budget above buys half as many
+    # pairs as it would plain sequences. batch_size here counts pairs, not sequences, for DPO.
+    width_multiplier = 2 if cfg.dpo.enabled else 1
+    batch_size = max(1, int(max_tokens // cfg.data.seq_len // width_multiplier))
     grad_accum_steps = max(1, math.ceil(cfg.train.target_effective_batch_size / batch_size))
 
+    unit = "pairs" if cfg.dpo.enabled else "sequences"
     print(
         f"[radiance] auto_batch_size: {free_bytes / 1e9:.2f} GB free, {num_params:,} params, "
-        f"vram_safety_margin={cfg.train.vram_safety_margin} -> batch_size={batch_size}, "
+        f"vram_safety_margin={cfg.train.vram_safety_margin} -> batch_size={batch_size} {unit}, "
         f"grad_accum_steps={grad_accum_steps} (effective_batch_size={batch_size * grad_accum_steps}, "
         f"target={cfg.train.target_effective_batch_size})"
     )
@@ -372,6 +378,54 @@ def compute_sft_loss(
     return _nll_and_logz(logits.view(-1, logits.size(-1)), labels.view(-1))
 
 
+def compute_dpo_loss(
+    policy_chosen_logp: torch.Tensor,
+    policy_rejected_logp: torch.Tensor,
+    ref_chosen_logp: torch.Tensor,
+    ref_rejected_logp: torch.Tensor,
+    beta: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The standard DPO objective (Rafailov et al. 2023): -E[logsigmoid(beta * (policy_logratio -
+    ref_logratio))], mean over the batch. Each *_logp is a per-row (batch,) sequence-summed
+    log-probability (see model.sequence_logprob_sum), not a mean, and the reference values are read
+    from data.py's precomputed cache rather than a second live model.
+
+    Also returns two no_grad diagnostics, logged but not optimized: the mean implicit reward margin
+    (how much more the policy separates chosen from rejected than the reference did, in beta-scaled
+    log-odds units) and the pairwise accuracy (fraction of the batch where the policy ranks chosen
+    above rejected by more than the reference did, i.e. logits > 0).
+    """
+    policy_logratio = policy_chosen_logp - policy_rejected_logp
+    ref_logratio = ref_chosen_logp - ref_rejected_logp
+    logits = beta * (policy_logratio - ref_logratio)
+    loss = -F.logsigmoid(logits).mean()
+    with torch.no_grad():
+        accuracy = (logits > 0).float().mean()
+        margin = (
+            beta * (policy_chosen_logp - ref_chosen_logp) - beta * (policy_rejected_logp - ref_rejected_logp)
+        ).mean()
+    return loss, margin, accuracy
+
+
+def compute_dpo_loss_from_logits(
+    chosen_logits: torch.Tensor,
+    chosen_ids: torch.Tensor,
+    chosen_mask: torch.Tensor,
+    rejected_logits: torch.Tensor,
+    rejected_ids: torch.Tensor,
+    rejected_mask: torch.Tensor,
+    ref_chosen_logp: torch.Tensor,
+    ref_rejected_logp: torch.Tensor,
+    beta: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuses sequence_logprob_sum (x2) + compute_dpo_loss into one function so build_dpo_loss_fn
+    can torch.compile it as a single unit — the same reasoning build_loss_fn already applies to
+    compute_loss/compute_sft_loss."""
+    policy_chosen_logp = sequence_logprob_sum(chosen_logits, chosen_ids, chosen_mask)
+    policy_rejected_logp = sequence_logprob_sum(rejected_logits, rejected_ids, rejected_mask)
+    return compute_dpo_loss(policy_chosen_logp, policy_rejected_logp, ref_chosen_logp, ref_rejected_logp, beta)
+
+
 def build_loss_fn(cfg: Config):
     """compute_loss (or, under cfg.sft.enabled, compute_sft_loss), compiled when the run is compiled.
 
@@ -379,9 +433,21 @@ def build_loss_fn(cfg: Config):
     it consumes the (batch, seq, vocab_size) logits the model returns, and that tensor is large
     enough that whether its reductions get fused is worth ~20% of step time on a small-d_model,
     large-vocab config. Tied to cfg.train.compile so the CPU sanity-check path stays eager.
+
+    Not used for cfg.dpo.enabled runs — see build_dpo_loss_fn, which wraps a different-shaped
+    function (compute_dpo_loss_from_logits) since DPO's loss needs both chosen and rejected logits
+    plus the cached reference log-probs, not just one logits tensor and its own input_ids.
     """
     fn = compute_sft_loss if cfg.sft.enabled else compute_loss
     return torch.compile(fn) if cfg.train.compile else fn
+
+
+def build_dpo_loss_fn(cfg: Config):
+    """compute_dpo_loss_from_logits, compiled when the run is compiled. DPO analogue of
+    build_loss_fn — kept separate rather than folded into it because the two functions take
+    different-shaped arguments (one logits tensor + input_ids/loss_mask vs. two logits tensors +
+    two input_ids/loss_mask pairs + two cached reference log-probs)."""
+    return torch.compile(compute_dpo_loss_from_logits) if cfg.train.compile else compute_dpo_loss_from_logits
 
 
 @torch.no_grad()
@@ -394,8 +460,10 @@ def evaluate(
     max_batches: int | None = None,
     loss_fn=compute_loss,
     sft: bool = False,
+    dpo: bool = False,
+    dpo_beta: float | None = None,
 ) -> float:
-    """Mean LM loss over the validation loader, capped at max_batches batches.
+    """Mean loss over the validation loader, capped at max_batches batches.
 
     The cap matters because this runs every eval_every steps: uncapped, a large validation split
     (or a streaming one, which has no length at all) makes each eval cost a meaningful fraction of
@@ -403,25 +471,58 @@ def evaluate(
     sizes differ. max_batches=None keeps the original full-pass behavior.
 
     sft=True pulls the batch's "loss_mask" and calls loss_fn with it (compute_sft_loss's
-    signature), matching whichever loss_fn build_loss_fn(cfg) actually built.
+    signature). dpo=True pulls all 6 DPO batch columns, forwards chosen+rejected concatenated in
+    one call, and calls loss_fn with compute_dpo_loss_from_logits's signature (dpo_beta required).
+    Exactly one of sft/dpo should be set, matching whichever loss_fn build_loss_fn(cfg)/
+    build_dpo_loss_fn(cfg) actually built.
     """
     model.eval()
     total, count = 0.0, 0
     for i, batch in enumerate(val_loader):
         if max_batches is not None and i >= max_batches:
             break
-        input_ids = batch["input_ids"].to(device)
         with torch.autocast(device_type=device_type, dtype=dtype, enabled=dtype != torch.float32):
-            out = model(input_ids)
-            if sft:
-                loss_mask = batch["loss_mask"].to(device)
-                loss, _ = loss_fn(out.logits, input_ids, loss_mask)  # z_loss discarded
+            if dpo:
+                chosen_ids = batch["chosen_input_ids"].to(device)
+                chosen_mask = batch["chosen_loss_mask"].to(device)
+                rejected_ids = batch["rejected_input_ids"].to(device)
+                rejected_mask = batch["rejected_loss_mask"].to(device)
+                ref_chosen = batch["ref_chosen_logprob"].to(device)
+                ref_rejected = batch["ref_rejected_logprob"].to(device)
+                b = chosen_ids.size(0)
+                out = model(torch.cat([chosen_ids, rejected_ids], dim=0))
+                chosen_logits, rejected_logits = out.logits.split(b, dim=0)
+                loss, _, _ = loss_fn(
+                    chosen_logits, chosen_ids, chosen_mask, rejected_logits, rejected_ids, rejected_mask,
+                    ref_chosen, ref_rejected, dpo_beta,
+                )  # margin/accuracy discarded: val/loss stays the plain DPO objective
             else:
-                loss, _ = loss_fn(out.logits, input_ids)  # z_loss discarded: val/loss stays pure LM
+                input_ids = batch["input_ids"].to(device)
+                out = model(input_ids)
+                if sft:
+                    loss_mask = batch["loss_mask"].to(device)
+                    loss, _ = loss_fn(out.logits, input_ids, loss_mask)  # z_loss discarded
+                else:
+                    loss, _ = loss_fn(out.logits, input_ids)  # z_loss discarded: val/loss stays pure LM
         total += loss.item()
         count += 1
     model.train()
     return total / count if count else float("nan")
+
+
+def validate_post_training_config(cfg: Config) -> None:
+    """Raise clear errors for post-training mode combinations train() can't handle, rather than
+    letting them fail confusingly deep inside the data pipeline or the accumulation loop."""
+    if cfg.sft.enabled and cfg.dpo.enabled:
+        raise ValueError("sft.enabled and dpo.enabled are mutually exclusive — pick one post-training mode.")
+    if (cfg.sft.enabled or cfg.dpo.enabled) and cfg.model.mtp_heads > 1:
+        # compute_mtp_loss would need the same loss_mask treatment compute_sft_loss/compute_dpo_loss
+        # got — mechanically similar (shift-by-depth+1 and fold the mask into -100) but not yet
+        # built for either. Raise rather than silently score prompt/rejected tokens through the
+        # auxiliary heads.
+        raise ValueError("sft.enabled/dpo.enabled do not support model.mtp_heads > 1 yet — set mtp_heads: 1.")
+    if cfg.dpo.enabled and not cfg.dpo.reference_checkpoint:
+        raise ValueError("dpo.enabled requires dpo.reference_checkpoint to be set.")
 
 
 def train(cfg: Config) -> None:
@@ -448,11 +549,7 @@ def train(cfg: Config) -> None:
     # model.document_ids) — data.py joins documents with exactly this token.
     raw_model = DenseTransformer(cfg.model, vocab_size=vocab_size, eos_id=tokenizer.eos_token_id).to(device)
 
-    if cfg.sft.enabled and cfg.model.mtp_heads > 1:
-        # compute_mtp_loss would need the same loss_mask treatment compute_sft_loss just got —
-        # mechanically identical (shift-by-depth+1 and fold the mask into -100) but not yet built.
-        # Raise rather than silently score prompt tokens through the auxiliary heads.
-        raise ValueError("sft.enabled does not support model.mtp_heads > 1 yet — set mtp_heads: 1.")
+    validate_post_training_config(cfg)
 
     # Computed here (rather than only where it's consumed, near the bottom) so init_from below can
     # check "is this run resuming?" before deciding whether to apply it — resuming an interrupted
@@ -489,10 +586,15 @@ def train(cfg: Config) -> None:
 
     compile_mode = resolve_compile_mode(raw_model, cfg, device_type)
     model = torch.compile(raw_model, mode=compile_mode) if cfg.train.compile else raw_model
-    loss_fn = build_loss_fn(cfg)
+    loss_fn = build_dpo_loss_fn(cfg) if cfg.dpo.enabled else build_loss_fn(cfg)
 
     # batch_size must be finalized (auto_batch_size, if any, already ran) before the DataLoader is built.
-    build_loader_fn = build_sft_dataloaders if cfg.sft.enabled else build_dataloaders
+    if cfg.dpo.enabled:
+        build_loader_fn = build_dpo_dataloaders
+    elif cfg.sft.enabled:
+        build_loader_fn = build_sft_dataloaders
+    else:
+        build_loader_fn = build_dataloaders
     train_loader, val_loader = build_loader_fn(cfg, tokenizer)
 
     if cfg.train.tokens_per_param is not None:
@@ -637,6 +739,8 @@ def train(cfg: Config) -> None:
                 accum_moe_aux_loss = torch.zeros((), device=device)
                 accum_z_loss = torch.zeros((), device=device)
                 accum_mtp_loss = torch.zeros((), device=device)
+                accum_dpo_accuracy = torch.zeros((), device=device)
+                accum_dpo_margin = torch.zeros((), device=device)
 
             try:
                 # set_to_none=False when compiled: keeps .grad buffers stable/preallocated (see the
@@ -649,6 +753,61 @@ def train(cfg: Config) -> None:
                     except StopIteration:
                         data_iter = iter(train_loader)
                         batch = next(data_iter)
+
+                    if cfg.dpo.enabled:
+                        # DPO's batch shape genuinely differs from SFT/pretrain's (6 parallel
+                        # tensors and a cat+split model call, vs. 1-2 tensors and a plain call), so
+                        # this is a separate branch rather than folded into the zip-loop below —
+                        # forcing them into one shape would obscure more than it shares. The outer
+                        # structure (try/OOM handling, this grad_accum_steps loop, chunk_weight
+                        # normalization, scaler.scale(...).backward()) stays identical either way.
+                        chosen_ids_chunks = batch["chosen_input_ids"].to(device).split(micro_chunk_size, dim=0)
+                        chosen_mask_chunks = batch["chosen_loss_mask"].to(device).split(micro_chunk_size, dim=0)
+                        rejected_ids_chunks = batch["rejected_input_ids"].to(device).split(micro_chunk_size, dim=0)
+                        rejected_mask_chunks = batch["rejected_loss_mask"].to(device).split(
+                            micro_chunk_size, dim=0
+                        )
+                        ref_chosen_chunks = batch["ref_chosen_logprob"].to(device).split(micro_chunk_size, dim=0)
+                        ref_rejected_chunks = batch["ref_rejected_logprob"].to(device).split(
+                            micro_chunk_size, dim=0
+                        )
+                        for c_ids, c_mask, r_ids, r_mask, ref_c, ref_r in zip(
+                            chosen_ids_chunks, chosen_mask_chunks, rejected_ids_chunks,
+                            rejected_mask_chunks, ref_chosen_chunks, ref_rejected_chunks,
+                        ):
+                            chunk_weight = c_ids.size(0) / cfg.train.batch_size / grad_accum_steps
+                            with torch.autocast(
+                                device_type=device_type, dtype=dtype, enabled=dtype != torch.float32
+                            ):
+                                b = c_ids.size(0)
+                                out = model(torch.cat([c_ids, r_ids], dim=0))
+                                chosen_logits, rejected_logits = out.logits.split(b, dim=0)
+                                dpo_loss, margin, accuracy = loss_fn(
+                                    chosen_logits, c_ids, c_mask, rejected_logits, r_ids, r_mask,
+                                    ref_c, ref_r, cfg.dpo.beta,
+                                )
+                                # z_loss/mtp_loss deliberately omitted here: mtp_heads > 1 is
+                                # already rejected by validate_post_training_config, and z_loss
+                                # would need its own reduction pass over the concatenated logits
+                                # that isn't needed for DPO correctness — a possible future
+                                # addition, not a gap in this one.
+                                chunk_loss = (
+                                    dpo_loss
+                                    + cfg.model.ponder_weight * out.ponder_cost
+                                    + cfg.model.moe_aux_loss_weight * out.moe_aux_loss
+                                )
+
+                            scaler.scale(chunk_loss * chunk_weight).backward()
+
+                            if will_log:
+                                accum_loss += chunk_loss.detach() * chunk_weight
+                                accum_lm_loss += dpo_loss.detach() * chunk_weight
+                                accum_ponder_cost += out.ponder_cost.detach() * chunk_weight
+                                accum_mean_loop_depth += out.mean_loop_depth.detach() * chunk_weight
+                                accum_moe_aux_loss += out.moe_aux_loss.detach() * chunk_weight
+                                accum_dpo_accuracy += accuracy.detach() * chunk_weight
+                                accum_dpo_margin += margin.detach() * chunk_weight
+                        continue
 
                     input_ids = batch["input_ids"].to(device)
                     id_chunks = input_ids.split(micro_chunk_size, dim=0)
@@ -747,6 +906,8 @@ def train(cfg: Config) -> None:
                             "train/moe_aux_loss": accum_moe_aux_loss.item(),
                             "train/z_loss": accum_z_loss.item(),
                             "train/mtp_loss": accum_mtp_loss.item(),
+                            "train/dpo_accuracy": accum_dpo_accuracy.item(),
+                            "train/dpo_margin": accum_dpo_margin.item(),
                             "train/expert_bias_spread": raw_model.expert_bias_spread(),
                             "train/lr": scheduler.get_last_lr()[0],
                             "train/micro_chunk_size": micro_chunk_size,
@@ -764,6 +925,8 @@ def train(cfg: Config) -> None:
                         cfg.train.eval_max_batches,
                         loss_fn,
                         sft=cfg.sft.enabled,
+                        dpo=cfg.dpo.enabled,
+                        dpo_beta=cfg.dpo.beta if cfg.dpo.enabled else None,
                     )
                     print(f"[radiance] step {step:>6} val/loss {val_loss:.4f}", flush=True)
                     wandb.log({"val/loss": val_loss}, step=step)

@@ -116,6 +116,25 @@ Post-training: supervised fine-tuning on chat/instruction data. A mode switch (l
 - **`eval_split_size`** — same semantics as `data.eval_split_size`, applied to the SFT dataset.
 - **`user_prefix` / `assistant_prefix`** — plain text turn markers (e.g. `"\n\nUser: "` / `"\n\nAssistant: "`) joined onto each turn before tokenizing. Not new special tokens — they tokenize through the existing vocab, so no embedding resize is needed. Assistant turns (and the trailing EOS) are what `compute_sft_loss` scores; user/system turns are masked out of the loss but still attended to causally.
 
+## dpo
+
+Post-training: Direct Preference Optimization on `(prompt, chosen, rejected)` triples. A second mode switch alongside `sft` — mutually exclusive with `sft.enabled` (`train.py` raises if both are set) — swapping `train.py`'s data pipeline and loss function the same way `sft.enabled` does, and reusing everything else (optimizer, LR schedule, `auto_batch_size`, checkpointing, `init_from`) identically. Unlike SFT, DPO's loss needs a frozen reference model's log-probabilities on the same sequences; those are precomputed once during data prep and cached to disk alongside the tokenized dataset, so training itself only ever holds the policy model in memory. See `configs/tinystories_dpo.yaml` for a worked example (a three-stage pretrain -> SFT -> DPO chain).
+
+Each `(prompt+chosen)`/`(prompt+rejected)` sequence is packed as its own row, independently padded to `seq_len` with trailing `eos_token_id` (loss-masked) — "packing of one," unlike `sft`'s many-examples-per-block packing — so a pair's two halves can never be separated by `DataLoader` shuffling. This needs no `model.py` changes: attention is strictly causal and the real content always precedes its own padding within a row, so the padding can never influence the scored tokens' logits.
+
+- **`enabled`** — route `train.py` through `build_dpo_dataloaders`/`compute_dpo_loss_from_logits` instead of the pretrain/SFT path. Default `false`.
+- **`dataset`** — HF `user/dataset`-style preference dataset. Required when `enabled`.
+- **`prompt_column`** — `null` (default): `chosen_column`/`rejected_column` are full `[{"role", "content"}, ...]` message lists that already include the prompt turn (e.g. `argilla/dpo-mix-7k`). Set: `chosen_column`/`rejected_column` are plain completion strings, combined with `prompt_column` (+ optional `system_column`) into a shared 1-turn user prompt (e.g. `Intel/orca_dpo_pairs`, which has separate `system`/`question`/`chosen`/`rejected` string columns — set `prompt_column: question`, `system_column: system`).
+- **`system_column`** — only consulted when `prompt_column` is set.
+- **`chosen_column` / `rejected_column`** — column names for the preferred/dispreferred side. Default `"chosen"`/`"rejected"`.
+- **`seq_len`** — packed row width for DPO; `null` resolves to `data.seq_len`. A pair with either side exceeding this is dropped, not truncated (truncating the completion would score a partial response as fully chosen/rejected; truncating the prompt would silently change what's being conditioned on).
+- **`cache_dir`** — tokenized+packed+reference-scored cache for the DPO dataset, separate from `data.cache_dir`/`sft.cache_dir`. The cache key includes the reference checkpoint's path/mtime/size, so changing `reference_checkpoint` invalidates it.
+- **`eval_split_size`** — same semantics as `data.eval_split_size`, applied to the DPO dataset.
+- **`beta`** — DPO temperature / regularization strength (Rafailov et al. 2023). Default `0.1`.
+- **`reference_checkpoint`** — path to a frozen checkpoint whose log-probabilities anchor the DPO loss. Required when `enabled`. Often, but not necessarily, the same checkpoint `train.init_from` seeds the policy from.
+- **`reference_batch_size`** — batch size for the one-time reference-logprob precompute pass. Default `32`.
+- **`user_prefix` / `assistant_prefix`** — same plain-text turn-marker convention as `sft.user_prefix`/`sft.assistant_prefix`.
+
 ## wandb
 
 - **`project`** — W&B project name.

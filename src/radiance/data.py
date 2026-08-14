@@ -12,7 +12,7 @@ from datasets import DatasetDict, IterableDataset, load_dataset, load_from_disk
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from radiance.config import Config
+from radiance.config import Config, resolve_device
 
 logger = logging.getLogger(__name__)
 
@@ -459,21 +459,25 @@ def _format_sft_messages(example: dict, cfg: Config) -> list[dict]:
 
 
 def _tokenize_sft_example(
-    messages: list[dict], tokenizer: PreTrainedTokenizerBase, cfg: Config
+    messages: list[dict], tokenizer: PreTrainedTokenizerBase, user_prefix: str, assistant_prefix: str
 ) -> tuple[list[int], list[int]]:
     """Tokenize one chat example to (ids, loss_mask).
 
     mask is 0 for user/system turns (not supervised) and 1 for assistant turns plus the trailing
     EOS (supervised, including EOS so the model learns to stop). Attention is not restricted
     here — a response still attends causally to its own prompt within the example; only the loss
-    is masked, downstream in train.compute_sft_loss. Turn markers (cfg.sft.user_prefix/
+    is masked, downstream in train.compute_sft_loss/compute_dpo_loss. Turn markers (user_prefix/
     assistant_prefix) are plain text tokenized through the existing vocab, not new special tokens.
+
+    Takes the prefixes as explicit strings rather than reading cfg.sft.user_prefix/assistant_prefix
+    directly, so DPO's data pipeline can reuse this unchanged with cfg.dpo's own prefixes instead of
+    being hardcoded to the sft config block.
     """
     ids: list[int] = []
     mask: list[int] = []
     for turn in messages:
         is_assistant = turn["role"] == "assistant"
-        prefix = cfg.sft.assistant_prefix if is_assistant else cfg.sft.user_prefix
+        prefix = assistant_prefix if is_assistant else user_prefix
         turn_ids = tokenizer(prefix + turn["content"])["input_ids"]
         ids.extend(turn_ids)
         mask.extend([int(is_assistant)] * len(turn_ids))
@@ -488,6 +492,24 @@ def format_sft_prompt(user_message: str, cfg: Config) -> str:
     return cfg.sft.user_prefix + user_message + cfg.sft.assistant_prefix
 
 
+def format_chat_prompt(user_message: str, cfg: Config) -> str:
+    """Generalizes format_sft_prompt to also cover a DPO checkpoint.
+
+    sft.enabled and dpo.enabled are mutually exclusive on any one run, so a DPO checkpoint's own
+    saved cfg.sft.enabled is False even though it expects the same turn template it was
+    (transitively) SFT'd with. Picks whichever post-training mode the checkpoint's own config has
+    on; raises if neither, mirroring format_sft_prompt's implicit prior contract that only an
+    SFT-trained checkpoint made sense to prompt this way.
+    """
+    if cfg.sft.enabled:
+        return format_sft_prompt(user_message, cfg)
+    if cfg.dpo.enabled:
+        return cfg.dpo.user_prefix + user_message + cfg.dpo.assistant_prefix
+    raise ValueError(
+        "format_chat_prompt requires a checkpoint trained with sft.enabled: true or dpo.enabled: true"
+    )
+
+
 def _tokenize_and_pack_sft(dataset, tokenizer: PreTrainedTokenizerBase, cfg: Config):
     seq_len = cfg.sft.seq_len or cfg.data.seq_len
 
@@ -496,7 +518,9 @@ def _tokenize_and_pack_sft(dataset, tokenizer: PreTrainedTokenizerBase, cfg: Con
         rows = [dict(zip(keys, values)) for values in zip(*batch.values())]
         ids_list, mask_list = [], []
         for example in rows:
-            ids, mask = _tokenize_sft_example(_format_sft_messages(example, cfg), tokenizer, cfg)
+            ids, mask = _tokenize_sft_example(
+                _format_sft_messages(example, cfg), tokenizer, cfg.sft.user_prefix, cfg.sft.assistant_prefix
+            )
             ids_list.append(ids)
             mask_list.append(mask)
         return {"input_ids": ids_list, "loss_mask": mask_list}
@@ -605,6 +629,278 @@ def build_sft_dataloaders(cfg: Config, tokenizer: PreTrainedTokenizerBase) -> tu
     )
 
     packed = _load_or_build_sft_packed(cfg, tokenizer)
+    train_ds = packed["train"]
+    val_ds = packed.get("validation")
+
+    train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size, shuffle=True, **loader_kwargs)
+
+    val_loader = None
+    if val_ds is not None:
+        val_loader = DataLoader(val_ds, batch_size=cfg.train.batch_size, shuffle=False, **loader_kwargs)
+
+    return train_loader, val_loader
+
+
+# --- DPO (preference post-training) ---------------------------------------------------------
+#
+# Different packing strategy from SFT's above, deliberately: SFT packs many chat examples per
+# fixed-seq_len block, relying on doc_attention_mask/model.document_ids' EOS-boundary detection to
+# isolate them from each other. DPO instead packs exactly one preference pair per dataset row — a
+# (prompt+chosen) sequence and a (prompt+rejected) sequence, each independently padded to seq_len
+# by appending repeated eos_token_id at the tail (loss_mask=0 on the padding). This is "packing of
+# one" rather than SFT's "many examples per block", chosen because DPO's loss needs the two halves
+# of a pair to survive DataLoader shuffling together — keeping both in the same row makes that
+# automatic, where packing multiple different pairs per block would require reconstructing pairing
+# from document ids after shuffling, which is fragile. It costs some padding-waste efficiency
+# relative to SFT's packing, an accepted tradeoff at this dataset scale (thousands to tens of
+# thousands of rows) and the same one reference DPO implementations (e.g. TRL) make.
+#
+# Note this padding scheme needs no doc_attention_mask support at all for correctness, unlike SFT's
+# multi-example blocks where it's load-bearing: attention is strictly causal and the real (scored)
+# content always precedes its own trailing padding within a row, so the real tokens can never
+# attend to padding regardless of whether document-boundary masking is active. Whether the
+# reference-logprob precompute pass below sets eos_id on its model is therefore a free choice, not
+# a correctness requirement.
+
+
+def _format_dpo_pair(example: dict, cfg: Config) -> tuple[list[dict], list[dict]]:
+    """Normalize one dataset row to (chosen_messages, rejected_messages).
+
+    Reads cfg.dpo.chosen_column/rejected_column directly as pre-built [{"role","content"}, ...]
+    message lists that already include the prompt turn (the shape e.g. argilla/dpo-mix-7k uses)
+    when cfg.dpo.prompt_column is unset. When it's set instead (Alpaca/orca-style datasets with a
+    separate prompt column and plain-string chosen/rejected completions, e.g. Intel/orca_dpo_pairs),
+    builds a shared 1-turn user prompt from prompt_column (+ optional system_column) and appends
+    each side's completion as its own final assistant turn. Mirrors _format_sft_messages'
+    instruction_column fallback.
+    """
+    if cfg.dpo.prompt_column is not None:
+        prompt = example[cfg.dpo.prompt_column]
+        if cfg.dpo.system_column:
+            system = example.get(cfg.dpo.system_column)
+            if system:
+                prompt = f"{system}\n{prompt}"
+        prompt_turns = [{"role": "user", "content": prompt}]
+        chosen = prompt_turns + [{"role": "assistant", "content": example[cfg.dpo.chosen_column]}]
+        rejected = prompt_turns + [{"role": "assistant", "content": example[cfg.dpo.rejected_column]}]
+        return chosen, rejected
+    return example[cfg.dpo.chosen_column], example[cfg.dpo.rejected_column]
+
+
+def _tokenize_dpo_row(
+    example: dict, tokenizer: PreTrainedTokenizerBase, cfg: Config, seq_len: int
+) -> dict | None:
+    """One dataset row -> a dict of 4 seq_len-padded lists, or None if either side's un-padded
+    length exceeds seq_len (dropped, not truncated).
+
+    Dropping is deliberate: truncating the completion would score a partial response as fully
+    chosen/rejected, and truncating the prompt would silently change what the response is
+    conditioned on — both corrupt the training signal in a way that's worse than losing the
+    example. Reuses _tokenize_sft_example verbatim for both sides (now that it takes explicit
+    prefixes rather than reading cfg.sft.* directly) — DPO's per-side (ids, loss_mask) construction
+    is identical to SFT's single-completion case, just called twice against a shared prompt prefix.
+    """
+    chosen_msgs, rejected_msgs = _format_dpo_pair(example, cfg)
+    chosen_ids, chosen_mask = _tokenize_sft_example(
+        chosen_msgs, tokenizer, cfg.dpo.user_prefix, cfg.dpo.assistant_prefix
+    )
+    rejected_ids, rejected_mask = _tokenize_sft_example(
+        rejected_msgs, tokenizer, cfg.dpo.user_prefix, cfg.dpo.assistant_prefix
+    )
+    if len(chosen_ids) > seq_len or len(rejected_ids) > seq_len:
+        return None
+
+    eos_id = tokenizer.eos_token_id
+
+    def pad(ids: list[int], mask: list[int]) -> tuple[list[int], list[int]]:
+        n_pad = seq_len - len(ids)
+        return ids + [eos_id] * n_pad, mask + [0] * n_pad
+
+    chosen_ids, chosen_mask = pad(chosen_ids, chosen_mask)
+    rejected_ids, rejected_mask = pad(rejected_ids, rejected_mask)
+    return {
+        "chosen_input_ids": chosen_ids,
+        "chosen_loss_mask": chosen_mask,
+        "rejected_input_ids": rejected_ids,
+        "rejected_loss_mask": rejected_mask,
+    }
+
+
+def _tokenize_and_filter_dpo(dataset, tokenizer: PreTrainedTokenizerBase, cfg: Config):
+    seq_len = cfg.dpo.seq_len or cfg.data.seq_len
+    n_before = len(dataset)
+
+    def batch_fn(batch):
+        keys = list(batch.keys())
+        rows = [dict(zip(keys, values)) for values in zip(*batch.values())]
+        out = {
+            "chosen_input_ids": [],
+            "chosen_loss_mask": [],
+            "rejected_input_ids": [],
+            "rejected_loss_mask": [],
+        }
+        for example in rows:
+            tokenized = _tokenize_dpo_row(example, tokenizer, cfg, seq_len)
+            if tokenized is None:
+                continue
+            for k, v in tokenized.items():
+                out[k].append(v)
+        return out
+
+    map_kwargs = {"num_proc": cfg.data.num_workers or None}
+    tokenized = dataset.map(
+        batch_fn,
+        batched=True,
+        remove_columns=dataset.column_names,
+        **map_kwargs,
+    )
+    # Computed post-hoc from before/after dataset length rather than an in-map counter: a
+    # closure-captured counter would only see whichever worker's shard it ran in under
+    # num_proc > 1, silently undercounting.
+    n_dropped = n_before - len(tokenized)
+    if n_dropped:
+        print(
+            f"[radiance] dpo data prep: dropped {n_dropped}/{n_before} pairs exceeding seq_len={seq_len}",
+            flush=True,
+        )
+    tokenized.set_format(type="torch", columns=list(tokenized.column_names))
+    return tokenized
+
+
+def _add_reference_logprobs(
+    packed: DatasetDict, cfg: Config, tokenizer: PreTrainedTokenizerBase, device: str
+) -> DatasetDict:
+    """One-time pass: forward the frozen reference checkpoint over every packed pair and cache
+    each side's summed log-probability as a new column.
+
+    Not a datasets.map() call — a model forward pass can't run inside a .map() multiprocessing
+    worker the way plain tokenization can — so this is a plain batched DataLoader loop instead.
+    Training itself never loads this model: it's built, used, and freed entirely within this
+    function, which is what keeps DPO training at exactly one resident model's VRAM cost.
+    """
+    from radiance.model import load_transformer_from_checkpoint, sequence_logprob_sum
+
+    ref_model, _ = load_transformer_from_checkpoint(
+        cfg.dpo.reference_checkpoint, device, eos_id=tokenizer.eos_token_id
+    )
+    result = {}
+    for split_name, split in packed.items():
+        loader = DataLoader(split, batch_size=cfg.dpo.reference_batch_size, shuffle=False)
+        chosen_logprobs: list[torch.Tensor] = []
+        rejected_logprobs: list[torch.Tensor] = []
+        with torch.no_grad():
+            for batch in loader:
+                c_ids = batch["chosen_input_ids"].to(device)
+                c_mask = batch["chosen_loss_mask"].to(device)
+                r_ids = batch["rejected_input_ids"].to(device)
+                r_mask = batch["rejected_loss_mask"].to(device)
+                b = c_ids.size(0)
+                logits = ref_model(torch.cat([c_ids, r_ids], dim=0)).logits
+                chosen_logits, rejected_logits = logits.split(b, dim=0)
+                chosen_logprobs.append(sequence_logprob_sum(chosen_logits, c_ids, c_mask).cpu())
+                rejected_logprobs.append(sequence_logprob_sum(rejected_logits, r_ids, r_mask).cpu())
+        split = split.add_column("ref_chosen_logprob", torch.cat(chosen_logprobs).tolist())
+        split = split.add_column("ref_rejected_logprob", torch.cat(rejected_logprobs).tolist())
+        result[split_name] = split
+
+    del ref_model
+    if device.startswith("cuda"):
+        torch.cuda.empty_cache()
+
+    return DatasetDict(result)
+
+
+def _dpo_cache_path(cfg: Config) -> Path:
+    seq_len = cfg.dpo.seq_len or cfg.data.seq_len
+    ref_path = Path(cfg.dpo.reference_checkpoint)
+    ref_stat = ref_path.stat()
+    key = "|".join(
+        [
+            cfg.dpo.dataset,
+            cfg.data.tokenizer,
+            str(seq_len),
+            str(cfg.dpo.prompt_column),
+            str(cfg.dpo.system_column),
+            cfg.dpo.chosen_column,
+            cfg.dpo.rejected_column,
+            cfg.dpo.user_prefix,
+            cfg.dpo.assistant_prefix,
+            str(cfg.dpo.eval_split_size),
+            # Reference checkpoint identity: mtime+size, not a content hash — hashing a
+            # multi-hundred-MB-to-multi-GB checkpoint on every run start would defeat the point of
+            # a fast cache-hit path, and this repo doesn't content-hash checkpoint files anywhere
+            # else either. Changing the reference model (even to a same-path file with new
+            # contents) invalidates the cache since either mtime or size will differ.
+            str(cfg.dpo.reference_checkpoint),
+            str(ref_stat.st_mtime),
+            str(ref_stat.st_size),
+        ]
+    )
+    digest = hashlib.sha256(key.encode()).hexdigest()[:16]
+    return Path(cfg.dpo.cache_dir) / digest
+
+
+def _load_or_build_dpo_packed(cfg: Config, tokenizer: PreTrainedTokenizerBase):
+    cache_path = _dpo_cache_path(cfg)
+    if cfg.dpo.cache_dir and cache_path.exists():
+        packed = load_from_disk(str(cache_path))
+        packed.set_format(type="torch")
+        return packed
+
+    raw = load_dataset(cfg.dpo.dataset)
+    train_split = raw["train"]
+    val_split = raw.get("validation") or raw.get("test")
+    if val_split is None:
+        train_split, val_split = _split_off_eval(train_split, cfg.dpo.eval_split_size)
+
+    packed = DatasetDict({"train": _tokenize_and_filter_dpo(train_split, tokenizer, cfg)})
+    if val_split is not None:
+        packed["validation"] = _tokenize_and_filter_dpo(val_split, tokenizer, cfg)
+
+    device = resolve_device(cfg.train.device)
+    packed = _add_reference_logprobs(packed, cfg, tokenizer, device)
+
+    if cfg.dpo.cache_dir:
+        packed.save_to_disk(str(cache_path))
+
+    # add_column (inside _add_reference_logprobs) doesn't necessarily preserve the "torch" format
+    # set on the original 4 columns, and never applies to the 2 columns it just added — re-apply
+    # unconditionally so this freshly-built path returns tensors exactly like the cache-hit path
+    # above, rather than plain Python lists.
+    packed.set_format(type="torch")
+
+    return packed
+
+
+def build_dpo_dataloaders(cfg: Config, tokenizer: PreTrainedTokenizerBase) -> tuple[DataLoader, DataLoader | None]:
+    """DPO analogue of build_sft_dataloaders: same (train_loader, val_loader) contract, but each
+    batch carries chosen/rejected input_ids+loss_mask plus their cached reference log-probs (see
+    module docstring above)."""
+    if not cfg.dpo.dataset:
+        raise ValueError("dpo.enabled requires dpo.dataset to be set.")
+    if not cfg.dpo.reference_checkpoint:
+        raise ValueError("dpo.enabled requires dpo.reference_checkpoint to be set.")
+
+    def collate(batch):
+        cols = [
+            "chosen_input_ids",
+            "chosen_loss_mask",
+            "rejected_input_ids",
+            "rejected_loss_mask",
+            "ref_chosen_logprob",
+            "ref_rejected_logprob",
+        ]
+        return {c: torch.stack([torch.as_tensor(ex[c]) for ex in batch]) for c in cols}
+
+    loader_kwargs = dict(
+        num_workers=cfg.data.num_workers,
+        persistent_workers=cfg.data.num_workers > 0,
+        prefetch_factor=cfg.data.prefetch_factor if cfg.data.num_workers > 0 else None,
+        collate_fn=collate,
+        drop_last=True,
+    )
+
+    packed = _load_or_build_dpo_packed(cfg, tokenizer)
     train_ds = packed["train"]
     val_ds = packed.get("validation")
 
