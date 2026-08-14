@@ -33,3 +33,17 @@ def test_format_chat_prompt_raises_when_neither_enabled():
 
     with pytest.raises(ValueError, match="sft.enabled|dpo.enabled"):
         format_chat_prompt("hi", cfg)
+
+
+def test_format_chat_prompt_on_pre_pr_checkpoint_hits_guard_not_attributeerror():
+    # A checkpoint pickled before sft/dpo existed on Config has no such attributes after
+    # unpickle (pickle restores __dict__ without running __init__, so default_factory never
+    # fires). Config.__setstate__ backfills them to their (disabled) defaults, so
+    # generate --chat on such a checkpoint lands on the intended guard, not an AttributeError.
+    state = dict(Config().__dict__)
+    del state["sft"], state["dpo"]
+    old = object.__new__(Config)
+    old.__setstate__(state)
+
+    with pytest.raises(ValueError, match="sft.enabled|dpo.enabled"):
+        format_chat_prompt("hi", old)

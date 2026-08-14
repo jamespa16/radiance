@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field, fields, is_dataclass
 
 import torch
 import yaml
@@ -383,10 +383,12 @@ class TrainConfig:
     wsd_decay_ratio: float = 0.2  # only used when lr_schedule == "wsd": fraction of max_steps spent
     # in the final decay phase.
     max_steps: int = 5000  # ignored (overwritten once the model is built) if tokens_per_param is set
-    tokens_per_param: float | None = None  # opt-in: derive max_steps from model size instead of a fixed step
-    # count — max_steps = round(tokens_per_param * num_active_parameters / (effective_batch_size *
-    # data.seq_len)), computed in train.py once the model is built (num_active_parameters excludes
-    # unused MoE expert params when model.use_moe is set). Chinchilla-optimal is ~20 tokens/param.
+    tokens_per_param: float | None = None  # opt-in: derive max_steps from model size instead of a fixed
+    # step count — max_steps = round(tokens_per_param * num_active_parameters /
+    # (effective_batch_size * resolved_row_tokens)), computed in train.py once the model is built
+    # (num_active_parameters excludes unused MoE expert params when model.use_moe is set, and
+    # resolved_row_tokens honors any active sft.seq_len / dpo.seq_len override plus DPO's
+    # chosen+rejected width). Chinchilla-optimal is ~20 tokens/param.
     auto_batch_size: bool = True  # overwrite batch_size/grad_accum_steps at startup, computed from free
     # VRAM + model size (see train.py's estimate_batch_size) instead of the values configured above.
     # Defaults to True — a deliberate behavior change for every existing config, not the usual
@@ -531,6 +533,38 @@ class DPOConfig:
     assistant_prefix: str = "\n\nAssistant: "
 
 
+def _backfill_missing_fields(obj) -> None:
+    """Restore, one field at a time, dataclass fields this pickle predates.
+
+    pickle reconstructs an instance by updating its ``__dict__`` — ``__init__`` never runs —
+    so a checkpoint saved before field ``x`` existed has no ``x`` attribute at all: the
+    ``default``/``default_factory`` machinery only fires inside ``__init__``. Reading such a
+    field then raises ``AttributeError`` instead of falling back to the default (a
+    pre-``sft``/``dpo`` checkpoint would AttributeError in ``format_chat_prompt`` and
+    ``validate_post_training_config``). A missing field is treated the way a YAML config
+    treats an omitted key — with the field's *current* default (see ``load_config``'s
+    ``raw.get("sft", {})``) — and the walk recurses into nested dataclasses, which pickle
+    restores as separate objects each with their own gaps. A field with no default at all
+    predates the schema by more than a default can absorb; there is nothing to restore, so
+    fail loudly instead of pretending.
+    """
+    for f in fields(obj):
+        if f.name not in obj.__dict__:
+            if f.default is not MISSING:
+                setattr(obj, f.name, f.default)
+            elif f.default_factory is not MISSING:
+                setattr(obj, f.name, f.default_factory())
+            else:
+                raise ValueError(
+                    f"unpickled {type(obj).__name__} is missing field {f.name!r}, which has no "
+                    "default to restore it from: the checkpoint predates this schema. Re-save "
+                    "the checkpoint with current code."
+                )
+        nested = getattr(obj, f.name)
+        if is_dataclass(nested) and not isinstance(nested, type):
+            _backfill_missing_fields(nested)
+
+
 @dataclass
 class Config:
     run_name: str = "radiance-run"
@@ -540,6 +574,69 @@ class Config:
     wandb: WandbConfig = field(default_factory=WandbConfig)
     sft: SFTConfig = field(default_factory=SFTConfig)
     dpo: DPOConfig = field(default_factory=DPOConfig)
+
+    @property
+    def resolved_seq_len(self) -> int:
+        """The packed-block width the active data pipeline actually uses.
+
+        ``data.seq_len`` is the pretraining default; SFT and DPO may each override it with their own
+        ``seq_len`` (both default to ``None`` and collapse back to ``data.seq_len``). Anything that sizes
+        memory or token accounting against the training/eval batches — ``estimate_batch_size``,
+        ``tokens_per_step`` — must use this resolved width, not ``data.seq_len`` directly.
+        """
+        if self.dpo.enabled:
+            return self.dpo.seq_len or self.data.seq_len
+        if self.sft.enabled:
+            return self.sft.seq_len or self.data.seq_len
+        return self.data.seq_len
+
+    @property
+    def train_width_multiplier(self) -> int:
+        """How many packed rows one logical batch row forwards at once.
+
+        DPO concatenates a pair's chosen and rejected sequences into a single forward pass, so one
+        DPO row costs twice the token width of one SFT/pretrain row at the same ``seq_len``. This is
+        the single source of truth that both ``estimate_batch_size`` (how many rows fit) and
+        ``tokens_per_step`` (how many tokens those rows process) consult.
+        """
+        return 2 if self.dpo.enabled else 1
+
+    @property
+    def resolved_row_tokens(self) -> int:
+        """Total tokens in one logical training row under the active data pipeline.
+
+        This is the per-row unit that both ``estimate_batch_size`` and ``tokens_per_step`` should
+        use: ``resolved_seq_len`` for pretrain/SFT, and two ``resolved_seq_len`` sequences for DPO
+        (chosen+rejected), each potentially narrowed by the active mode's ``seq_len`` override.
+        """
+        return self.resolved_seq_len * self.train_width_multiplier
+
+    def __setstate__(self, state: dict) -> None:
+        # The default unpickle is object.__new__ + __dict__.update(state); this adds schema
+        # evolution on top, so checkpoints saved before a field was added load with that
+        # field at its default — identical to a config file omitting it. Without this,
+        # pre-sft/dpo checkpoints AttributeError wherever cfg.sft/cfg.dpo is read, because
+        # default_factory only runs inside __init__, which pickle bypasses.
+        self.__dict__.update(state)
+        _backfill_missing_fields(self)
+
+
+def doc_mask_is_inert_for_dpo(model_cfg: ModelConfig) -> bool:
+    """Whether DPO's packing makes this model config's ``doc_attention_mask`` provably a no-op.
+
+    DPO packs **one pair side per row**: real content, then a tail of repeated ``eos_token_id``
+    padding carrying ``loss_mask=0``. ``document_ids``' exclusive cumsum puts every real token —
+    including the single EOS that terminates the content, which *is* scored — in document 0, and
+    each padding EOS in a document of its own. So the only attention the document mask removes is
+    a padded position's, and no padded position contributes a scored logit: every logit the DPO
+    loss reads is bit-identical with the mask on or off. Building it is pure wasted wall-clock,
+    every training step and across the whole reference-logprob precompute pass.
+
+    ``loop_attn_windows`` is the exception, and the reason this is a predicate rather than a bare
+    ``cfg.dpo.enabled``: windows ride the very same BlockMask, and a sliding window restricts
+    attention *within* document 0 — real DPO content genuinely feels it, so the mask stays.
+    """
+    return model_cfg.doc_attention_mask and not model_cfg.loop_attn_windows
 
 
 def resolve_device(device: str) -> str:

@@ -12,7 +12,7 @@ from datasets import DatasetDict, IterableDataset, load_dataset, load_from_disk
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from radiance.config import Config, resolve_device
+from radiance.config import Config, doc_mask_is_inert_for_dpo, resolve_device
 
 logger = logging.getLogger(__name__)
 
@@ -780,10 +780,44 @@ def _add_reference_logprobs(
     """
     from radiance.model import load_transformer_from_checkpoint, sequence_logprob_sum
 
-    ref_model, _ = load_transformer_from_checkpoint(
+    ref_model, ref_cfg = load_transformer_from_checkpoint(
         cfg.dpo.reference_checkpoint, device, eos_id=tokenizer.eos_token_id
     )
+    # The checkpoint was trained with whatever tokenizer its own saved config names. If that
+    # differs from this run's data.tokenizer, its vocab ids don't correspond to this run's packed
+    # ids, and every reference logprob below is computed over a mismatched vocabulary - and
+    # sequence_logprob_sum will happily gather from a no-smaller ref vocab and return
+    # numerically-plausible but semantically meaningless values, silently corrupting the DPO loss
+    # from step 1 with nothing to compare them against. data.tokenizer is the tokenizer identity
+    # the cache keys above already treat as canonical, so compare it here, where both configs are
+    # in hand, rather than letting a mismatched reference surface as a plausible-looking loss.
+    if ref_cfg.data.tokenizer != cfg.data.tokenizer:
+        raise ValueError(
+            f"dpo.reference_checkpoint {cfg.dpo.reference_checkpoint!r} was trained with "
+            f"data.tokenizer={ref_cfg.data.tokenizer!r}, but this run uses "
+            f"data.tokenizer={cfg.data.tokenizer!r}: a mismatched vocabulary, so the reference "
+            "log-probabilities would be meaningless. Point dpo.reference_checkpoint at a "
+            "checkpoint trained with the same data.tokenizer."
+        )
+    # Same skip train() applies to the policy model, for the same reason and against the same
+    # predicate — the rows scored here are exactly the rows trained on, so a mask that cannot
+    # change a scored logit there cannot change one here either. Applied to the *reference*
+    # checkpoint's own model config, which is whatever that run was trained with and need not
+    # match this run's.
+    if doc_mask_is_inert_for_dpo(ref_model.cfg):
+        ref_model.cfg.doc_attention_mask = False
     result = {}
+    # This pass runs before the training loop, so its OOMs never reach the step loop's backoff
+    # (micro_chunk_size / CPU-offload): the reference model is a second resident model on top of
+    # the policy's, reference_batch_size is hand-picked, and an OOM here would just crash the run
+    # at startup. It therefore carries that idiom locally: a fetched batch is processed in
+    # chunks of `chunk_size`, and an OOM halves the size and retries the batch. Rows are
+    # independent here — one row is one (prompt, completion) and its summed log-probability never
+    # reads another row's logits — so chunked calls are mathematically identical to the single
+    # call. `chunk_size` is sticky across batches, like micro_chunk_size: a size that doesn't
+    # fit once doesn't fit later, and backoff never rebuilds anything, only changes how many
+    # forward calls one fetched batch takes.
+    chunk_size = cfg.dpo.reference_batch_size
     for split_name, split in packed.items():
         loader = DataLoader(split, batch_size=cfg.dpo.reference_batch_size, shuffle=False)
         chosen_logprobs: list[torch.Tensor] = []
@@ -795,10 +829,44 @@ def _add_reference_logprobs(
                 r_ids = batch["rejected_input_ids"].to(device)
                 r_mask = batch["rejected_loss_mask"].to(device)
                 b = c_ids.size(0)
-                logits = ref_model(torch.cat([c_ids, r_ids], dim=0)).logits
-                chosen_logits, rejected_logits = logits.split(b, dim=0)
-                chosen_logprobs.append(sequence_logprob_sum(chosen_logits, c_ids, c_mask).cpu())
-                rejected_logprobs.append(sequence_logprob_sum(rejected_logits, r_ids, r_mask).cpu())
+                while True:
+                    batch_chosen: list[torch.Tensor] = []
+                    batch_rejected: list[torch.Tensor] = []
+                    try:
+                        for start in range(0, b, chunk_size):
+                            n = min(chunk_size, b - start)
+                            c_chunk, c_chunk_mask = c_ids[start : start + n], c_mask[start : start + n]
+                            r_chunk, r_chunk_mask = r_ids[start : start + n], r_mask[start : start + n]
+                            logits = ref_model(torch.cat([c_chunk, r_chunk], dim=0)).logits
+                            chosen_logits, rejected_logits = logits.split(n, dim=0)
+                            batch_chosen.append(
+                                sequence_logprob_sum(chosen_logits, c_chunk, c_chunk_mask).cpu()
+                            )
+                            batch_rejected.append(
+                                sequence_logprob_sum(rejected_logits, r_chunk, r_chunk_mask).cpu()
+                            )
+                        break
+                    except torch.cuda.OutOfMemoryError:
+                        # The failed call's output tensors (still referenced by name) are the
+                        # biggest live allocation; drop them before the retry's forward allocates.
+                        logits = chosen_logits = rejected_logits = None
+                        if chunk_size == 1:
+                            torch.cuda.empty_cache()
+                            print(
+                                f"[radiance] CUDA OOM in DPO reference-logprob precompute even at batch "
+                                f"size 1: a single row pair does not fit with the policy model resident. "
+                                f"Lower dpo.reference_batch_size (currently {cfg.dpo.reference_batch_size}) "
+                                "or shorten the sequence length, and relaunch."
+                            )
+                            raise
+                        torch.cuda.empty_cache()
+                        chunk_size = max(1, chunk_size // 2)
+                        print(
+                            f"[radiance] CUDA OOM in DPO reference-logprob precompute, backing off batch "
+                            f"size to {chunk_size} and retrying."
+                        )
+                chosen_logprobs.append(torch.cat(batch_chosen))
+                rejected_logprobs.append(torch.cat(batch_rejected))
         split = split.add_column("ref_chosen_logprob", torch.cat(chosen_logprobs).tolist())
         split = split.add_column("ref_rejected_logprob", torch.cat(rejected_logprobs).tolist())
         result[split_name] = split
@@ -811,10 +879,27 @@ def _add_reference_logprobs(
 
 
 def _dpo_cache_path(cfg: Config) -> Path:
+    """Where the packed DPO dataset (reference log-prob columns included) is cached on disk.
+
+    Under `cache_dir`, keyed on every field this pipeline derives from, in two levels rather
+    than one digest: a base digest over the dataset/tokenizer/columns/prefixes fields, and a
+    `ref-*` subdirectory digesting the reference checkpoint's identity (path+mtime+size, not a
+    content hash — hashing a multi-hundred-MB-to-multi-GB checkpoint on every run start would
+    defeat the point of a fast cache-hit path, and this repo doesn't content-hash checkpoint
+    files anywhere else either. Changing the reference model (even to a same-path file with new
+    contents) invalidates the cache since either mtime or size will differ).
+
+    The checkpoint is only ever needed to *compute* the reference log-probs; once that pass has
+    run and the packed dataset is cached, no later step touches the file. If it has since been
+    archived or moved away, its identity is no longer computable, so the cache built while it
+    was present is resolved by listing `ref-*` under the base digest instead. That is
+    unambiguous only when exactly one such cache exists for this base key; with zero there is
+    nothing to load and no checkpoint to rebuild from, and with several it is not knowable which
+    reference model's log-probs a given cache holds — reusing the wrong one corrupts the DPO
+    loss silently — so both raise.
+    """
     seq_len = cfg.dpo.seq_len or cfg.data.seq_len
-    ref_path = Path(cfg.dpo.reference_checkpoint)
-    ref_stat = ref_path.stat()
-    key = "|".join(
+    base_key = "|".join(
         [
             cfg.dpo.dataset,
             cfg.data.tokenizer,
@@ -826,18 +911,40 @@ def _dpo_cache_path(cfg: Config) -> Path:
             cfg.dpo.user_prefix,
             cfg.dpo.assistant_prefix,
             str(cfg.dpo.eval_split_size),
-            # Reference checkpoint identity: mtime+size, not a content hash — hashing a
-            # multi-hundred-MB-to-multi-GB checkpoint on every run start would defeat the point of
-            # a fast cache-hit path, and this repo doesn't content-hash checkpoint files anywhere
-            # else either. Changing the reference model (even to a same-path file with new
-            # contents) invalidates the cache since either mtime or size will differ.
-            str(cfg.dpo.reference_checkpoint),
-            str(ref_stat.st_mtime),
-            str(ref_stat.st_size),
         ]
     )
-    digest = hashlib.sha256(key.encode()).hexdigest()[:16]
-    return Path(cfg.dpo.cache_dir) / digest
+    base_dir = Path(cfg.dpo.cache_dir) / hashlib.sha256(base_key.encode()).hexdigest()[:16]
+
+    ref_path = Path(cfg.dpo.reference_checkpoint)
+    try:
+        ref_stat = ref_path.stat()
+    except FileNotFoundError:
+        candidates = (
+            sorted(d for d in base_dir.iterdir() if d.is_dir() and d.name.startswith("ref-"))
+            if base_dir.is_dir()
+            else []
+        )
+        if not candidates:
+            raise ValueError(
+                f"dpo.reference_checkpoint {cfg.dpo.reference_checkpoint!r} does not exist, and "
+                f"no cached DPO dataset for this dataset/config was found under "
+                f"{cfg.dpo.cache_dir!r}: the reference log-probabilities are computed from that "
+                "checkpoint, so there is nothing to load and nothing to rebuild it from. Restore "
+                "the checkpoint (or point dpo.reference_checkpoint at its new location)."
+            )
+        if len(candidates) > 1:
+            raise ValueError(
+                f"dpo.reference_checkpoint {cfg.dpo.reference_checkpoint!r} does not exist, and "
+                f"{len(candidates)} cached DPO datasets built against different reference "
+                f"checkpoints were found under {base_dir}: it is not possible to tell which "
+                "reference model the reference log-probabilities were computed against, and "
+                "reusing the wrong one would silently corrupt the DPO loss. Point "
+                "dpo.reference_checkpoint at the intended (still-present) checkpoint to use its "
+                f"cache, or delete the ones you no longer need ({', '.join(c.name for c in candidates)})."
+            )
+        return candidates[0]
+    ref_key = f"{cfg.dpo.reference_checkpoint}|{ref_stat.st_mtime}|{ref_stat.st_size}"
+    return base_dir / ("ref-" + hashlib.sha256(ref_key.encode()).hexdigest()[:16])
 
 
 def _load_or_build_dpo_packed(cfg: Config, tokenizer: PreTrainedTokenizerBase):

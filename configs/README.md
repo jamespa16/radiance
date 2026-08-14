@@ -66,7 +66,7 @@ Only the fields you need to change — everything else falls back to the datacla
 - **`dropout`** — attention-weight dropout. Set to `0.0` when using `doc_attention_mask` (flex_attention has no dropout).
 - **`max_seq_len`** — maximum context length.
 - **`rope_theta`** — RoPE base frequency.
-- **`doc_attention_mask`** — mask attention at document boundaries in packed sequences so tokens cannot attend across unrelated documents. Uses `flex_attention` on CUDA; falls back to plain SDPA on CPU and during generation.
+- **`doc_attention_mask`** — mask attention at document boundaries in packed sequences so tokens cannot attend across unrelated documents. Uses `flex_attention` on CUDA; falls back to plain SDPA on CPU and during generation. Turned off automatically for `dpo.enabled` runs (one pair side per row makes it provably inert), unless `loop_attn_windows` is also set.
 - **`loop_attn_windows`** — per-iteration attention window sizes (e.g. `[128, 128, 512, 512]` for local-then-global). Requires `doc_attention_mask` (rides the same flex_attention machinery). `None` = fully global.
 - **`grad_checkpoint`** — recompute activations during backward instead of storing them; trades ~20-25% throughput for large memory savings, especially under looping. Training-only.
 - **`vocab_pad_multiple`** — round vocab size up to this multiple for tensor-core alignment on `lm_head`. `1` disables. Padding rows are unreachable by any tokenizer id.
@@ -86,7 +86,7 @@ Only the fields you need to change — everything else falls back to the datacla
 - **`lr_schedule`** — `"cosine"` (default) or `"wsd"` (warmup-stable-decay: hold full LR, decay only the final `wsd_decay_ratio`).
 - **`wsd_decay_ratio`** — fraction of `max_steps` spent in the final decay phase when `lr_schedule: "wsd"`.
 - **`max_steps`** — training step count; ignored if `tokens_per_param` is set.
-- **`tokens_per_param`** — derive `max_steps` from model size instead; Chinchilla-optimal is ~20. Overwrites `max_steps` once the model is built.
+- **`tokens_per_param`** — derive `max_steps` from model size instead; Chinchilla-optimal is ~20. Overwrites `max_steps` once the model is built, using `resolved_row_tokens` so active `sft.seq_len`/`dpo.seq_len` overrides and DPO's chosen+rejected width are reflected.
 - **`auto_batch_size`** — compute `batch_size`/`grad_accum_steps` from free VRAM and model size at startup. Defaults on; makes the actual micro-batch safer, never bigger. Also enables OOM backoff. CUDA-only.
 - **`target_effective_batch_size`** — effective batch size `auto_batch_size` solves for; `None` preserves the configured `batch_size * grad_accum_steps`.
 - **`vram_safety_margin`** — fraction of estimated VRAM budget to use when `auto_batch_size` is on; lower is more conservative.
