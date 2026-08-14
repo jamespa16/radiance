@@ -1,0 +1,114 @@
+# SFT on top of checkpoints/fineweb_moe_hyper_router/step_4000.pt (~523M total / 288M active
+# params — MoE + hyper-connections + learned loop-depth, see fineweb_moe_hyper_router.yaml's
+# header for how that config was sized on this card).
+#
+# `model:` below is copied verbatim from fineweb_moe_hyper_router.yaml: train.init_from loads
+# weights into an already-constructed model, so every shape-relevant field (not just
+# d_model/n_layers/head_dim that load_pretrained_weights explicitly checks, but use_moe/
+# use_router/hyper_conn_streams/etc., which change what keys the state dict even has) must match
+# exactly, or load_state_dict fails outright.
+#
+# Dataset: HuggingFaceH4/no_robots — 10k human-written (not model-generated) instruction examples,
+# curated by HF, native `messages` column. Chosen over a larger option like
+# HuggingFaceH4/ultrachat_200k for this run specifically because its train/test split names match
+# what build_sft_dataloaders assumes out of the box (literal "train", carved eval otherwise) and
+# it's already been exercised end-to-end in this repo's own SFT smoke test — a multi-hour download
+# discovering a split-name mismatch partway through is a worse failure mode than a 10k-example
+# dataset being "only" LIMA-scale. 10k high-quality examples is itself a legitimate SFT dataset
+# size (see the "less is more" instruction-tuning literature); no_robots was part of Zephyr-7B's
+# own SFT mix, not a toy set.
+#
+# train.batch_size/grad_accum_steps/auto_batch_size mirror the pretrain config's pinned values:
+# this architecture leaves auto_batch_size's estimate_batch_size() blind to Muon's per-optimizer-
+# step Newton-Schulz stacking cost (see the pretrain config's header), so it must stay pinned to
+# the value already proven to run clean on this card, not re-estimated.
+
+run_name: fineweb-moe-hyper-router-sft-v2
+
+data:
+  tokenizer: gpt2
+  seq_len: 1024
+  num_workers: 4
+
+model:
+  d_model: 1024
+  head_dim: 64
+  n_layers: 6
+  ffn_mult: 4.0
+  ffn_depth: 2
+
+  use_router: true
+  max_loops: 4
+  ponder_weight: 1.0e-2
+  halt_epsilon: 0.01
+
+  hyper_conn_streams: 2
+  hyper_conn_dynamic: true
+  loop_iter_conditioning: norm_gains
+  loop_input_injection: true
+
+  use_moe: true
+  n_experts: 16
+  moe_top_k: 2
+  moe_expert_ffn_mult: 0.25
+  moe_n_shared: 1
+  moe_dense_every: 3
+  moe_capacity_factor: 1.25
+  moe_aux_loss_weight: 1.0e-3
+
+  mup_base_d_model: 256 # unchanged from the pretrain config — the same muP correction now also
+  # carries this run's (lower) SFT lr across the same width jump, with no extra work needed here.
+
+  dropout: 0.0
+  max_seq_len: 1024
+
+sft:
+  enabled: true
+  dataset: HuggingFaceH4/no_robots
+  messages_column: messages
+  eval_split_size: 200 # no_robots' own "test" split isn't named "validation", so this carves a
+  # held-out slice off train instead — see data._split_off_eval.
+
+train:
+  init_from: checkpoints/fineweb_moe_hyper_router/step_4000.pt
+
+  batch_size: 4 # pinned to the pretrain config's proven-safe value — see file header
+  grad_accum_steps: 16 # effective_batch_size=64 (65,536 tokens/step): smaller than pretraining's
+  # 256, deliberately — SFT wants more optimizer updates over a small dataset, not the largest
+  # batch Muon can amortize over.
+  auto_batch_size: false
+
+  optimizer: muon
+  lr: 1.0e-3 # ~1/10th the pretrain config's 1.0e-2: fine-tuning wants gentler updates than a
+  # from-scratch run's already-tuned peak, on the tensors AdamW still owns
+  muon_lr: 4.0e-3 # ~1/5th the pretrain config's 0.02, same reasoning
+  # hyper_conn_lr intentionally left at its non-null 1.0e-3 default (not train.lr) — see
+  # fineweb_moe_hyper_router.yaml's header for why sharing it erases the routing structure.
+  warmup_ratio: 0.03
+
+  # v2: the first attempt (max_steps: 300) overfit badly — val/loss rose monotonically from 2.80
+  # at step 50 to 3.79 at step 300 while train loss fell to 0.40, and save_every only keeps the
+  # latest checkpoint, so the actual best point (~step 50) was overwritten by the time the run
+  # ended. Stopping at 75 keeps the final checkpoint close to where val/loss was still near its
+  # minimum, with eval_every/save_every tightened to 25 so there's real resolution in that window.
+  max_steps: 75
+
+  grad_clip: 1.0
+  log_every: 10
+  eval_every: 25
+  eval_max_batches: 50
+  save_every: 25
+  # New output_dir (not the v1 run's): the old dir's step_300.pt is the overfit checkpoint, and
+  # resume_from: auto below would otherwise pick it up and continue training on top of it instead
+  # of restarting fresh from init_from's base checkpoint, which is what a shorter re-run needs.
+  output_dir: checkpoints/fineweb_moe_hyper_router_sft_v2
+  resume_from: auto
+  seed: 42
+  device: auto
+  compile: true
+  dtype: bf16
+
+wandb:
+  project: radiance
+  entity: null
+  mode: online

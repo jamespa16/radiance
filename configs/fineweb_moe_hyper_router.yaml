@@ -159,7 +159,7 @@ train:
   output_dir: checkpoints/fineweb_moe_hyper_router
   # Uncomment to resume an interrupted run from output_dir's checkpoint instead of restarting —
   # restores optimizer moments and the LR schedule, not just the weights.
-  # resume_from: auto
+  resume_from: auto
   seed: 42
   device: auto
   compile: true
