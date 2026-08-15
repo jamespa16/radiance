@@ -284,6 +284,59 @@ def build_muon_param_groups(model: torch.nn.Module, cfg: Config) -> list[dict]:
     return [g for g in groups if g["params"]]
 
 
+# Peak transient bytes inside one orthogonalize() call, per fp32 grad element in the stacked input
+# (X, A, A@A, B, B@X collectively — see orthogonalize's body). Measured directly (max_memory_allocated
+# delta, fp32 input, isolated orthogonalize() calls) rather than derived, the same convention
+# activation_bytes_per_token uses for diff attention's 7*d_model: square (in, out) shapes (the worst
+# case — A/B are (rows, rows), which shrinks relative to X as the shape gets more rectangular) landed
+# at a flat 12 bytes/elem across batch sizes 8-32 and shapes up to 1024x1024; rectangular shapes
+# measured lower (9 bytes/elem), so 12 stays conservative rather than shape-specific.
+_MUON_NS_BYTES_PER_ELEM = 12
+
+
+def muon_orthogonalize_reserve_bytes(model: torch.nn.Module, cfg: Config) -> int:
+    """VRAM estimate_batch_size should hold back for _step_muon's per-shape orthogonalize() call,
+    which allocates transient Newton-Schulz buffers with no relationship to num_params — see
+    _step_muon's docstring and _MUON_MAX_STACK. estimate_batch_size's existing not_yet_allocated_bytes
+    covers the *persistent* grad/momentum footprint (which does scale with num_params); this covers
+    the *transient* per-optimizer-step spike that footprint estimate has no term for at all.
+
+    Returns 0 when cfg.train.optimizer isn't "muon" (nothing to reserve for) or the model has no
+    Muon-owned tensors (e.g. every hidden weight excluded some other way).
+
+    Sizing: _step_muon unbinds every Muon-owned tensor into its individual (in, out) matrices — a
+    BatchedExperts-shaped (n_experts, in, out) tensor unbinds to n_experts matrices sharing one
+    (in, out) shape with every other layer's same-shaped projection — then stacks up to
+    _MUON_MAX_STACK of them per orthogonalize() call. The worst single call is therefore whichever
+    (in, out) shape has the most matrices, capped at _MUON_MAX_STACK, not the largest individual
+    tensor: a fine-grained MoE model's narrow expert projections can out-number a dense model's wide
+    ones by more than the width difference, and it's the matrix *count* at a shape that decides
+    how many chunks share one orthogonalize() call.
+    """
+    if cfg.train.optimizer != "muon":
+        return 0
+    groups = build_muon_param_groups(model, cfg)
+    muon_params = next((g["params"] for g in groups if g["algorithm"] == "muon"), [])
+    if not muon_params:
+        return 0
+
+    matrix_counts: dict[tuple[int, int], int] = {}
+    for p in muon_params:
+        if p.dim() == 2:
+            shape = (p.shape[0], p.shape[1])
+            matrix_counts[shape] = matrix_counts.get(shape, 0) + 1
+        else:
+            # BatchedExperts-style (n_experts, in, out): unbinds to n_experts matrices of the
+            # trailing (in, out) shape, same as _step_muon's by_shape grouping.
+            shape = (p.shape[-2], p.shape[-1])
+            matrix_counts[shape] = matrix_counts.get(shape, 0) + p.shape[0]
+
+    worst_chunk_elems = max(
+        min(count, _MUON_MAX_STACK) * rows * cols for (rows, cols), count in matrix_counts.items()
+    )
+    return _MUON_NS_BYTES_PER_ELEM * worst_chunk_elems
+
+
 def orthogonalize(grad: torch.Tensor, steps: int = 5, eps: float = 1.0e-7) -> torch.Tensor:
     """Newton-Schulz quintic iteration: replace a matrix by (approximately) the orthogonal factor
     of its polar decomposition, i.e. the same matrix with every singular value driven toward 1.

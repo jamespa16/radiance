@@ -109,6 +109,50 @@ def test_moe_expert_stacks_are_routed_to_muon():
     assert id(moe.router.proj.weight) not in muon_params  # routers stay on AdamW
 
 
+# --- Newton-Schulz VRAM reserve (muon_orthogonalize_reserve_bytes) -------------------------
+
+
+def test_muon_ns_reserve_zero_when_optimizer_is_not_muon():
+    """Nothing to reserve for an optimizer whose step never calls orthogonalize()."""
+    model, cfg = _model_and_cfg()
+    cfg.train.optimizer = "adamw"
+    assert optim_module.muon_orthogonalize_reserve_bytes(model, cfg) == 0
+
+
+def test_muon_ns_reserve_positive_for_a_plain_muon_model():
+    model, cfg = _model_and_cfg()
+    assert optim_module.muon_orthogonalize_reserve_bytes(model, cfg) > 0
+
+
+def test_muon_ns_reserve_caps_at_max_stack_matrices(monkeypatch):
+    """_step_muon stacks at most _MUON_MAX_STACK matrices of a shape per orthogonalize() call, so
+    the reserve must cap there too rather than growing with the raw matrix count at a shape — the
+    same distinction that made the original chunking fix (see _step_muon's docstring) non-trivial:
+    a MoE model's per-shape matrix count is n_moe_layers * n_experts, unrelated to num_params."""
+    model, cfg = _model_and_cfg(use_moe=True, n_experts=8)
+    groups = build_muon_param_groups(model, cfg)
+    muon_params = next(g["params"] for g in groups if g["algorithm"] == "muon")
+
+    matrix_counts: dict[tuple[int, int], int] = {}
+    for p in muon_params:
+        if p.dim() == 2:
+            shape = (p.shape[0], p.shape[1])
+            matrix_counts[shape] = matrix_counts.get(shape, 0) + 1
+        else:
+            shape = (p.shape[-2], p.shape[-1])
+            matrix_counts[shape] = matrix_counts.get(shape, 0) + p.shape[0]
+    uncapped_worst_elems = max(count * rows * cols for (rows, cols), count in matrix_counts.items())
+
+    monkeypatch.setattr(optim_module, "_MUON_MAX_STACK", 1_000_000)  # cap never binds
+    uncapped = optim_module.muon_orthogonalize_reserve_bytes(model, cfg)
+    assert uncapped == optim_module._MUON_NS_BYTES_PER_ELEM * uncapped_worst_elems
+
+    monkeypatch.setattr(optim_module, "_MUON_MAX_STACK", 2)
+    capped = optim_module.muon_orthogonalize_reserve_bytes(model, cfg)
+    assert capped < uncapped, (
+        "reserve must shrink once the per-shape matrix count exceeds the (patched) cap"
+    )
+
 
 def test_muon_group_uses_muon_lr():
     """Muon needs a ~50x larger LR than AdamW; the two must not share one field."""

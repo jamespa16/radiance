@@ -28,7 +28,7 @@ from radiance.data import (
     dpo_cache_exists,
 )
 from radiance.model import DenseTransformer, checkpoint_param_bytes, padded_vocab_size, sequence_logprob_sum
-from radiance.optim import build_optimizer, migrate_optimizer_to_cpu_offload
+from radiance.optim import build_optimizer, migrate_optimizer_to_cpu_offload, muon_orthogonalize_reserve_bytes
 
 
 def set_seed(seed: int) -> None:
@@ -190,7 +190,17 @@ def estimate_batch_size(
     # the time this is called, so mem_get_info's free_bytes already excludes them; adding them
     # again would subtract the same memory twice and hand the run a needlessly small micro-batch.
     # raw_model.fp4_cache_bytes() reports the figure for anyone sizing a run by hand.
-    usable_bytes = max(0.0, free_bytes - not_yet_allocated_bytes - reserve_bytes) * cfg.train.vram_safety_margin
+    #
+    # Muon's per-shape orthogonalize() call (optim.py's _step_muon) allocates transient
+    # Newton-Schulz buffers that scale with matrix *count* at a shape (capped at _MUON_MAX_STACK),
+    # not with num_params — a fine-grained MoE model's narrow expert projections can spike here far
+    # out of proportion to what not_yet_allocated_bytes above already reserves. See
+    # muon_orthogonalize_reserve_bytes's docstring and docs/optim.md.
+    ns_reserve_bytes = muon_orthogonalize_reserve_bytes(raw_model, cfg)
+    usable_bytes = (
+        max(0.0, free_bytes - not_yet_allocated_bytes - ns_reserve_bytes - reserve_bytes)
+        * cfg.train.vram_safety_margin
+    )
 
     activation_dtype_bytes = 4 if cfg.train.dtype == "fp32" else 2
     bytes_per_token = raw_model.activation_bytes_per_token(activation_dtype_bytes)
@@ -205,8 +215,9 @@ def estimate_batch_size(
 
     unit = "pairs" if cfg.dpo.enabled else "sequences"
     reserve_note = f", reserve_bytes={reserve_bytes / 1e9:.2f} GB (DPO reference checkpoint)" if reserve_bytes else ""
+    ns_reserve_note = f", muon_ns_reserve={ns_reserve_bytes / 1e9:.2f} GB" if ns_reserve_bytes else ""
     print(
-        f"[radiance] auto_batch_size: {free_bytes / 1e9:.2f} GB free{reserve_note}, {num_params:,} params, "
+        f"[radiance] auto_batch_size: {free_bytes / 1e9:.2f} GB free{reserve_note}{ns_reserve_note}, {num_params:,} params, "
         f"vram_safety_margin={cfg.train.vram_safety_margin} -> batch_size={batch_size} {unit}, "
         f"grad_accum_steps={grad_accum_steps} (effective_batch_size={batch_size * grad_accum_steps}, "
         f"target={cfg.train.target_effective_batch_size})"
