@@ -44,7 +44,7 @@ from .quantize import (
     FP4_VALUES,
     TINY,
     NVFP4Tensor,
-    _block_scale,
+    _block_scale,  # noqa: F401 -- re-exported only for tests/test_nvfp4.py's reflective access
     blocked_offset,
     dequantize,
     encode_e2m1,

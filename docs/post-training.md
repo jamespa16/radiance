@@ -157,7 +157,7 @@ not justified without a concrete bug the current shape causes.
 loss need: a per-row `(batch,)` **sum** of log-probability at `loss_mask==1` positions, using the same
 single-`logsumexp`-pass trick `losses._nll_and_logz` uses but keeping the batch dimension — `_nll_and_logz` reduces
 to one batch-wide *mean*, the right reduction for a plain LM loss but not for DPO, which needs one log-probability
-scalar per sequence. It lives in `model/` (`masking.sequence_logprob_sum`), not `train.py`, purely because of import
+scalar per sequence. It lives in `model/` (`dpo.sequence_logprob_sum`), not `train.py`, purely because of import
 direction: `dpo_data.py`'s precompute needs it too, and `dpo_data.py` must not import `train.py` (which already
 imports it) — both already import `model/`. `model.load_transformer_from_checkpoint(path, device, eos_id=None)` moved there for the identical
 reason: `generate.py` owns this logic and imports `data.py`, so `data.py` can't import `generate.py` back;

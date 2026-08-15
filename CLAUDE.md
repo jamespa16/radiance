@@ -116,9 +116,10 @@ only the model package imports. `model/` and `nvfp4/` are packages whose `__init
 - **`model/`** — `DenseTransformer` (`transformer.py`): token + learned positional embeddings, a stack of pre-norm
   `TransformerBlock`s (`block.py`), final LayerNorm, weight-tied LM head. `blocks[0]` runs once; `blocks[1:]` is a
   **shared-weight loop body** re-run a fixed or learned number of times per forward, which is the central
-  architectural idea here and what most features exist to support. Attention + KV cache in `attention.py`, document
-  masking in `masking.py`, dense/MoE feed-forward in `ffn.py`, ACT in `act.py`, MTP in `mtp.py`, norms in `norms.py`,
-  hyper-connections in `hyper_connections.py`, checkpoint reconstruction in `load.py`.
+  architectural idea here and what most features exist to support. Shared dataclasses (`ModelOutput`, `LoopContext`)
+  in `core.py`, attention + KV cache in `attention.py`, document masking in `masking.py`, dense/MoE feed-forward in
+  `ffn.py`, ACT in `act.py`, MTP in `mtp.py`, norms in `norms.py`, hyper-connections in `hyper_connections.py`,
+  checkpoint reconstruction in `load.py`, DPO's `sequence_logprob_sum` in `dpo.py`.
 - **`nvfp4/`** — NVFP4 4-bit GEMM primitives. Separate from the model package because it is ~600 lines of Triton with
   nothing to do with architecture: `quantize.py` (format constants, pure-torch reference, Triton kernels),
   `linear.py` (`FP4Linear` and the per-step weight refresh).
