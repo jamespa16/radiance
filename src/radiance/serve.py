@@ -27,6 +27,15 @@ from radiance.sft_data import format_chat_messages
 logger = logging.getLogger("radiance.serve")
 
 
+def _token_matches(token: str, key: str) -> bool:
+    """Constant-time comparison that also tolerates non-ASCII input. `secrets.compare_digest`
+    raises TypeError when given a `str` containing non-ASCII characters (e.g. a header decoded
+    via Starlette's latin-1 header codec, or a non-ASCII --api-key); comparing the UTF-8-encoded
+    bytes instead sidesteps that restriction without weakening the constant-time guarantee.
+    """
+    return secrets.compare_digest(token.encode("utf-8"), key.encode("utf-8"))
+
+
 def _require_chat_enabled(cfg: Config) -> None:
     if not (cfg.sft.enabled or cfg.dpo.enabled):
         raise ValueError(
@@ -87,17 +96,31 @@ class RateLimiter:
     def __init__(self, limit_per_minute: int):
         self.limit_per_minute = limit_per_minute
         self._windows: dict[str, tuple[int, int]] = {}
+        self._last_swept_window: int | None = None
 
     def allow(self, key: str) -> bool:
         if self.limit_per_minute <= 0:
             return True
         window = int(time.monotonic() // 60)
+        self._sweep(window)
         start_window, count = self._windows.get(key, (window, 0))
         if start_window != window:
             start_window, count = window, 0
         count += 1
         self._windows[key] = (start_window, count)
         return count <= self.limit_per_minute
+
+    def _sweep(self, window: int) -> None:
+        """Evicts entries from stale windows so `_windows` doesn't grow without bound over the
+        life of a long-running server as new client IPs/keys are seen. Runs at most once per
+        window (not on every call), so this stays O(1) amortized.
+        """
+        if self._last_swept_window == window:
+            return
+        self._last_swept_window = window
+        stale_keys = [k for k, (start_window, _) in self._windows.items() if start_window != window]
+        for k in stale_keys:
+            del self._windows[k]
 
 
 class ChatMessage(BaseModel):
@@ -237,29 +260,30 @@ def create_app(
     app = FastAPI()
 
     async def _auth_and_rate_limit(request: Request) -> None:
-        """Dependency on every /v1/* route: bearer-token auth (skipped entirely when no keys are
-        configured, matching the quickstart's no-flags-needed default) followed by a per-key rate
-        limit, checked in that order and both before the route handler ever touches `lock` — an
-        over-quota or unauthenticated request must never queue behind a real generation.
+        """Dependency on every /v1/* route: a per-client-IP rate limit followed by bearer-token
+        auth (skipped entirely when no keys are configured, matching the quickstart's
+        no-flags-needed default), both before the route handler ever touches `lock` — an
+        over-quota, unauthenticated, or invalid-key request must never queue behind a real
+        generation. The rate limit is keyed by client IP rather than by API key so that requests
+        with a missing or wrong key — which never reach the auth check's success path — are still
+        throttled instead of getting unlimited attempts to brute-force a key.
         """
-        if api_keys:
-            authorization = request.headers.get("authorization", "")
-            token = authorization[len("Bearer ") :] if authorization.startswith("Bearer ") else ""
-            if not any(secrets.compare_digest(token, key) for key in api_keys):
-                raise HTTPException(
-                    status_code=401,
-                    detail={"error": {"message": "Invalid API key", "type": "invalid_request_error"}},
-                )
-            rate_limit_key = token
-        else:
-            rate_limit_key = request.client.host if request.client else "unknown"
-
-        if not limiter.allow(rate_limit_key):
+        client_ip = request.client.host if request.client else "unknown"
+        if not limiter.allow(client_ip):
             raise HTTPException(
                 status_code=429,
                 detail={"error": {"message": "Rate limit exceeded", "type": "rate_limit_error"}},
                 headers={"Retry-After": "60"},
             )
+
+        if api_keys:
+            authorization = request.headers.get("authorization", "")
+            token = authorization[len("Bearer ") :] if authorization.startswith("Bearer ") else ""
+            if not any(_token_matches(token, key) for key in api_keys):
+                raise HTTPException(
+                    status_code=401,
+                    detail={"error": {"message": "Invalid API key", "type": "invalid_request_error"}},
+                )
 
     @app.middleware("http")
     async def _log_and_count(request: Request, call_next):
@@ -319,6 +343,21 @@ def create_app(
         if not matches:
             return None
         return min(matches, key=lambda s: text.index(s))
+
+    def _longest_partial_overlap(text: str, stop_seqs: list[str]) -> int:
+        """Length of the longest suffix of `text` that is a strict prefix of some stop sequence —
+        i.e. text that could still turn into a stop-sequence match once more text arrives, and so
+        must not be emitted yet. Used to hold back a streamed delta that ends mid-stop-sequence
+        instead of yielding it (and, for a streaming response, sending it to the client) before
+        it's known whether the stop sequence will actually complete.
+        """
+        best = 0
+        for s in stop_seqs:
+            for n in range(min(len(text), len(s) - 1), 0, -1):
+                if text.endswith(s[:n]):
+                    best = max(best, n)
+                    break
+        return best
 
     def _finish_reason(completion_tokens: int, max_tokens: int, stopped_on_sequence: bool) -> str:
         # generate_tokens only stops early (before max_tokens iterations) via internal EOS
@@ -414,12 +453,18 @@ def create_app(
         `(delta_text, stopped, count)` as tokens arrive, where `stopped` is True on the final
         tuple iff generation ended because a stop sequence matched (as opposed to exhausting
         max_tokens or hitting EOS), and `count` is the number of tokens generated so far.
+
+        Text that could be the start of a stop sequence is held back rather than yielded
+        immediately, since a stop sequence can span multiple underlying token deltas — yielding
+        eagerly would leak a partial stop sequence into the response (and, for a streaming
+        request, onto the wire) before it's known whether it actually completes.
         """
         sync_gen = generate_tokens(
             model, tokenizer, input_ids, req.max_tokens, req.temperature, req.top_k, device, req.loops
         )
         stream = _iter_in_thread(_decode_deltas(sync_gen, tokenizer))
         text_so_far = ""
+        yielded_len = 0
         count = 0
         try:
             async for delta in stream:
@@ -427,10 +472,15 @@ def create_app(
                 text_so_far += delta
                 stop_at = _matched_stop(text_so_far, stop_seqs)
                 if stop_at is not None:
-                    overshoot = len(text_so_far) - len(text_so_far.split(stop_at, 1)[0])
-                    yield delta[: len(delta) - overshoot], True, count
+                    stop_index = text_so_far.index(stop_at)
+                    yield text_so_far[yielded_len:stop_index], True, count
                     return
-                yield delta, False, count
+                safe_boundary = len(text_so_far) - _longest_partial_overlap(text_so_far, stop_seqs)
+                if safe_boundary > yielded_len:
+                    yield text_so_far[yielded_len:safe_boundary], False, count
+                    yielded_len = safe_boundary
+            if yielded_len < len(text_so_far):
+                yield text_so_far[yielded_len:], False, count
         finally:
             await stream.aclose()
 
