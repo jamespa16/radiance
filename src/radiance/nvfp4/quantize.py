@@ -1,7 +1,7 @@
 """NVFP4 quantization: the format reference implementation and the Triton kernels.
 
 Part of the `radiance.nvfp4` package - the package `__init__` re-exports everything here, so
-`nvfp4.<name>` access from `model.py` and the tests is unchanged. The `FP4Linear` layer that
+`nvfp4.<name>` access from `model/` and the tests is unchanged. The `FP4Linear` layer that
 consumes these primitives lives in `linear.py`.
 """
 

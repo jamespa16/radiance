@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
+
+if TYPE_CHECKING:
+    from .attention import KVCache
 class ModelOutput(NamedTuple):
     """DenseTransformer.forward's return value.
 

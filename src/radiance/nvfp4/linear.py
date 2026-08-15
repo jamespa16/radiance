@@ -51,7 +51,7 @@ class _FP4LinearFn(torch.autograd.Function):
     as a negative control.
 
     Being outside autograd also means straight-through estimation needs no `x - x.detach()` trick
-    (contrast `_counterfactual_probe_signal` in `model.py`): the gradient computed against the
+    (contrast `_counterfactual_probe_signal` in `model/ffn.py`): the gradient computed against the
     quantized operands *is* returned as the gradient of the full-precision input, which is exactly
     the identity Jacobian STE asks for.
 

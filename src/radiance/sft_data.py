@@ -10,11 +10,11 @@ from transformers import PreTrainedTokenizerBase
 
 from radiance.config import Config
 
-from .data import _split_off_eval
+from .data import split_off_eval
 
 # SFT (post-training): same overall shape as the pretrain path (tokenize -> pack into fixed
 # seq_len blocks -> cache to disk -> collate), with two differences carried alongside input_ids at
-# every stage: each example is chat-formatted (see _format_sft_messages/_tokenize_sft_example)
+# every stage: each example is chat-formatted (see _format_sft_messages/tokenize_sft_example)
 # rather than plain text, and a per-token loss_mask travels with it so only assistant-turn tokens
 # (and the trailing EOS) are scored. Packing multiple examples per block and letting
 # doc_attention_mask isolate them via the same EOS-boundary detection it already uses for
@@ -40,7 +40,7 @@ def _format_sft_messages(example: dict, cfg: Config) -> list[dict]:
     return example[cfg.sft.messages_column]
 
 
-def _tokenize_sft_example(
+def tokenize_sft_example(
     messages: list[dict], tokenizer: PreTrainedTokenizerBase, user_prefix: str, assistant_prefix: str
 ) -> tuple[list[int], list[int]]:
     """Tokenize one chat example to (ids, loss_mask).
@@ -69,7 +69,7 @@ def _tokenize_sft_example(
 
 
 def format_sft_prompt(user_message: str, cfg: Config) -> str:
-    """The same turn-formatting _tokenize_sft_example applies, for a single open user turn —
+    """The same turn-formatting tokenize_sft_example applies, for a single open user turn —
     used by generate.py so prompting an SFT checkpoint matches how it was trained."""
     return cfg.sft.user_prefix + user_message + cfg.sft.assistant_prefix
 
@@ -100,7 +100,7 @@ def _tokenize_and_pack_sft(dataset, tokenizer: PreTrainedTokenizerBase, cfg: Con
         rows = [dict(zip(keys, values)) for values in zip(*batch.values())]
         ids_list, mask_list = [], []
         for example in rows:
-            ids, mask = _tokenize_sft_example(
+            ids, mask = tokenize_sft_example(
                 _format_sft_messages(example, cfg), tokenizer, cfg.sft.user_prefix, cfg.sft.assistant_prefix
             )
             ids_list.append(ids)
@@ -169,7 +169,7 @@ def _load_or_build_sft_packed(cfg: Config, tokenizer: PreTrainedTokenizerBase):
     train_split = raw["train"]
     val_split = raw.get("validation")
     if val_split is None:
-        train_split, val_split = _split_off_eval(train_split, cfg.sft.eval_split_size)
+        train_split, val_split = split_off_eval(train_split, cfg.sft.eval_split_size)
 
     packed = DatasetDict({"train": _tokenize_and_pack_sft(train_split, tokenizer, cfg)})
     if val_split is not None:

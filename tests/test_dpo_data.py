@@ -2,7 +2,7 @@
 independently EOS-tail-padded to seq_len rather than SFT's many-examples-per-block packing).
 
 _format_dpo_pair and _tokenize_dpo_row are the DPO analogues of _format_sft_messages/
-_tokenize_sft_example — these pin the two dataset shapes _format_dpo_pair supports, and that
+tokenize_sft_example — these pin the two dataset shapes _format_dpo_pair supports, and that
 _tokenize_dpo_row pads correctly (with a zeroed loss_mask on the padding) or drops a pair outright
 when either side overflows seq_len, rather than truncating it.
 """
@@ -148,8 +148,8 @@ def test_tokenize_dpo_row_drops_pair_when_rejected_overflows_seq_len():
 
 
 def test_tokenize_dpo_row_uses_dpo_prefixes_not_sft_prefixes():
-    """Reuses _tokenize_sft_example, but must pass cfg.dpo's own prefixes — a regression guard for
-    the _tokenize_sft_example signature fix that made this reuse possible."""
+    """Reuses tokenize_sft_example, but must pass cfg.dpo's own prefixes — a regression guard for
+    the tokenize_sft_example signature fix that made this reuse possible."""
     cfg = Config(dpo=DPOConfig(user_prefix="DPO_USER: ", assistant_prefix="DPO_ASSISTANT: "))
     tokenizer = _FakeTokenizer()
     example = {

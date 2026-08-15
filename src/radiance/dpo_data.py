@@ -11,8 +11,8 @@ from transformers import PreTrainedTokenizerBase
 from radiance.config import Config, doc_mask_is_inert_for_dpo, resolve_device, resolve_dtype
 from radiance.model import load_transformer_from_checkpoint, sequence_logprob_sum
 
-from .data import _split_off_eval
-from .sft_data import _tokenize_sft_example
+from .data import split_off_eval
+from .sft_data import tokenize_sft_example
 
 # DPO (preference post-training): different packing strategy from SFT's above, deliberately.
 # SFT packs many chat examples per fixed-seq_len block, relying on
@@ -67,15 +67,15 @@ def _tokenize_dpo_row(
     Dropping is deliberate: truncating the completion would score a partial response as fully
     chosen/rejected, and truncating the prompt would silently change what the response is
     conditioned on — both corrupt the training signal in a way that's worse than losing the
-    example. Reuses _tokenize_sft_example verbatim for both sides (now that it takes explicit
+    example. Reuses tokenize_sft_example verbatim for both sides (now that it takes explicit
     prefixes rather than reading cfg.sft.* directly) — DPO's per-side (ids, loss_mask) construction
     is identical to SFT's single-completion case, just called twice against a shared prompt prefix.
     """
     chosen_msgs, rejected_msgs = _format_dpo_pair(example, cfg)
-    chosen_ids, chosen_mask = _tokenize_sft_example(
+    chosen_ids, chosen_mask = tokenize_sft_example(
         chosen_msgs, tokenizer, cfg.dpo.user_prefix, cfg.dpo.assistant_prefix
     )
-    rejected_ids, rejected_mask = _tokenize_sft_example(
+    rejected_ids, rejected_mask = tokenize_sft_example(
         rejected_msgs, tokenizer, cfg.dpo.user_prefix, cfg.dpo.assistant_prefix
     )
     if len(chosen_ids) > seq_len or len(rejected_ids) > seq_len:
@@ -355,7 +355,7 @@ def _load_or_build_dpo_packed(cfg: Config, tokenizer: PreTrainedTokenizerBase):
     if val_split is None:
         val_split = raw.get("test")
     if val_split is None:
-        train_split, val_split = _split_off_eval(train_split, cfg.dpo.eval_split_size)
+        train_split, val_split = split_off_eval(train_split, cfg.dpo.eval_split_size)
 
     packed = DatasetDict({"train": _tokenize_and_filter_dpo(train_split, tokenizer, cfg)})
     if val_split is not None:

@@ -82,7 +82,7 @@ def _cache_path(cfg: Config) -> Path:
     return Path(cfg.data.cache_dir) / digest
 
 
-def _split_off_eval(train_split, eval_split_size: int):
+def split_off_eval(train_split, eval_split_size: int):
     """When a dataset has no validation split, carve a deterministic held-out slice off the
     front of train instead (same order every run, so eval numbers stay comparable across runs).
     No-op (val_split=None) unless eval_split_size > 0."""
@@ -106,7 +106,7 @@ def _load_or_build_packed(cfg: Config, tokenizer: PreTrainedTokenizerBase):
         train_split = raw["train"]
         val_split = raw.get("validation")
         if val_split is None:
-            train_split, val_split = _split_off_eval(train_split, cfg.data.eval_split_size)
+            train_split, val_split = split_off_eval(train_split, cfg.data.eval_split_size)
 
         train_split = train_split.shuffle(seed=cfg.train.seed, buffer_size=cfg.data.shuffle_buffer_size)
         train_packed = _tokenize_and_pack(train_split, tokenizer, cfg)
@@ -125,7 +125,7 @@ def _load_or_build_packed(cfg: Config, tokenizer: PreTrainedTokenizerBase):
     train_split = raw["train"]
     val_split = raw.get("validation")
     if val_split is None:
-        train_split, val_split = _split_off_eval(train_split, cfg.data.eval_split_size)
+        train_split, val_split = split_off_eval(train_split, cfg.data.eval_split_size)
 
     packed = DatasetDict({"train": _tokenize_and_pack(train_split, tokenizer, cfg)})
     if val_split is not None:

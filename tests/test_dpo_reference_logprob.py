@@ -27,7 +27,7 @@ from tests.conftest import TINY_VOCAB
 class _FakeTokenizer:
     # Deliberately outside [1, TINY_VOCAB) so it never collides with the synthetic random ids
     # below — on CPU doc_attention_mask always falls back to plain SDPA anyway (see
-    # model.py/CLAUDE.md), so this is belt-and-suspenders, not load-bearing for this test.
+    # model/attention.py/CLAUDE.md), so this is belt-and-suspenders, not load-bearing for this test.
     eos_token_id = 0
 
 

@@ -438,7 +438,7 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
         Stacking is capped at `_MUON_MAX_STACK` *matrices* per orthogonalize() call, not tensors —
         this distinction is load-bearing and was the bug in this function's first chunking attempt.
         `BatchedExperts` already stores each MoE projection role as one tensor shaped
-        `(n_experts, in, out)` (see model.py), so grouping-and-counting by whole *tensor* (e.g. "16
+        `(n_experts, in, out)` (see model/ffn.py), so grouping-and-counting by whole *tensor* (e.g. "16
         tensors of shape (48, 1024, 1024), well under a cap of 32, so don't chunk") completely
         misses that each of those 16 tensors already carries 48 experts stacked in its own leading
         dim. `torch.stack`-ing those 16 tensors produces one `(16, 48, 1024, 1024)` tensor, and
