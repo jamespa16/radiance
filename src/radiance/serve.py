@@ -230,6 +230,14 @@ def create_app(
         prompt = format_chat_messages([m.model_dump() for m in req.messages], cfg)
         prompt_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
         prompt_tokens = prompt_ids.shape[1]
+        if prompt_tokens >= model.cfg.max_seq_len:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"prompt is {prompt_tokens} tokens, which leaves no room to generate within "
+                    f"this model's max_seq_len ({model.cfg.max_seq_len}); shorten the conversation"
+                ),
+            )
         stop_seqs = _stop_sequences(req.stop)
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
