@@ -54,7 +54,7 @@ def test_training_still_uses_bounded_capacity():
     n_tokens = 4 * 16
     expected = round(layer.cfg.moe_capacity_factor * n_tokens * layer.cfg.moe_top_k / layer.cfg.n_experts)
 
-    from radiance.model import _moe_capacity
+    from radiance.model.ffn import _moe_capacity
 
     assert _moe_capacity(layer.cfg, n_tokens) == expected
 

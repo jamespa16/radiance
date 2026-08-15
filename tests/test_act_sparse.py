@@ -17,7 +17,9 @@ import pytest
 import torch
 
 from radiance.config import ModelConfig
-from radiance.model import DenseTransformer, _act_select, _sparse_attn_mask
+from radiance.model import DenseTransformer
+from radiance.model.act import _act_select
+from radiance.model.masking import _sparse_attn_mask
 from tests.conftest import TINY_VOCAB
 
 
