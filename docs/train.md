@@ -169,9 +169,10 @@ logging/`eval_every`/`save_every` all stay in accumulated-step units.
 
 Overwrites the configured `batch_size`/`grad_accum_steps` at startup with values computed from free VRAM and model
 size (`estimate_batch_size`) — a deliberately conservative closed-form estimate (params/gradients/optimizer state
-sized exactly, activation memory from `DenseTransformer.activation_bytes_per_token`, and memory divided by
-`cfg.resolved_row_tokens` rather than `cfg.data.seq_len` so an active SFT/DPO `seq_len` override is reflected) rather
-than an expensive live probe.
+sized exactly, activation memory from `DenseTransformer.activation_bytes_per_token`, `train.optimizer == "muon"`'s
+transient Newton-Schulz reserve from `optim.muon_orthogonalize_reserve_bytes` (see docs/optim.md), and memory divided
+by `cfg.resolved_row_tokens` rather than `cfg.data.seq_len` so an active SFT/DPO `seq_len` override is reflected)
+rather than an expensive live probe.
 
 It defaults `True` — a deliberate behavior change for every existing config, not the usual opt-in convention — since
 on CUDA it only ever makes the actual micro-batch *safer* than a hand-picked one, never bigger, and it is what gates

@@ -1,6 +1,13 @@
 """estimate_batch_size and tokens_per_step must size batches using the resolved per-row token width,
 not cfg.data.seq_len directly, so sft.seq_len / dpo.seq_len overrides reach auto_batch_size and
-tokens_per_param's derived max_steps."""
+tokens_per_param's derived max_steps.
+
+Muon's Newton-Schulz reserve (muon_orthogonalize_reserve_bytes) is a separate concern with its own
+sizing coverage in test_optim.py; the fixtures here pin train.optimizer="adamw" (rather than the
+TrainConfig default of "muon") so _FakeModel, which has no named_parameters(), doesn't need to
+support build_muon_param_groups just to exercise row-width resolution.
+test_estimate_batch_size_reserves_for_muon_newton_schulz below covers the wiring itself, against a
+real DenseTransformer rather than _FakeModel."""
 
 from __future__ import annotations
 
@@ -41,6 +48,7 @@ def _estimate_cfg(sft: SFTConfig | None = None, dpo: DPOConfig | None = None) ->
             compile=False,
             device="cpu",
             dtype="bf16",
+            optimizer="adamw",
             target_effective_batch_size=4,
             vram_safety_margin=1.0,
         ),
