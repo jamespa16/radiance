@@ -260,30 +260,40 @@ def create_app(
     app = FastAPI()
 
     async def _auth_and_rate_limit(request: Request) -> None:
-        """Dependency on every /v1/* route: a per-client-IP rate limit followed by bearer-token
-        auth (skipped entirely when no keys are configured, matching the quickstart's
-        no-flags-needed default), both before the route handler ever touches `lock` — an
-        over-quota, unauthenticated, or invalid-key request must never queue behind a real
-        generation. The rate limit is keyed by client IP rather than by API key so that requests
-        with a missing or wrong key — which never reach the auth check's success path — are still
-        throttled instead of getting unlimited attempts to brute-force a key.
+        """Dependency on every /v1/* route: a rate limit followed by bearer-token auth (skipped
+        entirely when no keys are configured, matching the quickstart's no-flags-needed default),
+        both before the route handler ever touches `lock` — an over-quota, unauthenticated, or
+        invalid-key request must never queue behind a real generation. A request presenting a
+        valid key is rate-limited per key, so distinct keys get independent quotas as documented.
+        Requests with a missing or wrong key — which never reach the auth check's success path —
+        are throttled per client IP instead, so they don't get unlimited attempts to brute-force a
+        key; when the client IP is unavailable (e.g. a Unix domain socket) there is no identifier
+        to key a shared bucket on without pooling unrelated callers together, so such requests skip
+        the rate limit and fall through to the auth check.
         """
-        client_ip = request.client.host if request.client else "unknown"
-        if not limiter.allow(client_ip):
+        authorization = request.headers.get("authorization", "")
+        token = authorization[len("Bearer ") :] if authorization.startswith("Bearer ") else ""
+        matched_key = next((key for key in api_keys if _token_matches(token, key)), None) if api_keys else None
+
+        if matched_key is not None:
+            rate_limit_key = f"key:{matched_key}"
+        elif request.client is not None:
+            rate_limit_key = f"ip:{request.client.host}"
+        else:
+            rate_limit_key = None
+
+        if rate_limit_key is not None and not limiter.allow(rate_limit_key):
             raise HTTPException(
                 status_code=429,
                 detail={"error": {"message": "Rate limit exceeded", "type": "rate_limit_error"}},
                 headers={"Retry-After": "60"},
             )
 
-        if api_keys:
-            authorization = request.headers.get("authorization", "")
-            token = authorization[len("Bearer ") :] if authorization.startswith("Bearer ") else ""
-            if not any(_token_matches(token, key) for key in api_keys):
-                raise HTTPException(
-                    status_code=401,
-                    detail={"error": {"message": "Invalid API key", "type": "invalid_request_error"}},
-                )
+        if api_keys and matched_key is None:
+            raise HTTPException(
+                status_code=401,
+                detail={"error": {"message": "Invalid API key", "type": "invalid_request_error"}},
+            )
 
     @app.middleware("http")
     async def _log_and_count(request: Request, call_next):
