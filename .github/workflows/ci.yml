@@ -1,11 +1,9 @@
 name: CI
 
-# Fast, CPU-only suite. Runs on the same self-hosted box as gpu-tests.yml —
-# there's only one runner, so this and any GPU test run queue behind each
-# other rather than running in parallel. Excludes tests/test_compile.py
-# (marked `slow`, CUDA-only) — that suite runs separately in gpu-tests.yml.
-# Requires the runner to be online (unlike a GitHub-hosted runner, pushes get
-# no CI signal while the box is off).
+# Fast, CPU-only suite. Runs on a GitHub-hosted runner (unlike gpu-tests.yml, which needs the
+# self-hosted GPU box) so every push/PR gets a CI signal regardless of whether that box is online.
+# Excludes tests/test_compile.py (marked `slow`, CUDA-only) — that suite runs separately in
+# gpu-tests.yml.
 on:
   push:
     branches: [main]
@@ -17,7 +15,7 @@ concurrency:
 
 jobs:
   test:
-    runs-on: [self-hosted, gpu]
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
