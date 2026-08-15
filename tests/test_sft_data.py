@@ -9,7 +9,7 @@ that packing carries (ids, mask) through concatenation/slicing in lockstep.
 from __future__ import annotations
 
 from radiance.config import Config, SFTConfig
-from radiance.data import _format_sft_messages, _tokenize_sft_example, format_sft_prompt
+from radiance.sft_data import _format_sft_messages, _tokenize_sft_example, format_sft_prompt
 
 
 class _FakeTokenizer:

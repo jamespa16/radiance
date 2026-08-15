@@ -5,7 +5,7 @@ import math
 import torch
 
 from radiance.config import Config
-from radiance.data import dpo_cache_exists
+from radiance.dpo_data import dpo_cache_exists
 from radiance.model import DenseTransformer, checkpoint_param_bytes
 def dpo_reference_reserve_bytes(cfg: Config) -> int:
     """VRAM estimate_batch_size should hold back for a DPO reference-checkpoint load that hasn't

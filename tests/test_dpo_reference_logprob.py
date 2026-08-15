@@ -15,7 +15,7 @@ import torch
 from datasets import Dataset, DatasetDict
 
 from radiance.config import Config, DPOConfig, DataConfig
-from radiance.data import _add_reference_logprobs, _dpo_cache_path, dpo_cache_exists
+from radiance.dpo_data import _add_reference_logprobs, _dpo_cache_path, dpo_cache_exists
 from radiance.model import DenseTransformer, checkpoint_param_bytes, sequence_logprob_sum
 from radiance.optim import build_optimizer
 from radiance.train import build_lr_scheduler
