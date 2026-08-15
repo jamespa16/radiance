@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 
 from radiance.config import Config, DPOConfig, SFTConfig
-from radiance.sft_data import format_chat_prompt, format_sft_prompt
+from radiance.sft_data import format_chat_messages, format_chat_prompt, format_sft_prompt
 
 
 def test_format_chat_prompt_uses_sft_prefixes_when_sft_enabled():
@@ -47,3 +47,46 @@ def test_format_chat_prompt_on_pre_pr_checkpoint_hits_guard_not_attributeerror()
 
     with pytest.raises(ValueError, match="sft.enabled|dpo.enabled"):
         format_chat_prompt("hi", old)
+
+
+def test_format_chat_messages_concatenates_multi_turn_conversation():
+    cfg = Config(sft=SFTConfig(enabled=True, user_prefix="U: ", assistant_prefix="A: "))
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "yo"},
+        {"role": "user", "content": "more"},
+    ]
+
+    assert format_chat_messages(messages, cfg) == "U: hiA: yoU: moreA: "
+
+
+def test_format_chat_messages_folds_system_role_into_user_prefix():
+    cfg = Config(sft=SFTConfig(enabled=True, user_prefix="U: ", assistant_prefix="A: "))
+    messages = [{"role": "system", "content": "be nice"}, {"role": "user", "content": "hi"}]
+
+    assert format_chat_messages(messages, cfg) == "U: be niceU: hiA: "
+
+
+def test_format_chat_messages_uses_dpo_prefixes_when_dpo_enabled():
+    cfg = Config(
+        dpo=DPOConfig(
+            enabled=True, dataset="foo/bar", reference_checkpoint="foo.pt",
+            user_prefix="DU: ", assistant_prefix="DA: ",
+        )
+    )
+
+    assert format_chat_messages([{"role": "user", "content": "hi"}], cfg) == "DU: hiDA: "
+
+
+def test_format_chat_messages_raises_when_neither_enabled():
+    cfg = Config()
+
+    with pytest.raises(ValueError, match="sft.enabled|dpo.enabled"):
+        format_chat_messages([{"role": "user", "content": "hi"}], cfg)
+
+
+def test_format_chat_messages_raises_on_empty_messages():
+    cfg = Config(sft=SFTConfig(enabled=True))
+
+    with pytest.raises(ValueError, match="at least one message"):
+        format_chat_messages([], cfg)

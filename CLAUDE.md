@@ -64,6 +64,19 @@ SFT/DPO checkpoint). See [docs/train.md](docs/train.md) for the KV cache and the
 Entry points: `radiance.train:main` (`--config`) and `radiance.generate:main` — `radiance-train` /
 `radiance-generate` console scripts after install.
 
+## Running the OpenAI-compatible server
+
+```bash
+uv run radiance-serve --checkpoint checkpoints/tinystories/step_1000.pt --port 8000
+```
+
+Loads one checkpoint (same loader as `radiance-generate`, so it requires `sft.enabled: true` or `dpo.enabled: true`
+— the server formats every request through the checkpoint's own chat turn template) and serves it on
+`/v1/chat/completions` (streaming and non-streaming) and `/v1/models`, on `127.0.0.1` by default. One request at a
+time — generation is serialized behind a lock, no batching. `radiance.generate.generate_tokens` is the shared
+sampling-loop generator both `radiance-generate` and the server stream tokens from. Entry point:
+`radiance.serve:main` — `radiance-serve` console script after install.
+
 ## Running tests
 
 ```bash

@@ -92,6 +92,33 @@ def format_chat_prompt(user_message: str, cfg: Config) -> str:
     )
 
 
+def format_chat_messages(messages: list[dict], cfg: Config) -> str:
+    """Multi-turn analog of format_chat_prompt, for an OpenAI-style [{"role", "content"}, ...]
+    conversation (radiance.serve). Concatenates (prefix + content) per turn using the same
+    user_prefix/assistant_prefix convention tokenize_sft_example trains on, then appends a bare
+    trailing assistant_prefix (no content) to prompt generation.
+
+    "system" (and any role other than "assistant") gets user_prefix: tokenize_sft_example has no
+    distinct system-turn handling, so a checkpoint was never trained on a separate system marker —
+    folding it into user_prefix matches what the model actually saw during SFT/DPO.
+    """
+    if not messages:
+        raise ValueError("format_chat_messages requires at least one message")
+    if cfg.sft.enabled:
+        user_prefix, assistant_prefix = cfg.sft.user_prefix, cfg.sft.assistant_prefix
+    elif cfg.dpo.enabled:
+        user_prefix, assistant_prefix = cfg.dpo.user_prefix, cfg.dpo.assistant_prefix
+    else:
+        raise ValueError(
+            "format_chat_messages requires a checkpoint trained with sft.enabled: true or dpo.enabled: true"
+        )
+    parts = [
+        (assistant_prefix if m["role"] == "assistant" else user_prefix) + m["content"] for m in messages
+    ]
+    parts.append(assistant_prefix)
+    return "".join(parts)
+
+
 def _tokenize_and_pack_sft(dataset, tokenizer: PreTrainedTokenizerBase, cfg: Config):
     seq_len = cfg.sft.seq_len or cfg.data.seq_len
 
