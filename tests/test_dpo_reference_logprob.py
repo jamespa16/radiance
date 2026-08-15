@@ -167,7 +167,7 @@ def test_add_reference_logprobs_backs_off_on_oom(tmp_path, tiny_cfg, monkeypatch
     # the step loop's micro_chunk_size/CPU-offload backoff never sees it. The fix is the same
     # idiom locally — process the fetched batch in chunks, halve on OOM, retry. Rows are
     # independent, so the chunked path must be bit-for-bit the reference values.
-    import radiance.model as model_mod
+    import radiance.dpo_data as dpo_data_mod
 
     cfg = tiny_cfg(_train=dict(optimizer="adamw"))
     ckpt_path = _save_reference_checkpoint(tmp_path, cfg)
@@ -184,7 +184,7 @@ def test_add_reference_logprobs_backs_off_on_oom(tmp_path, tiny_cfg, monkeypatch
         ),
     )
 
-    real_load = model_mod.load_transformer_from_checkpoint
+    real_load = dpo_data_mod.load_transformer_from_checkpoint
     simulators: list[_OOMSimulator] = []
 
     def fake_load(*args, **kwargs):
@@ -192,7 +192,7 @@ def test_add_reference_logprobs_backs_off_on_oom(tmp_path, tiny_cfg, monkeypatch
         simulators.append(_OOMSimulator(ref, oom_above=8))
         return simulators[-1], ref_cfg
 
-    monkeypatch.setattr(model_mod, "load_transformer_from_checkpoint", fake_load)
+    monkeypatch.setattr(dpo_data_mod, "load_transformer_from_checkpoint", fake_load)
 
     result = _add_reference_logprobs(packed, dpo_cfg, _FakeTokenizer(), device="cpu")
 
@@ -234,7 +234,7 @@ def test_add_reference_logprobs_backs_off_on_oom(tmp_path, tiny_cfg, monkeypatch
 def test_add_reference_logprobs_reraises_when_even_one_row_does_not_fit(tmp_path, tiny_cfg, monkeypatch):
     # The backoff has a floor of one row; if a single row pair still OOMs there is nothing left
     # to halve, so it must re-raise the OOM (with a note) rather than spin or silently drop rows.
-    import radiance.model as model_mod
+    import radiance.dpo_data as dpo_data_mod
 
     cfg = tiny_cfg(_train=dict(optimizer="adamw"))
     ckpt_path = _save_reference_checkpoint(tmp_path, cfg)
@@ -249,13 +249,13 @@ def test_add_reference_logprobs_reraises_when_even_one_row_does_not_fit(tmp_path
         ),
     )
 
-    real_load = model_mod.load_transformer_from_checkpoint
+    real_load = dpo_data_mod.load_transformer_from_checkpoint
 
     def fake_load(*args, **kwargs):
         ref, ref_cfg = real_load(*args, **kwargs)
         return _OOMSimulator(ref, oom_above=-1), ref_cfg  # -1: every call, down to one row
 
-    monkeypatch.setattr(model_mod, "load_transformer_from_checkpoint", fake_load)
+    monkeypatch.setattr(dpo_data_mod, "load_transformer_from_checkpoint", fake_load)
 
     with pytest.raises(torch.cuda.OutOfMemoryError):
         _add_reference_logprobs(packed, dpo_cfg, _FakeTokenizer(), device="cpu")
@@ -266,7 +266,7 @@ def test_add_reference_logprobs_resets_chunk_size_per_split(tmp_path, tiny_cfg, 
     # fresh, unstressed DataLoader loop and may never hit the same OOM. oom_above=8 only ever
     # trips on the first (16-row, both sides) call of the *first* split processed; if chunk_size
     # stayed sticky across splits, the second split's first call would arrive already halved.
-    import radiance.model as model_mod
+    import radiance.dpo_data as dpo_data_mod
 
     cfg = tiny_cfg(_train=dict(optimizer="adamw"))
     ckpt_path = _save_reference_checkpoint(tmp_path, cfg)
@@ -282,7 +282,7 @@ def test_add_reference_logprobs_resets_chunk_size_per_split(tmp_path, tiny_cfg, 
         ),
     )
 
-    real_load = model_mod.load_transformer_from_checkpoint
+    real_load = dpo_data_mod.load_transformer_from_checkpoint
     simulators: list[_OOMSimulator] = []
 
     def fake_load(*args, **kwargs):
@@ -292,7 +292,7 @@ def test_add_reference_logprobs_resets_chunk_size_per_split(tmp_path, tiny_cfg, 
         simulators.append(_OOMSimulator(ref, oom_above=8))
         return simulators[-1], ref_cfg
 
-    monkeypatch.setattr(model_mod, "load_transformer_from_checkpoint", fake_load)
+    monkeypatch.setattr(dpo_data_mod, "load_transformer_from_checkpoint", fake_load)
 
     _add_reference_logprobs(packed, dpo_cfg, _FakeTokenizer(), device="cpu")
 

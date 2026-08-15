@@ -18,7 +18,11 @@ from radiance.config import (
 from radiance.batching import estimate_batch_size
 
 
-class _FakeModel:
+class _FakeModel(torch.nn.Module):
+    # A real (empty) nn.Module, not a bare stand-in: estimate_batch_size now calls
+    # muon_orthogonalize_reserve_bytes, which walks model.modules()/named_parameters() via
+    # build_muon_param_groups. No parameters means build_muon_param_groups finds no Muon tensors,
+    # so the reservation is 0 and every fixed-VRAM assertion below is unaffected.
     def num_parameters(self) -> int:
         return 1000
 
@@ -111,3 +115,43 @@ def test_estimate_batch_size_reserve_bytes_shrinks_the_budget(monkeypatch):
 
     assert without_reserve == (2, 2)
     assert with_reserve == (1, 4)
+
+
+def test_estimate_batch_size_reserves_for_muon_newton_schulz(monkeypatch):
+    # Regression test: estimate_batch_size must fold muon_orthogonalize_reserve_bytes into its
+    # usable-VRAM budget the same way it folds in reserve_bytes above, or a fine-grained MoE model
+    # can pick a batch size that transiently OOMs during Muon's orthogonalize() call (see
+    # docs/optim.md). A real tiny DenseTransformer is used here (not _FakeModel) because the
+    # reservation is computed from the model's actual Muon-owned tensor shapes.
+    from radiance.config import ModelConfig
+    from radiance.model import DenseTransformer
+    from radiance.optim import muon_orthogonalize_reserve_bytes
+
+    torch.manual_seed(0)
+    model_cfg = ModelConfig(d_model=32, head_dim=8, n_layers=3, ffn_mult=2.0, ffn_depth=1, max_seq_len=32)
+    cfg = _estimate_cfg()
+    cfg.data.seq_len = 8  # keep row_bytes small relative to ns_reserve, which is seq_len-independent
+    cfg.model = model_cfg
+    cfg.train.optimizer = "muon"
+    model = DenseTransformer(model_cfg, vocab_size=64)
+
+    ns_reserve = muon_orthogonalize_reserve_bytes(model, cfg)
+    assert ns_reserve > 0
+
+    # free_bytes is pinned so the budget holds exactly 8 rows before ns_reserve is subtracted, and
+    # (since ns_reserve eats at least one row's worth) strictly fewer once it is — the muon path
+    # must actually shrink batch_size relative to the identical adamw setup, not just log a note.
+    bytes_per_token = model.activation_bytes_per_token(2)
+    row_bytes = cfg.resolved_row_tokens * bytes_per_token
+    assert ns_reserve >= row_bytes, "test fixture assumes ns_reserve costs at least one row"
+    free_bytes = 3 * model.num_parameters() * 4 + 8 * row_bytes + ns_reserve - 1
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (free_bytes, 1_000_000_000))
+
+    batch_size, _ = estimate_batch_size(model, cfg, "cuda", "cuda")
+    assert batch_size < 8
+
+    cfg.train.optimizer = "adamw"
+    batch_size_no_reserve, _ = estimate_batch_size(model, cfg, "cuda", "cuda")
+    # Without a Muon reservation, the same free_bytes buys strictly more usable budget.
+    assert batch_size_no_reserve > batch_size

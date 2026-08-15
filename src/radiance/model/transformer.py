@@ -10,6 +10,9 @@ from torch.utils.checkpoint import checkpoint
 from radiance import nvfp4
 from radiance.config import ModelConfig
 
+# _act_select/_ffn_capacity/_sparse_ffn_delta: ACT's capacity/selection helpers, package-private
+# to model/ but owned jointly with the halting/dispatch loop below — see act.py's module docstring
+# and tests/test_act_kv_invariance.py before changing either side.
 from .act import ACTRouter, _act_select, _ffn_capacity, _sparse_ffn_delta
 from .attention import KVCache, RotaryEmbedding, _FLEX_MIN_HEAD_DIM
 from .block import TransformerBlock

@@ -48,7 +48,7 @@ def _tokenize_sft_example(
     mask is 0 for user/system turns (not supervised) and 1 for assistant turns plus the trailing
     EOS (supervised, including EOS so the model learns to stop). Attention is not restricted
     here — a response still attends causally to its own prompt within the example; only the loss
-    is masked, downstream in train.compute_sft_loss/compute_dpo_loss. Turn markers (user_prefix/
+    is masked, downstream in losses.compute_sft_loss/compute_dpo_loss. Turn markers (user_prefix/
     assistant_prefix) are plain text tokenized through the existing vocab, not new special tokens.
 
     Takes the prefixes as explicit strings rather than reading cfg.sft.user_prefix/assistant_prefix

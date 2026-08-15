@@ -8,10 +8,11 @@ from .act import ACTRouter
 from .attention import CausalSelfAttention, KVCache, RotaryEmbedding, apply_rope, rotate_half
 from .block import TransformerBlock
 from .core import LoopContext, ModelOutput
+from .dpo import sequence_logprob_sum
 from .ffn import BatchedExperts, FeedForward, MoEFeedForward, MoERouter
 from .hyper_connections import HyperConnection
 from .load import checkpoint_param_bytes, load_transformer_from_checkpoint, padded_vocab_size
-from .masking import build_block_mask, document_ids, sequence_logprob_sum
+from .masking import build_block_mask, document_ids
 from .mtp import MTPHead
 from .norms import IterLoRA, RMSNorm
 from .transformer import DenseTransformer

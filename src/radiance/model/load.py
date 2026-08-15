@@ -10,10 +10,11 @@ def load_transformer_from_checkpoint(
 ) -> tuple["DenseTransformer", "Config"]:
     """Reconstruct a DenseTransformer + its embedded Config from a train.py checkpoint .pt file.
 
-    Extracted from generate.load_checkpoint (which now calls this) so data.py's DPO
-    reference-logprob precompute can reuse the same reconstruction logic without a
-    generate.py <-> data.py <-> model.py import cycle: generate.py already imports data.py, so
-    data.py must not import generate.py, but both data.py and generate.py already import model.py.
+    Extracted from generate.load_checkpoint (which now calls this) so dpo_data.py's DPO
+    reference-logprob precompute (dpo_data.py:153) can reuse the same reconstruction logic without
+    a generate.py <-> dpo_data.py <-> model/ import cycle: generate.py already imports
+    sft_data.py/data.py, so dpo_data.py must not import generate.py, but both dpo_data.py and
+    generate.py already import model/.
 
     eos_id defaults to None, preserving generate.load_checkpoint's exact prior behavior (doc
     masking off during generation, since a single prompt is one document anyway regardless).

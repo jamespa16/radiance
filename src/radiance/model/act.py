@@ -8,6 +8,14 @@ from radiance.config import ModelConfig
 
 from .ffn import FeedForward
 from .norms import RMSNorm
+
+# _ffn_capacity/_sparse_ffn_delta/_act_select below are consumed by transformer.py's halting/
+# dispatch loop, which owns the actual per-position invariants these helpers must uphold (see
+# tests/test_act_kv_invariance.py). Changing a signature or a selection/capacity rule here without
+# re-reading that loop and its test docstring is how a halted position silently stops being
+# invariant.
+
+
 class ACTRouter(nn.Module):
     """Per-token halting-probability head for ACT (Graves 2016) adaptive looping.
 

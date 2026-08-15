@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 from transformers import PreTrainedTokenizerBase
 
 from radiance.config import Config, doc_mask_is_inert_for_dpo, resolve_device, resolve_dtype
+from radiance.model import load_transformer_from_checkpoint, sequence_logprob_sum
 
 from .data import _split_off_eval
 from .sft_data import _tokenize_sft_example
@@ -148,8 +149,6 @@ def _add_reference_logprobs(
     Training itself never loads this model: it's built, used, and freed entirely within this
     function, which is what keeps DPO training at exactly one resident model's VRAM cost.
     """
-    from radiance.model import load_transformer_from_checkpoint, sequence_logprob_sum
-
     ref_model, ref_cfg = load_transformer_from_checkpoint(
         cfg.dpo.reference_checkpoint, device, eos_id=tokenizer.eos_token_id
     )
