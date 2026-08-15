@@ -16,7 +16,7 @@ import torch
 from radiance.config import Config, DPOConfig, ModelConfig
 from radiance.data import _tokenize_dpo_row
 from radiance.model import DenseTransformer, document_ids, sequence_logprob_sum
-from radiance.train import resolve_dpo_doc_mask
+from radiance.losses import resolve_dpo_doc_mask
 from tests.conftest import TINY_VOCAB
 
 

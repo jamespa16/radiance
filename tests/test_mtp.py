@@ -7,7 +7,7 @@ import torch
 from radiance.config import ModelConfig
 from radiance.model import DenseTransformer
 from radiance.model.mtp import _shift_left
-from radiance.train import compute_mtp_loss
+from radiance.losses import compute_mtp_loss
 from tests.conftest import TINY_VOCAB
 
 

@@ -15,7 +15,7 @@ from radiance.config import (
     SFTConfig,
     TrainConfig,
 )
-from radiance.train import estimate_batch_size
+from radiance.batching import estimate_batch_size
 
 
 class _FakeModel:
