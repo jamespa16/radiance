@@ -20,6 +20,7 @@ from .data import _split_off_eval
 # doc_attention_mask isolate them via the same EOS-boundary detection it already uses for
 # pretraining documents is deliberate — see CLAUDE.md/the SFT design notes for why no model
 # change is needed for that.
+
 def _format_sft_messages(example: dict, cfg: Config) -> list[dict]:
     """Normalize one dataset row to a [{"role": ..., "content": ...}, ...] turn list.
 

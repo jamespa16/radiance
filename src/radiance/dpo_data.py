@@ -32,6 +32,7 @@ from .sft_data import _tokenize_sft_example
 # never attend to padding regardless of whether document-boundary masking is active. Whether the
 # reference-logprob precompute pass below sets eos_id on its model is therefore a free choice,
 # not a correctness requirement.
+
 def _format_dpo_pair(example: dict, cfg: Config) -> tuple[list[dict], list[dict]]:
     """Normalize one dataset row to (chosen_messages, rejected_messages).
 
