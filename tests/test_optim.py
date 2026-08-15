@@ -18,6 +18,8 @@ from radiance.optim import (
 )
 from tests.conftest import TINY_VOCAB
 
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="pin_memory requires CUDA")
+
 
 # --- Newton-Schulz -------------------------------------------------------------------------
 
@@ -267,10 +269,15 @@ def test_unknown_optimizer_raises():
         build_optimizer(model, cfg, "cpu")
 
 
+@requires_cuda
 def test_cpu_offload_tier_mutates_muon_in_place():
     """MuonWithAuxAdam offloads its AdamW groups in place and returns itself, which is what lets
     train() skip rebuilding the LR scheduler. Muon's own momentum stays resident: Newton-Schulz is
-    a matmul chain per step and would cost far more against CPU memory than the VRAM it frees."""
+    a matmul chain per step and would cost far more against CPU memory than the VRAM it frees.
+
+    Runs pin_memory() on CPU tensors, which itself requires a CUDA context even though the tensors
+    stay off-device — the whole feature only matters when training on a GPU that's short on VRAM
+    anyway, so gating on CUDA availability costs nothing on a CPU-only CI runner."""
     model, cfg = _model_and_cfg()
     optimizer = build_optimizer(model, cfg, "cpu")
     model(torch.randint(0, TINY_VOCAB, (2, 8))).logits.square().mean().backward()

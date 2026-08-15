@@ -1,4 +1,4 @@
-# `nvfp4.py` — NVFP4 4-bit GEMMs
+# `nvfp4/` — NVFP4 4-bit GEMMs
 
 Behind `cfg.model.fp4_linear` (opt-in). NVFP4 is Blackwell's 4-bit float: `e2m1` elements packed two per byte, a
 per-16-element `e4m3` block scale, and one per-tensor fp32 global scale. `FP4Linear` runs all three of a linear's
@@ -6,8 +6,11 @@ GEMMs (forward, dgrad, wgrad) on the FP4 tensor cores while master weights, grad
 and autocast stays bf16 — **only the GEMM operands are 4-bit.** `train.dtype: nvfp4` is sugar that sets `fp4_linear`
 (`config._apply_dtype_sugar`).
 
-The module is separate from `model.py` for the reason `optim.py` was split out: ~600 lines of Triton with nothing to
-do with architecture. See `configs/fineweb_500m_nvfp4.yaml`, and [results.md](results.md) for the throughput A/B.
+The package is separate from the model package for the reason `optim.py` was split out: ~600 lines of Triton with
+nothing to do with architecture. `quantize.py` holds the format constants, the capability probe, the pure-torch
+reference implementation and the Triton quantizer kernels; `linear.py` holds `FP4Recipe`, `_FP4LinearFn`, `FP4Linear`
+and `refresh_fp4_weights`. `__init__.py` re-exports the full surface, so `from radiance import nvfp4` attribute
+access is unchanged. See `configs/fineweb_500m_nvfp4.yaml`, and [results.md](results.md) for the throughput A/B.
 
 **NVFP4 is the only 4-bit format available on this card.** `_ScalingType.BlockWise1x32` (MXFP4) raises "MXFP4 scaling
 only supported in CUDA for B200/B300" on sm_120; `BlockWise1x16` (NVFP4) works. Both scale tensors must additionally

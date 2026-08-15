@@ -54,7 +54,7 @@ class ModelConfig:
     fp4_linear: bool = False  # opt-in: run every hidden linear's three GEMMs (forward, dgrad,
     # wgrad) in NVFP4 — 4-bit e2m1 operands with a per-16-element e4m3 block scale, on Blackwell's
     # FP4 tensor cores. Master weights, gradients and optimizer state all stay fp32 and autocast
-    # still runs in train.dtype; only the GEMM operands are 4-bit. See nvfp4.py.
+    # still runs in train.dtype; only the GEMM operands are 4-bit. See nvfp4/.
     #
     # Opt-in rather than default-on, and this file's own convention says why: features default on
     # because their parameters default to an *inert* setting (zero-init, identity-valued, or

@@ -1,6 +1,11 @@
-# `model.py` — the model
+# `model/` — the model
 
-Everything architectural lives here. Related: [config.md](config.md) for the defaults convention,
+Everything architectural lives in this package: `DenseTransformer` and the loop body in `transformer.py`,
+attention + KV cache in `attention.py`, document masking in `masking.py`, the `TransformerBlock` in `block.py`,
+dense and MoE feed-forward in `ffn.py`, ACT in `act.py`, the MTP head in `mtp.py`, norms/IterLoRA in `norms.py`,
+hyper-connections in `hyper_connections.py`, shared dataclasses in `core.py`, and checkpoint reconstruction in
+`load.py`. `__init__.py` re-exports the public API, so `from radiance.model import ...` works as before.
+Related: [config.md](config.md) for the defaults convention,
 [nvfp4.md](nvfp4.md) for 4-bit linears, [results.md](results.md) for every A/B referenced below.
 
 ## Contracts
@@ -54,7 +59,7 @@ term now shrinks with the compute dtype like every other activation. Against the
 estimate lands 1.12x high where the fp32 assumption had it 1.58x high — still on the intended over-estimating side,
 but no longer spending that headroom on a smaller micro-batch than the model needs.
 
-**Keep this in step with the loss**: it is the only place that models a term `model.py` doesn't own.
+**Keep this in step with the loss**: it is the only place that models a term `model/` doesn't own.
 
 ## Attention
 

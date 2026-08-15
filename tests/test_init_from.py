@@ -11,7 +11,8 @@ import torch
 from radiance.config import Config, ModelConfig, TrainConfig
 from radiance.model import DenseTransformer
 from radiance.optim import build_optimizer
-from radiance.train import build_lr_scheduler, load_pretrained_weights, save_checkpoint
+from radiance.train import build_lr_scheduler
+from radiance.checkpointing import load_pretrained_weights, save_checkpoint
 from tests.conftest import TINY_VOCAB
 
 

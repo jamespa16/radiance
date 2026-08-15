@@ -15,14 +15,9 @@ import torch
 
 from radiance.config import Config, DPOConfig, SFTConfig
 from radiance.model import DenseTransformer
-from radiance.train import (
-    _ACCUM_METRICS,
-    build_dpo_loss_fn,
-    build_loss_fn,
-    chunk_loss_and_metrics,
-    chunk_reduction_units,
-    split_micro_batch,
-)
+from radiance.train import _ACCUM_METRICS
+from radiance.batching import chunk_reduction_units, split_micro_batch
+from radiance.losses import build_dpo_loss_fn, build_loss_fn, chunk_loss_and_metrics
 from tests.conftest import TINY_VOCAB
 
 

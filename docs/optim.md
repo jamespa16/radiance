@@ -15,6 +15,11 @@ reshaping — dim 0 is a free batch dimension. The iteration deliberately does *
 settle into a band around [0.68, 1.13], which is the intended operating point (it needs the spread collapsed, not the
 values exact).
 
+`orthogonalize` runs in bf16 on CUDA (self-correcting, so the halved precision costs nothing and halves the
+bandwidth) but stays in the input's own dtype on CPU: there's no bandwidth win to trade for there, and without
+AVX-512-BF16 hardware, PyTorch's CPU bf16 matmul falls back to a path slow enough to turn a CPU-only test run into an
+effective hang — this is what made `ci.yml`'s move to a GitHub-hosted (non-AVX-512-BF16) runner surface it.
+
 `MuonWithAuxAdam` holds both algorithms in **one** Optimizer object with a per-group `algorithm` key, because
 everything downstream assumes a single optimizer — the `GradScaler`'s unscale_/step bookkeeping is keyed on it,
 `LambdaLR` drives its `param_groups`, `save_checkpoint` serialises its `state_dict`, and the OOM handler swaps it.
@@ -76,7 +81,7 @@ for another whose bottleneck is elsewhere — re-measure the config you actually
 ### `estimate_batch_size` now reserves for the transient orthogonalize() spike
 
 `optim.muon_orthogonalize_reserve_bytes` closes the gap the previous section describes:
-`estimate_batch_size` (`train.py`) calls it and subtracts the result from usable VRAM alongside the existing
+`estimate_batch_size` (`batching.py`) calls it and subtracts the result from usable VRAM alongside the existing
 grad/momentum reservation, when `train.optimizer == "muon"`. It re-derives the same per-shape matrix count
 `_step_muon` computes (unbind every Muon-owned tensor into individual `(in, out)` matrices, group by shape), takes
 the shape with the most matrices capped at `_MUON_MAX_STACK`, and multiplies by a measured

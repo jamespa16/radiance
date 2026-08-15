@@ -7,7 +7,8 @@ import torch.nn.functional as F
 from transformers import PreTrainedTokenizerBase
 
 from radiance.config import Config, resolve_device
-from radiance.data import build_tokenizer, format_chat_prompt
+from radiance.data import build_tokenizer
+from radiance.sft_data import format_chat_prompt
 from radiance.model import DenseTransformer, load_transformer_from_checkpoint
 
 

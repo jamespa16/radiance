@@ -8,7 +8,8 @@ from typing import Any
 
 import torch
 
-from radiance.train import compute_dpo_loss_from_logits, compute_loss, compute_sft_loss, evaluate
+from radiance.evaluation import evaluate
+from radiance.losses import compute_dpo_loss_from_logits, compute_loss, compute_sft_loss
 
 
 class _FakeModel:

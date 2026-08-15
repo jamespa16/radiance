@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 
 from radiance.config import Config, DPOConfig, SFTConfig
-from radiance.data import format_chat_prompt, format_sft_prompt
+from radiance.sft_data import format_chat_prompt, format_sft_prompt
 
 
 def test_format_chat_prompt_uses_sft_prefixes_when_sft_enabled():

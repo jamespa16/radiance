@@ -13,7 +13,7 @@ import torch.nn.functional as F
 
 from radiance.config import Config, DPOConfig, ModelConfig, SFTConfig
 from radiance.model import sequence_logprob_sum
-from radiance.train import compute_dpo_loss, note_dpo_z_loss_omitted, validate_post_training_config
+from radiance.losses import compute_dpo_loss, note_dpo_z_loss_omitted, validate_post_training_config
 
 
 def test_sequence_logprob_sum_matches_hand_built_log_softmax_reference():

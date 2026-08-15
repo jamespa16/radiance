@@ -1,6 +1,6 @@
 """SFT data pipeline: chat-turn masking and packing.
 
-_tokenize_sft_example and _tokenize_and_pack_sft's group_fn are the SFT analogues of
+tokenize_sft_example and _tokenize_and_pack_sft's group_fn are the SFT analogues of
 _tokenize_and_pack's tokenize_fn/group_fn (tested implicitly via build_dataloaders elsewhere) —
 these pin the two things that are new here: per-token loss_mask construction from chat turns, and
 that packing carries (ids, mask) through concatenation/slicing in lockstep.
@@ -9,7 +9,7 @@ that packing carries (ids, mask) through concatenation/slicing in lockstep.
 from __future__ import annotations
 
 from radiance.config import Config, SFTConfig
-from radiance.data import _format_sft_messages, _tokenize_sft_example, format_sft_prompt
+from radiance.sft_data import _format_sft_messages, tokenize_sft_example, format_sft_prompt
 
 
 class _FakeTokenizer:
@@ -22,7 +22,7 @@ class _FakeTokenizer:
         return {"input_ids": [hash(word) % 900 for word in text.split()]}
 
 
-def test_tokenize_sft_example_masks_user_turns_and_supervises_assistant_turns():
+def testtokenize_sft_example_masks_user_turns_and_supervises_assistant_turns():
     cfg = Config(sft=SFTConfig(user_prefix="U: ", assistant_prefix="A: "))
     tokenizer = _FakeTokenizer()
     messages = [
@@ -30,7 +30,7 @@ def test_tokenize_sft_example_masks_user_turns_and_supervises_assistant_turns():
         {"role": "assistant", "content": "hi friend"},
     ]
 
-    ids, mask = _tokenize_sft_example(messages, tokenizer, cfg.sft.user_prefix, cfg.sft.assistant_prefix)
+    ids, mask = tokenize_sft_example(messages, tokenizer, cfg.sft.user_prefix, cfg.sft.assistant_prefix)
 
     user_ids = tokenizer("U: hello there")["input_ids"]
     assistant_ids = tokenizer("A: hi friend")["input_ids"]
@@ -38,7 +38,7 @@ def test_tokenize_sft_example_masks_user_turns_and_supervises_assistant_turns():
     assert mask == [0] * len(user_ids) + [1] * len(assistant_ids) + [1]
 
 
-def test_tokenize_sft_example_multiturn_masks_every_non_assistant_turn():
+def testtokenize_sft_example_multiturn_masks_every_non_assistant_turn():
     cfg = Config(sft=SFTConfig(user_prefix="U: ", assistant_prefix="A: "))
     tokenizer = _FakeTokenizer()
     messages = [
@@ -49,7 +49,7 @@ def test_tokenize_sft_example_multiturn_masks_every_non_assistant_turn():
         {"role": "assistant", "content": "quite well thanks"},
     ]
 
-    ids, mask = _tokenize_sft_example(messages, tokenizer, cfg.sft.user_prefix, cfg.sft.assistant_prefix)
+    ids, mask = tokenize_sft_example(messages, tokenizer, cfg.sft.user_prefix, cfg.sft.assistant_prefix)
 
     expected_mask = []
     for turn in messages:
@@ -108,7 +108,7 @@ def test_packing_carries_ids_and_mask_in_lockstep():
     """The packing loop (mirroring _tokenize_and_pack_sft's group_fn) must keep input_ids and
     loss_mask exactly aligned through concatenation and fixed-width slicing."""
     seq_len = 6
-    # Two short pre-tokenized examples, as _tokenize_sft_example would produce them.
+    # Two short pre-tokenized examples, as tokenize_sft_example would produce them.
     ex1_ids, ex1_mask = [1, 2, 3, 999], [0, 0, 1, 1]
     ex2_ids, ex2_mask = [4, 5, 999], [0, 1, 1]
 

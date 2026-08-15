@@ -11,7 +11,7 @@ Each entry names the reference example to read before starting.
 approximation on both splits; no other changes needed for a standard HF hub dataset. To also avoid re-fetching
 already-seen data across repeated short runs, add `data.disk_cache_max_gb`.
 
-**New model variant.** Add config fields to `ModelConfig`, then wire them into `model.py`. Keep the
+**New model variant.** Add config fields to `ModelConfig`, then wire them into `model/`. Keep the
 `TransformerBlock` I/O contract so `train.py` and `data.py` stay untouched. `ACTRouter` /
 `DenseTransformer._forward_act` is the reference for a variant that changes `forward`'s control flow rather than just
 swapping in a different block. `configs/tinystories_gqa.yaml` is a worked example of a simpler one.
@@ -41,7 +41,7 @@ existing two-tensor API. And run the *compiled* forward against eager before tru
 `torch._dynamo.disable` fix and its regression test in `tests/test_compile.py`, which caught a real inductor bug that
 every eager test passed straight through.
 
-**New numeric format / low-precision GEMM.** `nvfp4.py` is the reference, and four things it did are worth copying.
+**New numeric format / low-precision GEMM.** `nvfp4/` is the reference, and four things it did are worth copying.
 **Write a pure-torch reference first and assert the kernel bit-exact against it** — that bar, not "is it close", is
 what caught four separate 1-ULP disagreements between Triton and torch, none visible in the dequantized values.
 **Quantize inside an `autograd.Function`**, never in autograd's view, or the step-function encode leaves a

@@ -1,4 +1,4 @@
-# `data.py` — dataset loading, tokenization, packing
+# `data.py` / `sft_data.py` / `dpo_data.py` — dataset loading, tokenization, packing
 
 `build_tokenizer(cfg)` loads an `AutoTokenizer`. `build_dataloaders(cfg, tokenizer)` calls
 `datasets.load_dataset(cfg.data.dataset)` (expects a HF `user/dataset` with `train`/`validation` splits), tokenizes,
@@ -49,5 +49,6 @@ entirely, for open-ended multi-epoch training over a dataset larger than the cac
 
 ## SFT and DPO paths
 
-`_format_sft_messages`/`_tokenize_sft_example`, `_tokenize_and_pack_sft`, `_tokenize_dpo_row`,
-`_add_reference_logprobs` and `format_chat_prompt` live here too — see [post-training.md](post-training.md).
+`_format_sft_messages`/`_tokenize_sft_example`, `_tokenize_and_pack_sft` and `format_chat_prompt` live in
+`sft_data.py`; `_tokenize_dpo_row`, `_add_reference_logprobs` and the DPO cache/packing path live in
+`dpo_data.py` — see [post-training.md](post-training.md).

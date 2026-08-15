@@ -1,4 +1,4 @@
-# NVFP4 native training — the worked example for model.fp4_linear (see CLAUDE.md and nvfp4.py).
+# NVFP4 native training — the worked example for model.fp4_linear (see CLAUDE.md and nvfp4/).
 #
 # Identical to fineweb_500m.yaml except for `train.dtype: nvfp4`, which resolves to
 # `model.fp4_linear: true` with bf16 autocast underneath (config._apply_dtype_sugar). Master

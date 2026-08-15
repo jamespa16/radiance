@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import torch
 
-from radiance.train import compute_loss, compute_sft_loss
+from radiance.losses import compute_loss, compute_sft_loss
 
 
 def test_all_ones_mask_matches_compute_loss():

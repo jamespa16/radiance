@@ -6,7 +6,8 @@ import pytest
 import torch
 
 from radiance.config import Config, TrainConfig
-from radiance.train import build_lr_scheduler, compute_loss
+from radiance.train import build_lr_scheduler
+from radiance.losses import compute_loss
 
 
 def test_z_loss_matches_masked_reference():

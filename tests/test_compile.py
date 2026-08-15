@@ -29,7 +29,7 @@ to discover:
     together, the second call's output silently diverges from eager — no error, no warning, up to
     ~0.85 absolute on a toy shape. Eager was correct throughout; only the compiled *combination* was
     wrong, which is exactly the class of bug this file exists to catch — the shapes/gradients/KV-cache
-    tests in test_diff_attention.py all passed the whole time. _diff_flex_attention (model.py) is
+    tests in test_diff_attention.py all passed the whole time. _diff_flex_attention (model/attention.py) is
     marked @torch._dynamo.disable for the same structural reason _doc_masks is, though the underlying
     cause is different (an inductor scheduling issue with two flex_attention calls sharing a BlockMask
     and split-provenance inputs, not an unlowerable data-dependent tensor). Plain attention is
