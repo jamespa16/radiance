@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
+import os
+import secrets
 import threading
 import time
 import uuid
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 from typing import AsyncIterator, Literal
 
 import torch
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from transformers import PreTrainedTokenizerBase
@@ -20,13 +24,80 @@ from radiance.generate import generate_tokens, load_checkpoint
 from radiance.model import DenseTransformer
 from radiance.sft_data import format_chat_messages
 
+logger = logging.getLogger("radiance.serve")
+
 
 def _require_chat_enabled(cfg: Config) -> None:
     if not (cfg.sft.enabled or cfg.dpo.enabled):
         raise ValueError(
-            "radiance-serve requires a checkpoint trained with sft.enabled: true or dpo.enabled: "
-            "true, since /v1/chat/completions formats requests with format_chat_messages."
+            "/v1/chat/completions requires a checkpoint trained with sft.enabled: true or "
+            "dpo.enabled: true, since it formats requests with format_chat_messages. Use "
+            "/v1/completions for a base checkpoint."
         )
+
+
+@dataclass
+class ServerMetrics:
+    """In-memory counters for /metrics. No lock: uvicorn's default single worker runs one asyncio
+    event loop, and every increment here happens between `await` points, so updates can't
+    interleave — a lock would guard against a race that can't occur in this deployment.
+    """
+
+    started_at: float = field(default_factory=time.monotonic)
+    requests_total: int = 0
+    errors_total: int = 0
+    prompt_tokens_total: int = 0
+    completion_tokens_total: int = 0
+    generation_seconds_total: float = 0.0
+
+    def record_request(self, is_error: bool) -> None:
+        self.requests_total += 1
+        if is_error:
+            self.errors_total += 1
+
+    def record_generation(self, prompt_tokens: int, completion_tokens: int, elapsed_seconds: float) -> None:
+        self.prompt_tokens_total += prompt_tokens
+        self.completion_tokens_total += completion_tokens
+        self.generation_seconds_total += elapsed_seconds
+
+    def snapshot(self) -> dict:
+        uptime = max(time.monotonic() - self.started_at, 1e-9)
+        return {
+            "uptime_seconds": round(uptime, 3),
+            "requests_total": self.requests_total,
+            "errors_total": self.errors_total,
+            "requests_per_second": round(self.requests_total / uptime, 4),
+            "prompt_tokens_total": self.prompt_tokens_total,
+            "completion_tokens_total": self.completion_tokens_total,
+            "tokens_per_second": (
+                round(self.completion_tokens_total / self.generation_seconds_total, 2)
+                if self.generation_seconds_total > 0
+                else 0.0
+            ),
+        }
+
+
+class RateLimiter:
+    """Fixed 60-second-window request counter, keyed by API key (or client IP when auth is
+    disabled). Good enough for "don't fall over under a traffic spike", not a precise sliding
+    window — matching this file's "explicit over abstraction" bar rather than pulling in a
+    dependency like slowapi for one counter.
+    """
+
+    def __init__(self, limit_per_minute: int):
+        self.limit_per_minute = limit_per_minute
+        self._windows: dict[str, tuple[int, int]] = {}
+
+    def allow(self, key: str) -> bool:
+        if self.limit_per_minute <= 0:
+            return True
+        window = int(time.monotonic() // 60)
+        start_window, count = self._windows.get(key, (window, 0))
+        if start_window != window:
+            start_window, count = window, 0
+        count += 1
+        self._windows[key] = (start_window, count)
+        return count <= self.limit_per_minute
 
 
 class ChatMessage(BaseModel):
@@ -91,6 +162,52 @@ class ChatCompletionStreamChunk(BaseModel):
     choices: list[ChatCompletionStreamChoice]
 
 
+class CompletionRequest(BaseModel):
+    """Legacy /v1/completions request. `prompt` is a single string, not OpenAI's `str | list[str]`
+    — this server handles one request at a time (see docs on request batching), so there is no
+    benefit to accepting a prompt list only to run it as a sequential loop.
+    """
+
+    model: str = "radiance"
+    prompt: str
+    temperature: float = 0.8
+    max_tokens: int = 200
+    stream: bool = False
+    stop: str | list[str] | None = None
+    top_k: int = 50
+    top_p: float | None = None
+    loops: int | None = None
+
+
+class CompletionChoice(BaseModel):
+    index: int = 0
+    text: str
+    finish_reason: str
+
+
+class CompletionResponse(BaseModel):
+    id: str
+    object: Literal["text_completion"] = "text_completion"
+    created: int
+    model: str
+    choices: list[CompletionChoice]
+    usage: ChatCompletionUsage
+
+
+class CompletionStreamChoice(BaseModel):
+    index: int = 0
+    text: str
+    finish_reason: str | None = None
+
+
+class CompletionStreamChunk(BaseModel):
+    id: str
+    object: Literal["text_completion"] = "text_completion"
+    created: int
+    model: str
+    choices: list[CompletionStreamChoice]
+
+
 class ModelInfo(BaseModel):
     id: str
     object: Literal["model"] = "model"
@@ -104,15 +221,91 @@ class ModelList(BaseModel):
 
 
 def create_app(
-    model: DenseTransformer, cfg: Config, tokenizer: PreTrainedTokenizerBase, device: str, model_name: str
+    model: DenseTransformer,
+    cfg: Config,
+    tokenizer: PreTrainedTokenizerBase,
+    device: str,
+    model_name: str,
+    api_keys: set[str] | None = None,
+    rate_limit_per_minute: int = 0,
 ) -> FastAPI:
-    _require_chat_enabled(cfg)
     lock = asyncio.Lock()
     server_started = int(time.time())
+    metrics = ServerMetrics()
+    limiter = RateLimiter(rate_limit_per_minute)
 
     app = FastAPI()
 
-    @app.get("/v1/models")
+    async def _auth_and_rate_limit(request: Request) -> None:
+        """Dependency on every /v1/* route: bearer-token auth (skipped entirely when no keys are
+        configured, matching the quickstart's no-flags-needed default) followed by a per-key rate
+        limit, checked in that order and both before the route handler ever touches `lock` — an
+        over-quota or unauthenticated request must never queue behind a real generation.
+        """
+        if api_keys:
+            authorization = request.headers.get("authorization", "")
+            token = authorization[len("Bearer ") :] if authorization.startswith("Bearer ") else ""
+            if not any(secrets.compare_digest(token, key) for key in api_keys):
+                raise HTTPException(
+                    status_code=401,
+                    detail={"error": {"message": "Invalid API key", "type": "invalid_request_error"}},
+                )
+            rate_limit_key = token
+        else:
+            rate_limit_key = request.client.host if request.client else "unknown"
+
+        if not limiter.allow(rate_limit_key):
+            raise HTTPException(
+                status_code=429,
+                detail={"error": {"message": "Rate limit exceeded", "type": "rate_limit_error"}},
+                headers={"Retry-After": "60"},
+            )
+
+    @app.middleware("http")
+    async def _log_and_count(request: Request, call_next):
+        """Structured per-request logging plus the request/error counters behind /metrics.
+        Deliberately does *not* drive tokens_per_second: for a streaming response, `call_next`
+        returns once headers are ready, well before the generator finishes, so timing token
+        throughput here would undercount every streamed request. Handlers report generation time
+        themselves via `metrics.record_generation` once a completion actually finishes.
+        """
+        start = time.monotonic()
+        try:
+            response = await call_next(request)
+        except Exception:
+            metrics.record_request(is_error=True)
+            logger.exception(
+                "request failed", extra={"method": request.method, "path": request.url.path}
+            )
+            raise
+        duration_ms = (time.monotonic() - start) * 1000
+        metrics.record_request(is_error=response.status_code >= 400)
+        logger.info(
+            "%s",
+            {
+                "method": request.method,
+                "path": request.url.path,
+                "status": response.status_code,
+                "duration_ms": round(duration_ms, 2),
+            },
+        )
+        return response
+
+    @app.get("/healthz")
+    async def healthz() -> dict:
+        return {"status": "ok"}
+
+    @app.get("/readyz")
+    async def readyz() -> dict:
+        # The model and tokenizer are loaded synchronously before create_app() is ever called, so
+        # by the time this route can be hit the server is always ready to serve.
+        return {"status": "ready"}
+
+    @app.get("/metrics")
+    async def get_metrics() -> dict:
+        return metrics.snapshot()
+
+    @app.get("/v1/models", dependencies=[Depends(_auth_and_rate_limit)])
     async def list_models() -> ModelList:
         return ModelList(data=[ModelInfo(id=model_name, created=server_started)])
 
@@ -126,6 +319,25 @@ def create_app(
         if not matches:
             return None
         return min(matches, key=lambda s: text.index(s))
+
+    def _finish_reason(completion_tokens: int, max_tokens: int, stopped_on_sequence: bool) -> str:
+        # generate_tokens only stops early (before max_tokens iterations) via internal EOS
+        # detection or a stop-sequence match; either way that's "stop", and exhausting the token
+        # budget without either is "length".
+        return "length" if completion_tokens >= max_tokens and not stopped_on_sequence else "stop"
+
+    def _tokenize_and_check(prompt: str) -> tuple[torch.Tensor, int]:
+        prompt_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
+        prompt_tokens = prompt_ids.shape[1]
+        if prompt_tokens >= model.cfg.max_seq_len:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"prompt is {prompt_tokens} tokens, which leaves no room to generate within "
+                    f"this model's max_seq_len ({model.cfg.max_seq_len}); shorten the prompt"
+                ),
+            )
+        return prompt_ids, prompt_tokens
 
     def _decode_deltas(ids_iter: Iterator[int], tokenizer: PreTrainedTokenizerBase) -> Iterator[str]:
         """Decodes generated token ids incrementally, yielding only the text new since the last
@@ -194,12 +406,14 @@ def create_app(
         return consumer()
 
     async def _generate_deltas(
-        input_ids: torch.Tensor, req: ChatCompletionRequest, stop_seqs: list[str]
+        input_ids: torch.Tensor,
+        req: ChatCompletionRequest | CompletionRequest,
+        stop_seqs: list[str],
     ) -> AsyncIterator[tuple[str, bool, int]]:
-        """Shared generation core for both handlers below: yields `(delta_text, stopped, count)`
-        as tokens arrive, where `stopped` is True on the final tuple iff generation ended because
-        a stop sequence matched (as opposed to exhausting max_tokens or hitting EOS), and `count`
-        is the number of tokens generated so far.
+        """Shared generation core for both /v1/chat/completions and /v1/completions: yields
+        `(delta_text, stopped, count)` as tokens arrive, where `stopped` is True on the final
+        tuple iff generation ended because a stop sequence matched (as opposed to exhausting
+        max_tokens or hitting EOS), and `count` is the number of tokens generated so far.
         """
         sync_gen = generate_tokens(
             model, tokenizer, input_ids, req.max_tokens, req.temperature, req.top_k, device, req.loops
@@ -220,30 +434,26 @@ def create_app(
         finally:
             await stream.aclose()
 
-    @app.post("/v1/chat/completions")
+    @app.post("/v1/chat/completions", dependencies=[Depends(_auth_and_rate_limit)])
     async def chat_completions(req: ChatCompletionRequest):
+        try:
+            _require_chat_enabled(cfg)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         if req.top_p is not None and req.top_p != 1.0:
             raise HTTPException(status_code=400, detail="top_p is not supported by this server; use top_k")
         if not req.messages:
             raise HTTPException(status_code=400, detail="messages must not be empty")
 
         prompt = format_chat_messages([m.model_dump() for m in req.messages], cfg)
-        prompt_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
-        prompt_tokens = prompt_ids.shape[1]
-        if prompt_tokens >= model.cfg.max_seq_len:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"prompt is {prompt_tokens} tokens, which leaves no room to generate within "
-                    f"this model's max_seq_len ({model.cfg.max_seq_len}); shorten the conversation"
-                ),
-            )
+        prompt_ids, prompt_tokens = _tokenize_and_check(prompt)
         stop_seqs = _stop_sequences(req.stop)
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
 
         if not req.stream:
             async with lock:
+                gen_start = time.monotonic()
                 text_so_far = ""
                 stopped_on_sequence = False
                 completion_tokens = 0
@@ -251,12 +461,8 @@ def create_app(
                     text_so_far += delta
                     stopped_on_sequence = stopped
                     completion_tokens = count
-                # generate_tokens only stops early (before max_tokens iterations) via internal EOS
-                # detection or a stop-sequence match above; either way that's "stop", and
-                # exhausting the token budget without either is "length".
-                finish_reason = (
-                    "length" if completion_tokens >= req.max_tokens and not stopped_on_sequence else "stop"
-                )
+                metrics.record_generation(prompt_tokens, completion_tokens, time.monotonic() - gen_start)
+                finish_reason = _finish_reason(completion_tokens, req.max_tokens, stopped_on_sequence)
 
             return ChatCompletionResponse(
                 id=completion_id,
@@ -277,6 +483,7 @@ def create_app(
 
         async def event_generator() -> AsyncIterator[str]:
             async with lock:
+                gen_start = time.monotonic()
                 first_chunk = ChatCompletionStreamChunk(
                     id=completion_id,
                     created=created,
@@ -299,16 +506,82 @@ def create_app(
                         )
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
-                # See the non-streaming handler for why this condition identifies "length".
-                finish_reason = (
-                    "length" if completion_tokens >= req.max_tokens and not stopped_on_sequence else "stop"
-                )
+                metrics.record_generation(prompt_tokens, completion_tokens, time.monotonic() - gen_start)
+                finish_reason = _finish_reason(completion_tokens, req.max_tokens, stopped_on_sequence)
 
                 final_chunk = ChatCompletionStreamChunk(
                     id=completion_id,
                     created=created,
                     model=req.model,
                     choices=[ChatCompletionStreamChoice(delta=Delta(), finish_reason=finish_reason)],
+                )
+                yield f"data: {final_chunk.model_dump_json()}\n\n"
+                yield "data: [DONE]\n\n"
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+    @app.post("/v1/completions", dependencies=[Depends(_auth_and_rate_limit)])
+    async def completions(req: CompletionRequest):
+        if req.top_p is not None and req.top_p != 1.0:
+            raise HTTPException(status_code=400, detail="top_p is not supported by this server; use top_k")
+        if not req.prompt:
+            raise HTTPException(status_code=400, detail="prompt must not be empty")
+
+        prompt_ids, prompt_tokens = _tokenize_and_check(req.prompt)
+        stop_seqs = _stop_sequences(req.stop)
+        completion_id = f"cmpl-{uuid.uuid4().hex[:24]}"
+        created = int(time.time())
+
+        if not req.stream:
+            async with lock:
+                gen_start = time.monotonic()
+                text_so_far = ""
+                stopped_on_sequence = False
+                completion_tokens = 0
+                async for delta, stopped, count in _generate_deltas(prompt_ids, req, stop_seqs):
+                    text_so_far += delta
+                    stopped_on_sequence = stopped
+                    completion_tokens = count
+                metrics.record_generation(prompt_tokens, completion_tokens, time.monotonic() - gen_start)
+                finish_reason = _finish_reason(completion_tokens, req.max_tokens, stopped_on_sequence)
+
+            return CompletionResponse(
+                id=completion_id,
+                created=created,
+                model=req.model,
+                choices=[CompletionChoice(text=text_so_far, finish_reason=finish_reason)],
+                usage=ChatCompletionUsage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens,
+                ),
+            )
+
+        async def event_generator() -> AsyncIterator[str]:
+            async with lock:
+                gen_start = time.monotonic()
+                stopped_on_sequence = False
+                completion_tokens = 0
+                async for delta, stopped, count in _generate_deltas(prompt_ids, req, stop_seqs):
+                    stopped_on_sequence = stopped
+                    completion_tokens = count
+                    if delta:
+                        chunk = CompletionStreamChunk(
+                            id=completion_id,
+                            created=created,
+                            model=req.model,
+                            choices=[CompletionStreamChoice(text=delta)],
+                        )
+                        yield f"data: {chunk.model_dump_json()}\n\n"
+
+                metrics.record_generation(prompt_tokens, completion_tokens, time.monotonic() - gen_start)
+                finish_reason = _finish_reason(completion_tokens, req.max_tokens, stopped_on_sequence)
+
+                final_chunk = CompletionStreamChunk(
+                    id=completion_id,
+                    created=created,
+                    model=req.model,
+                    choices=[CompletionStreamChoice(text="", finish_reason=finish_reason)],
                 )
                 yield f"data: {final_chunk.model_dump_json()}\n\n"
                 yield "data: [DONE]\n\n"
@@ -330,14 +603,34 @@ def main() -> None:
         default=None,
         help="Name reported in /v1/models and echoed in responses (default: the checkpoint filename)",
     )
+    parser.add_argument(
+        "--api-key",
+        action="append",
+        default=None,
+        help="Bearer token required on /v1/* endpoints (Authorization: Bearer <key>). Repeatable "
+        "for multiple valid keys. Also read from the RADIANCE_API_KEY env var (comma-separated). "
+        "If no key is configured from either source, /v1/* endpoints are unauthenticated — the "
+        "default, so the quickstart keeps working with no flags.",
+    )
+    parser.add_argument(
+        "--rate-limit",
+        type=int,
+        default=0,
+        help="Max requests per minute per API key (or per client IP when no --api-key is set). "
+        "0 (default) disables rate limiting.",
+    )
     args = parser.parse_args()
     device = resolve_device(args.device)
 
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    api_keys = set(args.api_key or [])
+    api_keys |= {key.strip() for key in os.environ.get("RADIANCE_API_KEY", "").split(",") if key.strip()}
+
     model, cfg, tokenizer = load_checkpoint(args.checkpoint, device)
-    _require_chat_enabled(cfg)
 
     model_name = args.model_name or args.checkpoint.rsplit("/", 1)[-1]
-    app = create_app(model, cfg, tokenizer, device, model_name)
+    app = create_app(model, cfg, tokenizer, device, model_name, api_keys=api_keys, rate_limit_per_minute=args.rate_limit)
 
     uvicorn.run(app, host=args.host, port=args.port)
 

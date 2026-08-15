@@ -70,12 +70,18 @@ Entry points: `radiance.train:main` (`--config`) and `radiance.generate:main` �
 uv run radiance-serve --checkpoint checkpoints/tinystories/step_1000.pt --port 8000
 ```
 
-Loads one checkpoint (same loader as `radiance-generate`, so it requires `sft.enabled: true` or `dpo.enabled: true`
-— the server formats every request through the checkpoint's own chat turn template) and serves it on
-`/v1/chat/completions` (streaming and non-streaming) and `/v1/models`, on `127.0.0.1` by default. One request at a
-time — generation is serialized behind a lock, no batching. `radiance.generate.generate_tokens` is the shared
-sampling-loop generator both `radiance-generate` and the server stream tokens from. Entry point:
-`radiance.serve:main` — `radiance-serve` console script after install.
+Loads one checkpoint (same loader as `radiance-generate`) and serves `/v1/completions` (streaming and
+non-streaming, works with any checkpoint) plus `/v1/chat/completions` (formats requests through the checkpoint's own
+chat turn template, so it 400s unless the checkpoint has `sft.enabled: true` or `dpo.enabled: true`) and
+`/v1/models`, on `127.0.0.1` by default. `/healthz`, `/readyz`, and `/metrics` (uptime, request/error counts,
+tokens/sec) are unauthenticated and unrate-limited. One request at a time — generation is serialized behind a lock,
+no batching. `radiance.generate.generate_tokens` is the shared sampling-loop generator both `radiance-generate` and
+the server stream tokens from.
+
+`--api-key` (repeatable, or the comma-separated `RADIANCE_API_KEY` env var) requires a matching `Authorization:
+Bearer <key>` on every `/v1/*` route; omitted, those routes are unauthenticated (the default, so the quickstart
+above needs no flags). `--rate-limit` caps requests/minute per key (or per client IP when no key is configured); `0`
+(default) disables it. Entry point: `radiance.serve:main` — `radiance-serve` console script after install.
 
 ## Running tests
 
