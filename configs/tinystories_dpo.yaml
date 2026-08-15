@@ -23,7 +23,7 @@
 #
 # Each (prompt+chosen)/(prompt+rejected) sequence is packed as its own single row, EOS-tail-padded
 # to seq_len — "packing of one," not SFT's many-examples-per-block packing — so pairing survives
-# DataLoader shuffling with no extra bookkeeping. No model.py changes needed for this: attention is
+# DataLoader shuffling with no extra bookkeeping. No model/ changes needed for this: attention is
 # strictly causal and the real content always precedes its own padding within a row, so the padding
 # can never influence the scored tokens' logits regardless of document-boundary masking. A DPO run
 # therefore turns model.doc_attention_mask off for itself at startup (it would build a BlockMask

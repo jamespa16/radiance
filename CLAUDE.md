@@ -8,11 +8,11 @@ what is written down there is a measurement or a bug that cost a training run, n
 | page | covers |
 |---|---|
 | [docs/config.md](docs/config.md) | `config.py`, and **the defaults convention** — read before adding any flag |
-| [docs/data.md](docs/data.md) | `data.py` — loading, tokenizing, packing, streaming, disk cache |
-| [docs/model.md](docs/model.md) | `model.py` — the loop, attention variants, ACT, MoE, hyper-connections |
-| [docs/nvfp4.md](docs/nvfp4.md) | `nvfp4.py` — NVFP4 4-bit GEMMs behind `model.fp4_linear` |
+| [docs/data.md](docs/data.md) | `data.py` + `sft_data.py`/`dpo_data.py` — loading, tokenizing, packing, streaming, disk cache, SFT/DPO pipelines |
+| [docs/model.md](docs/model.md) | `model/` — the loop, attention variants, ACT, MoE, hyper-connections |
+| [docs/nvfp4.md](docs/nvfp4.md) | `nvfp4/` — NVFP4 4-bit GEMMs behind `model.fp4_linear` |
 | [docs/optim.md](docs/optim.md) | `optim.py` — Muon, muP, parameter groups, the `lr` retune |
-| [docs/train.md](docs/train.md) | `train.py` + `generate.py` — loop, loss, compile modes, batch sizing, OOM tiers |
+| [docs/train.md](docs/train.md) | `train.py` (+ `losses.py`, `batching.py`, `checkpointing.py`, `evaluation.py`) + `generate.py` — loop, loss, compile modes, batch sizing, OOM tiers |
 | [docs/post-training.md](docs/post-training.md) | SFT and DPO |
 | [docs/results.md](docs/results.md) | **every A/B ever run here**, and the cautions for running a new one |
 | [docs/extending.md](docs/extending.md) | how to add a dataset / model variant / optimizer / numeric format |
@@ -104,20 +104,28 @@ trusting a full run — the suite covers the model, not the data pipeline or the
 ## Architecture map
 
 Everything lives under `src/radiance/`, driven entirely by a single YAML config (`radiance.config.Config`, loaded via
-`load_config`). Six modules; four map to a stage of the pipeline, one holds the optimizers, and one is a numerics
-kernel library that only `model.py` imports.
+`load_config`). The four pipeline stages (data, model, optim, train) plus the `nvfp4/` numerics kernel package that
+only the model package imports. `model/` and `nvfp4/` are packages whose `__init__` re-exports the public API, so
+`from radiance.model import DenseTransformer` and `nvfp4.<name>` access work exactly as before.
 
 - **`config.py`** — the dataclass schema and `load_config`. Single source of truth for every tunable; a new
   hyperparameter is added here first, then threaded through. Plain dataclasses, not OmegaConf/Hydra.
-- **`data.py`** — tokenizer, dataloaders, causal-LM packing, streaming, disk cache, and the SFT/DPO data paths.
-- **`model.py`** — `DenseTransformer`: token + learned positional embeddings, a stack of pre-norm
-  `TransformerBlock`s, final LayerNorm, weight-tied LM head. `blocks[0]` runs once; `blocks[1:]` is a **shared-weight
-  loop body** re-run a fixed or learned number of times per forward, which is the central architectural idea here and
-  what most features exist to support.
-- **`nvfp4.py`** — NVFP4 4-bit GEMM primitives. Separate from `model.py` because it is ~600 lines of Triton with
-  nothing to do with architecture.
+- **`data.py`** — tokenizer, dataloaders, causal-LM packing, streaming, disk cache. The SFT pipeline (chat
+  formatting/packing, `format_chat_prompt`) is in **`sft_data.py`**; the DPO pipeline (pair packing, reference
+  logprobs) is in **`dpo_data.py`**.
+- **`model/`** — `DenseTransformer` (`transformer.py`): token + learned positional embeddings, a stack of pre-norm
+  `TransformerBlock`s (`block.py`), final LayerNorm, weight-tied LM head. `blocks[0]` runs once; `blocks[1:]` is a
+  **shared-weight loop body** re-run a fixed or learned number of times per forward, which is the central
+  architectural idea here and what most features exist to support. Attention + KV cache in `attention.py`, document
+  masking in `masking.py`, dense/MoE feed-forward in `ffn.py`, ACT in `act.py`, MTP in `mtp.py`, norms in `norms.py`,
+  hyper-connections in `hyper_connections.py`, checkpoint reconstruction in `load.py`.
+- **`nvfp4/`** — NVFP4 4-bit GEMM primitives. Separate from the model package because it is ~600 lines of Triton with
+  nothing to do with architecture: `quantize.py` (format constants, pure-torch reference, Triton kernels),
+  `linear.py` (`FP4Linear` and the per-step weight refresh).
 - **`optim.py`** — Muon + auxiliary AdamW, muP, and parameter-group construction.
-- **`train.py`** — plain PyTorch training loop (no HF `Trainer`), plus SFT/DPO mode switches.
+- **`train.py`** — plain PyTorch training loop (no HF `Trainer`), plus SFT/DPO mode switches; the losses in
+  `losses.py`, batch sizing in `batching.py`, checkpoint save/load in `checkpointing.py`, evaluation in
+  `evaluation.py`.
 - **`generate.py`** — checkpoint loading and KV-cached autoregressive sampling.
 
 Three cross-cutting conventions that decide most design questions here:

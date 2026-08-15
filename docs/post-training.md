@@ -15,7 +15,7 @@ markers (`sft.user_prefix`/`assistant_prefix`, **not** new special tokens, so no
 `loss_mask` 1 on assistant turns plus the trailing EOS, 0 elsewhere. `_tokenize_and_pack_sft` packs many examples per
 fixed-`seq_len` block, EOS-joined exactly like pretraining documents, and `doc_attention_mask` (on by default)
 isolates them from each other using the *same* EOS-boundary mechanism (`model.document_ids`) it already uses for
-plain text — so SFT needs no `model.py` changes at all.
+plain text — so SFT needs no `model/` changes at all.
 
 `train.compute_sft_loss` is a strict generalization of `compute_loss`, not a parallel reimplementation: it shifts
 `loss_mask` the same way labels are shifted, folds it into the `-100` ignore positions, then calls the same
@@ -155,11 +155,11 @@ not justified without a concrete bug the current shape causes.
 
 `model.sequence_logprob_sum(logits, input_ids, loss_mask)` is the primitive both the precompute pass and the training
 loss need: a per-row `(batch,)` **sum** of log-probability at `loss_mask==1` positions, using the same
-single-`logsumexp`-pass trick `train._nll_and_logz` uses but keeping the batch dimension — `_nll_and_logz` reduces to
-one batch-wide *mean*, the right reduction for a plain LM loss but not for DPO, which needs one log-probability
-scalar per sequence. It lives in `model.py`, not `train.py`, purely because of import direction: `data.py`'s
-precompute needs it too, and `data.py` must not import `train.py` (which already imports `data.py`) — both already
-import `model.py`. `model.load_transformer_from_checkpoint(path, device, eos_id=None)` moved there for the identical
+single-`logsumexp`-pass trick `losses._nll_and_logz` uses but keeping the batch dimension — `_nll_and_logz` reduces
+to one batch-wide *mean*, the right reduction for a plain LM loss but not for DPO, which needs one log-probability
+scalar per sequence. It lives in `model/` (`masking.sequence_logprob_sum`), not `train.py`, purely because of import
+direction: `dpo_data.py`'s precompute needs it too, and `dpo_data.py` must not import `train.py` (which already
+imports it) — both already import `model/`. `model.load_transformer_from_checkpoint(path, device, eos_id=None)` moved there for the identical
 reason: `generate.py` owns this logic and imports `data.py`, so `data.py` can't import `generate.py` back;
 `generate.load_checkpoint` is now a thin wrapper.
 

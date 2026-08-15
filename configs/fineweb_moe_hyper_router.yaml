@@ -21,7 +21,7 @@
 #   use_router (max_loops)  taxes *activations*: every loop-body pass retains its own activations
 #                            for backward (same mechanism as fixed loop_count — ACT in its default,
 #                            dense mode always runs max_loops iterations regardless of per-token
-#                            halting, see CLAUDE.md's model.py section on act_capacity_ratio). This
+#                            halting, see the model/ section of CLAUDE.md on act_capacity_ratio). This
 #                            cost scales with max_loops and is what dominated the sizing below.
 #
 #   hyper_conn_streams      taxes activations too (n_streams x the residual stream at every

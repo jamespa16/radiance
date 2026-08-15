@@ -1,5 +1,8 @@
 # `train.py` and `generate.py` — the training loop and inference
 
+The loop is in `train.py`; the loss functions are in `losses.py`, batch sizing and micro-batch splitting in
+`batching.py`, checkpoint save/load in `checkpointing.py`, and evaluation in `evaluation.py`.
+
 Plain PyTorch training loop (no HF `Trainer`): the optimizer from `optim.build_optimizer` plus a warmup +
 cosine-or-WSD LR schedule (`build_lr_scheduler`), manual loss computation, gradient clipping, periodic W&B logging
 (`train/loss`, `train/lm_loss`, `train/z_loss`, `train/mtp_loss`, `train/ponder_cost`, `train/mean_loop_depth`,
@@ -237,8 +240,8 @@ underflow small gradients, where bf16 has fp32's exponent range and needs no sca
 
 `load_checkpoint(path, device)` reconstructs a `DenseTransformer` + tokenizer via
 `model.load_transformer_from_checkpoint` (`torch.load(..., weights_only=False)`, since the checkpoint pickles the
-full `Config` object, not just tensors) plus `build_tokenizer`. The reconstruction itself lives in `model.py` for
-import-direction reasons — see [post-training.md](post-training.md).
+full `Config` object, not just tensors) plus `build_tokenizer`. The reconstruction itself lives in the model
+package (`model/load.py`) for import-direction reasons — see [post-training.md](post-training.md).
 
 `generate(...)` runs autoregressive sampling (`--temperature`, `--top-k`; `--temperature 0` for greedy) using a
 `KVCache` from `DenseTransformer.new_kv_cache()`: the (possibly truncated) prompt is prefilled once, then each later
