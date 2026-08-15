@@ -66,7 +66,7 @@ Only the fields you need to change — everything else falls back to the datacla
 - **`dropout`** — attention-weight dropout. Set to `0.0` when using `doc_attention_mask` (flex_attention has no dropout).
 - **`max_seq_len`** — maximum context length.
 - **`rope_theta`** — RoPE base frequency.
-- **`doc_attention_mask`** — mask attention at document boundaries in packed sequences so tokens cannot attend across unrelated documents. Uses `flex_attention` on CUDA; falls back to plain SDPA on CPU and during generation.
+- **`doc_attention_mask`** — mask attention at document boundaries in packed sequences so tokens cannot attend across unrelated documents. Uses `flex_attention` on CUDA; falls back to plain SDPA on CPU and during generation. Turned off automatically for `dpo.enabled` runs (one pair side per row makes it provably inert), unless `loop_attn_windows` is also set.
 - **`loop_attn_windows`** — per-iteration attention window sizes (e.g. `[128, 128, 512, 512]` for local-then-global). Requires `doc_attention_mask` (rides the same flex_attention machinery). `None` = fully global.
 - **`grad_checkpoint`** — recompute activations during backward instead of storing them; trades ~20-25% throughput for large memory savings, especially under looping. Training-only.
 - **`vocab_pad_multiple`** — round vocab size up to this multiple for tensor-core alignment on `lm_head`. `1` disables. Padding rows are unreachable by any tokenizer id.
@@ -86,7 +86,7 @@ Only the fields you need to change — everything else falls back to the datacla
 - **`lr_schedule`** — `"cosine"` (default) or `"wsd"` (warmup-stable-decay: hold full LR, decay only the final `wsd_decay_ratio`).
 - **`wsd_decay_ratio`** — fraction of `max_steps` spent in the final decay phase when `lr_schedule: "wsd"`.
 - **`max_steps`** — training step count; ignored if `tokens_per_param` is set.
-- **`tokens_per_param`** — derive `max_steps` from model size instead; Chinchilla-optimal is ~20. Overwrites `max_steps` once the model is built.
+- **`tokens_per_param`** — derive `max_steps` from model size instead; Chinchilla-optimal is ~20. Overwrites `max_steps` once the model is built, using `resolved_row_tokens` so active `sft.seq_len`/`dpo.seq_len` overrides and DPO's chosen+rejected width are reflected.
 - **`auto_batch_size`** — compute `batch_size`/`grad_accum_steps` from free VRAM and model size at startup. Defaults on; makes the actual micro-batch safer, never bigger. Also enables OOM backoff. CUDA-only.
 - **`target_effective_batch_size`** — effective batch size `auto_batch_size` solves for; `None` preserves the configured `batch_size * grad_accum_steps`.
 - **`vram_safety_margin`** — fraction of estimated VRAM budget to use when `auto_batch_size` is on; lower is more conservative.
@@ -97,10 +97,43 @@ Only the fields you need to change — everything else falls back to the datacla
 - **`save_every`** — checkpoint every N steps.
 - **`output_dir`** — directory for checkpoints.
 - **`resume_from`** — path to resume from, or `"auto"` for the highest-numbered checkpoint in `output_dir`. Restores weights, optimizer state, LR schedule, and GradScaler.
+- **`init_from`** — path to a checkpoint to seed *model weights only* from (e.g. starting SFT from a pretrained checkpoint); unlike `resume_from`, the optimizer/scheduler/step are not restored, so this run gets a fresh optimizer/scheduler and starts at step 0. Ignored whenever `resume_from` finds a checkpoint. `None` = fresh init.
 - **`seed`** — random seed.
 - **`device`** — `"auto"` (CUDA > MPS > CPU), `"cuda"`, `"mps"`, or `"cpu"`.
 - **`compile`** — enable `torch.compile` on the model.
 - **`dtype`** — precision: `"fp32"`, `"fp16"`, or `"bf16"`. Forward runs under `torch.autocast`; master weights and optimizer stay fp32. `GradScaler` is enabled only for `fp16`.
+
+## sft
+
+Post-training: supervised fine-tuning on chat/instruction data. A mode switch (like `use_moe`/`use_router`), not an inert default-on feature — enabling it swaps `train.py`'s data pipeline and loss function entirely. Pair with `train.init_from` to seed the model from a pretrained checkpoint; see `configs/tinystories_sft.yaml` for a worked example.
+
+- **`enabled`** — route `train.py` through `build_sft_dataloaders`/`compute_sft_loss` instead of the pretrain path. Default `false`.
+- **`dataset`** — HF `user/dataset`-style instruction dataset. Required when `enabled`.
+- **`messages_column`** — column holding `[{"role", "content"}, ...]` chat turns (the standard shape for chat-formatted HF datasets, e.g. `HuggingFaceH4/no_robots`). Ignored if `instruction_column` is set instead.
+- **`instruction_column` / `input_column` / `output_column`** — Alpaca-style fallback for datasets with separate instruction/input/output columns rather than a `messages` column; a 2-turn user/assistant list is built from these instead.
+- **`seq_len`** — packed block width for SFT; `None` resolves to `data.seq_len`.
+- **`cache_dir`** — tokenized+packed cache for the SFT dataset, separate from `data.cache_dir` so it can never collide with a pretrain cache entry.
+- **`eval_split_size`** — same semantics as `data.eval_split_size`, applied to the SFT dataset.
+- **`user_prefix` / `assistant_prefix`** — plain text turn markers (e.g. `"\n\nUser: "` / `"\n\nAssistant: "`) joined onto each turn before tokenizing. Not new special tokens — they tokenize through the existing vocab, so no embedding resize is needed. Assistant turns (and the trailing EOS) are what `compute_sft_loss` scores; user/system turns are masked out of the loss but still attended to causally.
+
+## dpo
+
+Post-training: Direct Preference Optimization on `(prompt, chosen, rejected)` triples. A second mode switch alongside `sft` — mutually exclusive with `sft.enabled` (`train.py` raises if both are set) — swapping `train.py`'s data pipeline and loss function the same way `sft.enabled` does, and reusing everything else (optimizer, LR schedule, `auto_batch_size`, checkpointing, `init_from`) identically. Unlike SFT, DPO's loss needs a frozen reference model's log-probabilities on the same sequences; those are precomputed once during data prep and cached to disk alongside the tokenized dataset, so training itself only ever holds the policy model in memory. See `configs/tinystories_dpo.yaml` for a worked example (a three-stage pretrain -> SFT -> DPO chain).
+
+Each `(prompt+chosen)`/`(prompt+rejected)` sequence is packed as its own row, independently padded to `seq_len` with trailing `eos_token_id` (loss-masked) — "packing of one," unlike `sft`'s many-examples-per-block packing — so a pair's two halves can never be separated by `DataLoader` shuffling. This needs no `model.py` changes: attention is strictly causal and the real content always precedes its own padding within a row, so the padding can never influence the scored tokens' logits.
+
+- **`enabled`** — route `train.py` through `build_dpo_dataloaders`/`compute_dpo_loss_from_logits` instead of the pretrain/SFT path. Default `false`.
+- **`dataset`** — HF `user/dataset`-style preference dataset. Required when `enabled`.
+- **`prompt_column`** — `null` (default): `chosen_column`/`rejected_column` are full `[{"role", "content"}, ...]` message lists that already include the prompt turn (e.g. `argilla/dpo-mix-7k`). Set: `chosen_column`/`rejected_column` are plain completion strings, combined with `prompt_column` (+ optional `system_column`) into a shared 1-turn user prompt (e.g. `Intel/orca_dpo_pairs`, which has separate `system`/`question`/`chosen`/`rejected` string columns — set `prompt_column: question`, `system_column: system`).
+- **`system_column`** — only consulted when `prompt_column` is set.
+- **`chosen_column` / `rejected_column`** — column names for the preferred/dispreferred side. Default `"chosen"`/`"rejected"`.
+- **`seq_len`** — packed row width for DPO; `null` resolves to `data.seq_len`. A pair with either side exceeding this is dropped, not truncated (truncating the completion would score a partial response as fully chosen/rejected; truncating the prompt would silently change what's being conditioned on).
+- **`cache_dir`** — tokenized+packed+reference-scored cache for the DPO dataset, separate from `data.cache_dir`/`sft.cache_dir`. The cache key includes the reference checkpoint's path/mtime/size, so changing `reference_checkpoint` invalidates it.
+- **`eval_split_size`** — same semantics as `data.eval_split_size`, applied to the DPO dataset.
+- **`beta`** — DPO temperature / regularization strength (Rafailov et al. 2023). Default `0.1`.
+- **`reference_checkpoint`** — path to a frozen checkpoint whose log-probabilities anchor the DPO loss. Required when `enabled`. Often, but not necessarily, the same checkpoint `train.init_from` seeds the policy from.
+- **`reference_batch_size`** — batch size for the one-time reference-logprob precompute pass. Default `32`.
+- **`user_prefix` / `assistant_prefix`** — same plain-text turn-marker convention as `sft.user_prefix`/`sft.assistant_prefix`.
 
 ## wandb
 
@@ -120,6 +153,7 @@ These are not YAML config knobs but command-line flags for `uv run radiance-gene
 - **`--loops N`** — override the checkpoint's loop count for this generation; for models trained with stochastic loop depth this enables test-time compute scaling. Per-iteration parameter banks clamp at their last entry rather than wrapping.
 - **`--device`** — device to run on; default `"auto"`.
 - **`--seed`** — random seed for reproducible generation.
+- **`--chat`** — wrap `--prompt` in the checkpoint's SFT turn template (`sft.user_prefix`/`assistant_prefix`, read back off the checkpoint's saved config) before generating. Requires a checkpoint trained with `sft.enabled: true`.
 
 ## W&B sweep configs
 

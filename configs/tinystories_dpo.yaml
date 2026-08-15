@@ -1,0 +1,77 @@
+# Worked example: DPO (Direct Preference Optimization, post-training) on top of an SFT checkpoint.
+#
+# This is the third stage of a pretrain -> SFT -> DPO chain, not a from-scratch run:
+#
+#   1. WANDB_MODE=offline uv run radiance-train --config configs/tinystories.yaml
+#      writes a base checkpoint (e.g. checkpoints/tinystories/run2/step_1000.pt).
+#   2. Point configs/tinystories_sft.yaml's train.init_from at that checkpoint and run it —
+#      writes an SFT checkpoint (e.g. checkpoints/tinystories_sft/step_800.pt).
+#   3. Point *this* config's train.init_from AND dpo.reference_checkpoint at that SFT checkpoint
+#      (both fields below need filling in) and run it.
+#
+# train.init_from seeds the DPO run's policy weights (fresh optimizer/scheduler, step 0 — same
+# "post-training" semantics tinystories_sft.yaml uses). dpo.reference_checkpoint is a *separate*
+# field on purpose: it's what data.py's one-time reference-logprob precompute pass loads to anchor
+# the DPO loss (see data.py's "DPO (preference post-training)" section) — usually, but not
+# necessarily, the same checkpoint init_from seeds the policy from. Here they're the same
+# checkpoint, which is the common case.
+#
+# dpo.dataset (argilla/dpo-mix-7k) ships `chosen`/`rejected` as full [{"role","content"},...]
+# message lists that already include the prompt turn, so dpo.prompt_column stays at its default
+# (null) — see configs/README.md's `## dpo` section for the alternate prompt_column-set shape
+# (e.g. Intel/orca_dpo_pairs, separate prompt + plain-string completions).
+#
+# Each (prompt+chosen)/(prompt+rejected) sequence is packed as its own single row, EOS-tail-padded
+# to seq_len — "packing of one," not SFT's many-examples-per-block packing — so pairing survives
+# DataLoader shuffling with no extra bookkeeping. No model.py changes needed for this: attention is
+# strictly causal and the real content always precedes its own padding within a row, so the padding
+# can never influence the scored tokens' logits regardless of document-boundary masking. A DPO run
+# therefore turns model.doc_attention_mask off for itself at startup (it would build a BlockMask
+# every step that cannot change a scored logit, and it costs the run CUDA graphs) — unless
+# model.loop_attn_windows is set, which rides the same mask and does affect real content.
+#
+# radiance-generate --checkpoint <this run's checkpoint> --chat --prompt "..." applies the same
+# turn template automatically (format_chat_prompt reads cfg.dpo.enabled off the checkpoint).
+
+run_name: tinystories-dpo
+
+data:
+  # dpo.enabled routes data loading through build_dpo_dataloaders entirely, so data.dataset/
+  # text_column/cache_dir are unused here — only tokenizer/seq_len/num_workers still apply
+  # (tokenizer must match the base checkpoint's; seq_len is dpo.seq_len's None-default fallback).
+  tokenizer: gpt2
+  seq_len: 512
+  num_workers: 4
+
+model:
+  d_model: 256
+  head_dim: 64
+  n_layers: 6
+  loop_count: 1
+  ffn_mult: 4.0
+  ffn_depth: 3
+  dropout: 0.03
+  max_seq_len: 512
+
+dpo:
+  enabled: true
+  dataset: argilla/dpo-mix-7k # ~6.75k train / 750 test, chosen/rejected as message lists
+  reference_checkpoint: null # fill in with the SFT checkpoint from step 2 above
+  beta: 0.1
+
+train:
+  init_from: null # fill in with the same SFT checkpoint as dpo.reference_checkpoint (see comment above)
+  batch_size: 8 # DPO forwards chosen+rejected concatenated (2x width per row) — see
+  # train.estimate_batch_size's width_multiplier — so this is deliberately half tinystories_sft's 16.
+  lr: 3.0e-5 # lower than SFT's 1.0e-4: DPO wants gentler updates still, one stage further out
+  muon_lr: 1.5e-3 # same ratio-to-lr scaling SFT used, one stage further down
+  warmup_ratio: 0.03
+  max_steps: 400
+  eval_every: 50
+  save_every: 100
+  output_dir: checkpoints/tinystories_dpo
+  dtype: bf16
+
+wandb:
+  project: radiance
+  mode: online

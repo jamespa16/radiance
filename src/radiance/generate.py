@@ -7,24 +7,15 @@ import torch.nn.functional as F
 from transformers import PreTrainedTokenizerBase
 
 from radiance.config import Config, resolve_device
-from radiance.data import build_tokenizer
-from radiance.model import DenseTransformer
+from radiance.data import build_tokenizer, format_chat_prompt
+from radiance.model import DenseTransformer, load_transformer_from_checkpoint
 
 
 def load_checkpoint(path: str, device: str) -> tuple[DenseTransformer, Config, PreTrainedTokenizerBase]:
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-    cfg: Config = ckpt["config"]
-
+    # eos_id intentionally left at its default (None): doc masking stays off during generation,
+    # since a single prompt is one document anyway (see model.load_transformer_from_checkpoint).
+    model, cfg = load_transformer_from_checkpoint(path, device)
     tokenizer = build_tokenizer(cfg)
-    # Must match training's padded vocab (see model.padded_vocab_size), or load_state_dict fails on
-    # the token_emb/lm_head shapes. Read the width off the checkpoint itself rather than recomputing
-    # it, so checkpoints saved before vocab padding existed still load.
-    vocab_size = ckpt["model"]["token_emb.weight"].shape[0]
-    model = DenseTransformer(cfg.model, vocab_size=vocab_size)
-    model.load_state_dict(ckpt["model"])
-    model.to(device)
-    model.eval()
-
     return model, cfg, tokenizer
 
 
@@ -99,17 +90,29 @@ def main() -> None:
         "most useful for a model trained with stochastic loop depth.",
     )
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--chat",
+        action="store_true",
+        help="Wrap --prompt in the checkpoint's chat turn template (cfg.sft.user_prefix/"
+        "assistant_prefix or cfg.dpo.user_prefix/assistant_prefix) before generating, matching how "
+        "the checkpoint was trained. Requires a checkpoint trained with sft.enabled: true or "
+        "dpo.enabled: true.",
+    )
     args = parser.parse_args()
     device = resolve_device(args.device)
 
     if args.seed is not None:
         torch.manual_seed(args.seed)
 
-    model, _, tokenizer = load_checkpoint(args.checkpoint, device)
+    model, cfg, tokenizer = load_checkpoint(args.checkpoint, device)
+    prompt = args.prompt
+    if args.chat:
+        prompt = format_chat_prompt(args.prompt, cfg)
+
     text = generate(
         model,
         tokenizer,
-        args.prompt,
+        prompt,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_k=args.top_k,

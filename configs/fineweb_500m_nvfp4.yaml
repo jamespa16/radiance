@@ -1,0 +1,110 @@
+# NVFP4 native training — the worked example for model.fp4_linear (see CLAUDE.md and nvfp4.py).
+#
+# Identical to fineweb_500m.yaml except for `train.dtype: nvfp4`, which resolves to
+# `model.fp4_linear: true` with bf16 autocast underneath (config._apply_dtype_sugar). Master
+# weights, gradients and optimizer state all stay fp32; only the GEMM operands are 4-bit.
+#
+# Why this config and not tinystories: FP4's win scales with how large the GEMMs are relative to
+# the quantization that feeds them. Measured per-linear, all three GEMMs, on an RTX 5090:
+# **1.18-1.88x at d_model 1280**, 2.35x at d_model 2048, and **0.34x at d_model 256**. A
+# TinyStories-scale A/B of this feature will report a loss, correctly, and tell you nothing about
+# whether it is worth using.
+#
+# This config's widths already satisfy the shape contract (every quantized width a multiple of
+# 128): d_model 1280, qkv 3840, ffn_dim 2560, and 4 x 1024 = 4096 tokens per micro-batch.
+#
+# Two things to keep in mind when A/B-ing against fineweb_500m.yaml:
+#   - **Compare at fixed compute, not fixed steps.** FP4 is *supposed* to change wall-clock, so a
+#     fixed-step comparison measures only the quality cost and reports it as a pure loss. Give the
+#     bf16 arm proportionally more steps, or run both to a wall-clock budget.
+#   - **Pin batch_size and set auto_batch_size: false** in both arms — *not* done below, because
+#     this ships as a training config rather than an A/B arm and auto-sizing is what you want for a
+#     real run. Add it by hand to both arms before comparing: FP4 costs ~2.7 GB *more* peak than
+#     bf16 (weight caches plus the backward briefly holding several quantized forms), so auto-sizing
+#     hands the two arms different batches and the comparison differs in two ways at once.
+#
+# Coverage defaults to *maximum* here: every block (including blocks[0] and the last), lm_head, and
+# activations saved for backward in their packed 4-bit form. That is worth ~4% of the step over the
+# conservative setting, on throughput evidence alone — the quality side is unmeasured. If a run
+# regresses on val/loss, turn coverage back in this order, at ~4% total cost:
+#   model.fp4_lm_head: false        # first: this is the tied-embedding gradient path
+#   model.fp4_keep_bf16_blocks: 1   # then: matches NVIDIA's published recipe
+#   model.fp4_keep_bf16_first: true
+# Set model.fp4_grad_gemms: false for the lower-risk arm that keeps dgrad/wgrad in bf16 — it is
+# also the control that separates "the gradient path is what hurts" from "FP4 hurts".
+
+run_name: fineweb-500m-nvfp4
+
+data:
+  dataset: HuggingFaceFW/fineweb # ~15TB, train split only (no validation split exists)
+  text_column: text
+  tokenizer: gpt2
+  seq_len: 1024
+  num_workers: 4
+  cache_dir: .cache/radiance/tokenized
+  streaming: true # required: fineweb is far too large to tokenize/cache to disk up front
+  shuffle_buffer_size: 10000
+  # fineweb has no validation split, so carve a deterministic 2000-example held-out slice off
+  # the front of train instead (excluded from training) — see CLAUDE.md's "Extending" section.
+  eval_split_size: 2000
+  # Uncomment to also avoid re-fetching/re-tokenizing already-streamed data across repeated
+  # short runs (e.g. while iterating on this config) — see CLAUDE.md's "Extending" section.
+  disk_cache_max_gb: 50
+  disk_cache_shard_size: 100
+  prefetch_factor: 2
+
+model:
+  d_model: 1280
+  head_dim: 64
+  n_layers: 22
+  loop_count: 2
+  ffn_mult: 2.0
+  ffn_depth: 2
+  dropout: 0.01
+  max_seq_len: 1024
+  # Uncomment to trade ~20-25% throughput for a large drop in activation memory (27.7 -> 11.2 GB peak at
+  # micro-batch 4, seq_len 1024 — see CLAUDE.md). Worth it here because loop_count: 2 means blocks[1:]
+  # retain activations twice over; auto_batch_size accounts for it and will pick a bigger micro-batch.
+  # grad_checkpoint: true
+  # ~498.5M parameters (verified via DenseTransformer(...).num_parameters() with the gpt2
+  # tokenizer's 50257-token vocab). Scale n_layers up/down to retarget a different size.
+
+train:
+  batch_size: 4 # tune to available VRAM at seq_len=1024, bf16 (500M params + fp32 optimizer state)
+  grad_accum_steps: 1 # bump this (not batch_size) to grow the effective batch beyond what fits in VRAM;
+  # effective_batch_size = batch_size * grad_accum_steps, and tokens_per_param's derived max_steps
+  # scales with effective_batch_size.
+  # auto_batch_size defaults to True (see CLAUDE.md's train.py section): on CUDA it overwrites
+  # batch_size/grad_accum_steps above with values estimated from free VRAM + model size, by default
+  # targeting the same effective_batch_size (batch_size * grad_accum_steps = 4) those already imply.
+  # Uncomment to target a different effective batch size, or set auto_batch_size: false above to use
+  # batch_size/grad_accum_steps exactly as hand-tuned instead.
+  target_effective_batch_size: 32 # NOT optional here, unlike in fineweb_500m.yaml where it is
+  # commented out. At the shipped grad_accum 1 (4096 tokens/step) Muon's flat ~99 ms per optimizer
+  # step is 43% of the step and FP4 never touches it, so the 1.24x FP4 buys on fwd+bwd dilutes to
+  # 1.06x overall. At 32768 tokens/step it amortises and the total is 1.20x. See "Measured results".
+  # vram_safety_margin: 0.5
+  lr: 2.5e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  tokens_per_param: 20 # Chinchilla-optimal; max_steps is derived from this and printed/logged at run start
+  grad_clip: 1.0
+  log_every: 10
+  eval_every: 100
+  save_every: 100
+  output_dir: checkpoints/fineweb_500m_nvfp4 # deliberately *not* fineweb_500m.yaml's directory:
+  # save_checkpoint keeps one checkpoint per run and deletes every other step_*.pt in output_dir
+  # before writing, so sharing a directory would have this run destroy the bf16 run's checkpoint —
+  # and resume_from: auto would then pick up whichever arm wrote last.
+  # Uncomment to make an interrupted run continue from the newest checkpoint in output_dir instead of
+  # restarting — restores optimizer moments and the LR schedule, not just the weights.
+  # resume_from: auto
+  seed: 42
+  device: auto
+  compile: true
+  dtype: nvfp4
+
+wandb:
+  project: radiance
+  entity: null
+  mode: online
