@@ -26,10 +26,11 @@ def test_generate_matches_manual_id_join_and_decode(tiny_cfg):
     torch.manual_seed(0)
     text = generate(model, tokenizer, prompt, max_new_tokens=6, temperature=0, device="cpu")
 
-    torch.manual_seed(0)
-    new_ids = list(generate_tokens(model, tokenizer, prompt, max_new_tokens=6, temperature=0, device="cpu"))
-
     prompt_ids = tokenizer(prompt)["input_ids"]
+    input_ids = torch.tensor([prompt_ids])
+    torch.manual_seed(0)
+    new_ids = list(generate_tokens(model, tokenizer, input_ids, max_new_tokens=6, temperature=0, device="cpu"))
+
     expected = tokenizer.decode(prompt_ids + new_ids, skip_special_tokens=True)
     assert text == expected
 
@@ -40,8 +41,9 @@ def test_incremental_decode_of_generate_tokens_matches_final_decode(tiny_cfg):
     tokenizer = WordTokenizer(TINY_VOCAB)
     prompt = "the quick brown fox jumps"
 
+    input_ids = torch.tensor([tokenizer(prompt)["input_ids"]])
     torch.manual_seed(0)
-    new_ids = list(generate_tokens(model, tokenizer, prompt, max_new_tokens=6, temperature=0, device="cpu"))
+    new_ids = list(generate_tokens(model, tokenizer, input_ids, max_new_tokens=6, temperature=0, device="cpu"))
 
     ids_so_far: list[int] = []
     text_so_far = ""
@@ -60,7 +62,8 @@ def test_generate_tokens_never_yields_eos(tiny_cfg):
     model = DenseTransformer(cfg.model, vocab_size=TINY_VOCAB).eval()
     tokenizer = WordTokenizer(TINY_VOCAB)
 
+    input_ids = torch.tensor([tokenizer("the quick")["input_ids"]])
     torch.manual_seed(0)
-    new_ids = list(generate_tokens(model, tokenizer, "the quick", max_new_tokens=20, temperature=0, device="cpu"))
+    new_ids = list(generate_tokens(model, tokenizer, input_ids, max_new_tokens=20, temperature=0, device="cpu"))
 
     assert tokenizer.eos_token_id not in new_ids

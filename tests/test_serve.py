@@ -154,3 +154,9 @@ def test_top_p_rejected(tiny_cfg):
         json={"messages": [{"role": "user", "content": "hi"}], "top_p": 0.5},
     )
     assert resp.status_code == 400
+
+
+def test_empty_messages_rejected(tiny_cfg):
+    client, _, _ = _client(_sft_cfg(tiny_cfg))
+    resp = client.post("/v1/chat/completions", json={"messages": []})
+    assert resp.status_code == 400

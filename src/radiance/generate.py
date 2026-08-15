@@ -25,7 +25,7 @@ def load_checkpoint(path: str, device: str) -> tuple[DenseTransformer, Config, P
 def generate_tokens(
     model: DenseTransformer,
     tokenizer: PreTrainedTokenizerBase,
-    prompt: str,
+    input_ids: torch.Tensor,
     max_new_tokens: int = 200,
     temperature: float = 0.8,
     top_k: int = 50,
@@ -36,6 +36,10 @@ def generate_tokens(
     step. Never yields the EOS token itself (breaks before yielding it), matching generate()'s
     skip_special_tokens=True behavior.
 
+    Takes an already-tokenized `input_ids` (shape `[1, seq_len]`, on `device`) rather than a raw
+    prompt string, so callers that also need the prompt token count or the full id sequence (e.g.
+    generate()) tokenize the prompt exactly once instead of once here and once more themselves.
+
     `loops` overrides how many times the weight-shared loop body runs per forward pass.
 
     A model trained with stochastic loop depth (model.loop_count_min/max) has seen a range of
@@ -43,7 +47,6 @@ def generate_tokens(
     test-time compute scaling with no change to the weights. The KV cache is sized to match, since
     it needs one slot per (block, iteration) pair actually executed.
     """
-    input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
     next_input = input_ids[:, -model.cfg.max_seq_len :]
     kv_cache = model.new_kv_cache(loop_count=loops)
 
@@ -96,7 +99,7 @@ def generate(
     input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
     input_ids = input_ids[:, -model.cfg.max_seq_len :]
     new_ids = list(
-        generate_tokens(model, tokenizer, prompt, max_new_tokens, temperature, top_k, device, loops)
+        generate_tokens(model, tokenizer, input_ids, max_new_tokens, temperature, top_k, device, loops)
     )
     if new_ids:
         new_ids_tensor = torch.tensor([new_ids], dtype=input_ids.dtype, device=device)
