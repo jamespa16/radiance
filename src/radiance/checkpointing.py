@@ -6,7 +6,7 @@ import torch
 from torch.optim.lr_scheduler import LambdaLR
 
 from radiance.config import Config, ModelConfig
-from radiance.model import DenseTransformer
+from radiance.model import DenseTransformer, checkpoint_vocab_size
 def save_checkpoint(
     path: Path,
     raw_model: DenseTransformer,
@@ -96,7 +96,7 @@ def load_pretrained_weights(raw_model: DenseTransformer, path: str, cfg: Config,
     """
     ckpt = torch.load(path, map_location=device, weights_only=False)
     source_cfg = ckpt["config"].model
-    source_vocab = ckpt["model"]["token_emb.weight"].shape[0]
+    source_vocab = checkpoint_vocab_size(ckpt)
     mismatches = []
     if source_vocab != vocab_size:
         mismatches.append(f"vocab_size: checkpoint={source_vocab}, this run={vocab_size}")

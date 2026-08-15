@@ -5,6 +5,16 @@ import torch
 from radiance.config import Config
 
 from .transformer import DenseTransformer
+def checkpoint_vocab_size(ckpt: dict) -> int:
+    """The vocab size a saved checkpoint's model was built with.
+
+    `token_emb.weight`'s leading dim is the only place this is recoverable from a raw state dict;
+    both DenseTransformer reconstruction and the checkpoint-shape-mismatch check in
+    checkpointing.load_pretrained_weights need it.
+    """
+    return ckpt["model"]["token_emb.weight"].shape[0]
+
+
 def load_transformer_from_checkpoint(
     path: str, device: str, eos_id: int | None = None
 ) -> tuple["DenseTransformer", "Config"]:
@@ -21,7 +31,7 @@ def load_transformer_from_checkpoint(
     """
     ckpt = torch.load(path, map_location=device, weights_only=False)
     cfg = ckpt["config"]
-    vocab_size = ckpt["model"]["token_emb.weight"].shape[0]
+    vocab_size = checkpoint_vocab_size(ckpt)
     model = DenseTransformer(cfg.model, vocab_size=vocab_size, eos_id=eos_id)
     model.load_state_dict(ckpt["model"])
     model.to(device)

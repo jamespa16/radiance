@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 
 from radiance.config import Config, doc_mask_is_inert_for_dpo
-from radiance.model import DenseTransformer, sequence_logprob_sum
+from radiance.model import DenseTransformer, ModelOutput, sequence_logprob_sum, target_logit_and_logz
 def compute_mtp_loss(
     model: DenseTransformer, mtp_hidden: tuple[torch.Tensor, ...] | None, input_ids: torch.Tensor
 ) -> torch.Tensor:
@@ -38,17 +38,15 @@ def compute_mtp_loss(
 def _nll_and_logz(flat_logits: torch.Tensor, flat_labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Mean NLL over non-ignored positions, and the mean of logsumexp(logits)^2, from ONE pass.
 
-    cross_entropy is exactly `logsumexp(x) - x[label]`, and the z-loss regulariser squares that
-    same `logsumexp(x)`. Computing them separately — F.cross_entropy plus a torch.logsumexp — walks
-    the largest tensor in the model twice in the forward and twice again in the backward. Deriving
-    both from a single `z` halves that, and lets the whole thing stay in the compute dtype instead
-    of tripping autocast's fp32 policy on log_softmax.
+    The z-loss regulariser squares the same `logsumexp(x)` that cross-entropy's `target_logit`
+    comes from; target_logit_and_logz (shared with model.dpo.sequence_logprob_sum, DPO's
+    per-row analogue of this NLL) derives both from that single pass, which lets the whole thing
+    stay in the compute dtype instead of tripping autocast's fp32 policy on log_softmax.
     """
     keep = flat_labels != -100
     # gather can't take -100, and those rows are masked out of both means below anyway.
     safe_labels = flat_labels.masked_fill(~keep, 0)
-    z = torch.logsumexp(flat_logits, dim=-1).float()
-    target_logit = flat_logits.gather(1, safe_labels.unsqueeze(1)).squeeze(1).float()
+    target_logit, z = target_logit_and_logz(flat_logits, safe_labels)
 
     keep_f = keep.to(torch.float32)
     # clamp: an all-ignored batch is degenerate (it needs seq_len < 2), and 0 beats the nan
@@ -197,6 +195,23 @@ def build_dpo_loss_fn(cfg: Config):
     return torch.compile(compute_dpo_loss_from_logits) if cfg.train.compile else compute_dpo_loss_from_logits
 
 
+def forward_dpo_pair(model, chunk: dict) -> tuple[ModelOutput, torch.Tensor, torch.Tensor]:
+    """Forward a DPO chunk's chosen+rejected sequences concatenated in one `model()` call, then
+    split the output logits back apart.
+
+    One concatenated forward rather than two separate ones keeps the DPO step's per-chunk kernel
+    launches and activation shape at chosen+rejected's natural combined width. Shared by
+    chunk_loss_and_metrics (training) and evaluate() (eval) since this forward mechanics is
+    identical between them — only what each does with the split logits differs; see
+    chunk_loss_and_metrics's docstring for why the two loss-*assembly* paths don't also share code.
+    """
+    c_ids, r_ids = chunk["chosen_input_ids"], chunk["rejected_input_ids"]
+    b = c_ids.size(0)
+    out = model(torch.cat([c_ids, r_ids], dim=0))
+    chosen_logits, rejected_logits = out.logits.split(b, dim=0)
+    return out, chosen_logits, rejected_logits
+
+
 def chunk_loss_and_metrics(
     model, raw_model: DenseTransformer, cfg: Config, loss_fn, chunk: dict
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -217,9 +232,7 @@ def chunk_loss_and_metrics(
     """
     if cfg.dpo.enabled:
         c_ids, r_ids = chunk["chosen_input_ids"], chunk["rejected_input_ids"]
-        b = c_ids.size(0)
-        out = model(torch.cat([c_ids, r_ids], dim=0))
-        chosen_logits, rejected_logits = out.logits.split(b, dim=0)
+        out, chosen_logits, rejected_logits = forward_dpo_pair(model, chunk)
         lm_loss, margin, margin_accuracy, reward_accuracy = loss_fn(
             chosen_logits, c_ids, chunk["chosen_loss_mask"],
             rejected_logits, r_ids, chunk["rejected_loss_mask"],

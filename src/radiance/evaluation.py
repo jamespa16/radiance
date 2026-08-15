@@ -5,7 +5,7 @@ import torch
 from radiance.model import DenseTransformer
 
 from .batching import chunk_reduction_units, split_micro_batch
-from .losses import compute_loss
+from .losses import compute_loss, forward_dpo_pair
 @torch.no_grad()
 def evaluate(
     model: DenseTransformer,
@@ -46,11 +46,13 @@ def evaluate(
     the historical single forward bit-for-bit — a run that never backoffed (chunk == batch_size)
     evals exactly as before.
 
-    The forward + loss assembly below stays local rather than also calling chunk_loss_and_metrics:
-    that function needs raw_model (for compute_mtp_loss) and unconditionally folds
+    The loss assembly below stays local rather than also calling chunk_loss_and_metrics: that
+    function needs raw_model (for compute_mtp_loss) and unconditionally folds
     ponder_cost/moe_aux_loss/z_loss/mtp_loss into its total, which val/loss deliberately excludes
     so it stays a pure LM number (see docs/train.md) — sharing it here would either drag those
-    terms into eval or need a second, eval-only mode threaded through it for no benefit.
+    terms into eval or need a second, eval-only mode threaded through it for no benefit. The DPO
+    forward itself (concatenate chosen+rejected, split the logits back) is identical either way,
+    so that much is shared via losses.forward_dpo_pair.
     """
     model.eval()
     total, count = 0.0, 0
@@ -66,9 +68,7 @@ def evaluate(
             for chunk, chunk_units in zip(chunks, units):
                 if dpo:
                     c_ids, r_ids = chunk["chosen_input_ids"], chunk["rejected_input_ids"]
-                    b = c_ids.size(0)
-                    out = model(torch.cat([c_ids, r_ids], dim=0))
-                    chosen_logits, rejected_logits = out.logits.split(b, dim=0)
+                    _, chosen_logits, rejected_logits = forward_dpo_pair(model, chunk)
                     chunk_loss, _, _, _ = loss_fn(
                         chosen_logits, c_ids, chunk["chosen_loss_mask"],
                         rejected_logits, r_ids, chunk["rejected_loss_mask"],
