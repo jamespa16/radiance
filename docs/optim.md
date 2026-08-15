@@ -15,6 +15,11 @@ reshaping — dim 0 is a free batch dimension. The iteration deliberately does *
 settle into a band around [0.68, 1.13], which is the intended operating point (it needs the spread collapsed, not the
 values exact).
 
+`orthogonalize` runs in bf16 on CUDA (self-correcting, so the halved precision costs nothing and halves the
+bandwidth) but stays in the input's own dtype on CPU: there's no bandwidth win to trade for there, and without
+AVX-512-BF16 hardware, PyTorch's CPU bf16 matmul falls back to a path slow enough to turn a CPU-only test run into an
+effective hang — this is what made `ci.yml`'s move to a GitHub-hosted (non-AVX-512-BF16) runner surface it.
+
 `MuonWithAuxAdam` holds both algorithms in **one** Optimizer object with a per-group `algorithm` key, because
 everything downstream assumes a single optimizer — the `GradScaler`'s unscale_/step bookkeeping is keyed on it,
 `LambdaLR` drives its `param_groups`, `save_checkpoint` serialises its `state_dict`, and the OOM handler swaps it.

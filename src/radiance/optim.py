@@ -351,11 +351,14 @@ def orthogonalize(grad: torch.Tensor, steps: int = 5, eps: float = 1.0e-7) -> to
 
     The quintic coefficients are the standard tuned ones: they do not converge to machine-precision
     orthogonality, but they drive the singular values into a band around 1 in very few steps, which
-    is all the optimizer needs. bfloat16 is deliberate and also standard — the iteration is
-    self-correcting, so the halved precision costs nothing and halves the bandwidth.
+    is all the optimizer needs. bfloat16 is deliberate and also standard on GPU — the iteration is
+    self-correcting, so the halved precision costs nothing and halves the bandwidth. On CPU there's
+    no bandwidth win to trade for, and without AVX-512-BF16 hardware support PyTorch's CPU bf16
+    matmul falls back to a path that's dramatically (not just somewhat) slower than fp32 — enough to
+    turn a CPU-only test run into an effective hang — so CPU stays in the input's own dtype instead.
     """
     a, b, c = 3.4445, -4.7750, 2.0315
-    X = grad.bfloat16()
+    X = grad.bfloat16() if grad.is_cuda else grad
     X = X / (torch.linalg.matrix_norm(X, keepdim=True) + eps)
 
     # The iteration below assumes rows <= cols; transpose the tall case and undo it afterwards.
