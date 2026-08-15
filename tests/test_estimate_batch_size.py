@@ -1,6 +1,12 @@
 """estimate_batch_size and tokens_per_step must size batches using the resolved per-row token width,
 not cfg.data.seq_len directly, so sft.seq_len / dpo.seq_len overrides reach auto_batch_size and
-tokens_per_param's derived max_steps."""
+tokens_per_param's derived max_steps.
+
+Muon's Newton-Schulz reserve (muon_orthogonalize_reserve_bytes) is a separate concern with its own
+coverage in test_optim.py; the fixtures here pin train.optimizer="adamw" (rather than the
+TrainConfig default of "muon") so _FakeModel, which has no named_parameters(), doesn't need to
+support build_muon_param_groups just to exercise row-width resolution. test_muon_ns_reserve_is_
+wired_into_estimate_batch_size below covers the wiring itself."""
 
 from __future__ import annotations
 
@@ -37,6 +43,7 @@ def _estimate_cfg(sft: SFTConfig | None = None, dpo: DPOConfig | None = None) ->
             compile=False,
             device="cpu",
             dtype="bf16",
+            optimizer="adamw",
             target_effective_batch_size=4,
             vram_safety_margin=1.0,
         ),
@@ -111,3 +118,26 @@ def test_estimate_batch_size_reserve_bytes_shrinks_the_budget(monkeypatch):
 
     assert without_reserve == (2, 2)
     assert with_reserve == (1, 4)
+
+
+def test_muon_ns_reserve_is_wired_into_estimate_batch_size(monkeypatch):
+    """Muon's Newton-Schulz transient buffer (muon_orthogonalize_reserve_bytes, see test_optim.py
+    for its own sizing coverage) must shrink the usable token budget exactly like reserve_bytes
+    does above, not just get computed and discarded. Patches the name train.py imported (not the
+    one in optim.py) so the fixture doesn't need a real Muon-eligible model."""
+    import radiance.train as train_module
+
+    cfg = _estimate_cfg()
+    free_bytes = 3 * 1000 * 4 + 1024 * 800  # same fixture as _estimate_with_fixed_vram
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (free_bytes, 1_000_000_000))
+
+    monkeypatch.setattr(train_module, "muon_orthogonalize_reserve_bytes", lambda model, cfg: 0)
+    without_ns_reserve = train_module.estimate_batch_size(_FakeModel(), cfg, "cuda", "cuda")
+
+    # Same 512-tokens'-worth reserve as the DPO case above, but sourced from the Muon NS reserve.
+    monkeypatch.setattr(train_module, "muon_orthogonalize_reserve_bytes", lambda model, cfg: 512 * 800)
+    with_ns_reserve = train_module.estimate_batch_size(_FakeModel(), cfg, "cuda", "cuda")
+
+    assert without_ns_reserve == (2, 2)
+    assert with_ns_reserve == (1, 4)

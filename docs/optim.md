@@ -46,10 +46,11 @@ most shapes. `tests/test_optim.py::test_orthogonalize_batches_over_leading_dims`
 `_MUON_MAX_STACK = 32`. Newton-Schulz's transient buffers (`A = X @ X.mT`, `B = b*A + c*(A@A)`, `B @ X`) scale with
 the *stacked batch size*, not with the parameter count being orthogonalised, so an unbounded stack turns a throughput
 win into an OOM on a model with many same-shaped matrices. That is exactly MoE: shape is keyed on `(in, out)`, so
-every expert's projection in every MoE layer shares one shape. `auto_batch_size` has no model of this cost whatsoever
-— it sizes params/grads/optimizer state and activations, and this is none of those — so it picks a batch that looks
-safe and the run dies on the first optimizer step. Neither OOM tier saves it: tier one shrinks the micro-batch, which
-this cost is independent of, and tier two offloads only AdamW-owned tensors while the pressure is entirely Muon-side.
+every expert's projection in every MoE layer shares one shape. Before `muon_orthogonalize_reserve_bytes` (below),
+`auto_batch_size` had no model of this cost whatsoever — it sized params/grads/optimizer state and activations, and
+this is none of those — so it picked a batch that looked safe and the run died on the first optimizer step. Neither
+OOM tier saves it: tier one shrinks the micro-batch, which this cost is independent of, and tier two offloads only
+AdamW-owned tensors while the pressure is entirely Muon-side.
 
 **The first version of this cap counted tensors, and it silently never fired.** `BatchedExperts` already stores each
 projection role as *one* tensor shaped `(n_experts, in, out)`, so a 4-MoE-layer model has ~16 tensors of a given
@@ -71,6 +72,29 @@ still scale linearly with `n_experts`, and in that config activation memory from
 was the binding constraint anyway. `configs/fineweb_moe_hyper_router.yaml` therefore still ships `n_experts: 16`; its
 header carries the full per-feature measurement table. **A fix aimed at one architecture's bottleneck can be a no-op
 for another whose bottleneck is elsewhere — re-measure the config you actually intend to run.**
+
+### `estimate_batch_size` now reserves for the transient orthogonalize() spike
+
+`optim.muon_orthogonalize_reserve_bytes` closes the gap the previous section describes:
+`estimate_batch_size` (`train.py`) calls it and subtracts the result from usable VRAM alongside the existing
+grad/momentum reservation, when `train.optimizer == "muon"`. It re-derives the same per-shape matrix count
+`_step_muon` computes (unbind every Muon-owned tensor into individual `(in, out)` matrices, group by shape), takes
+the shape with the most matrices capped at `_MUON_MAX_STACK`, and multiplies by a measured
+`_MUON_NS_BYTES_PER_ELEM = 12` — the peak `max_memory_allocated` delta of one isolated `orthogonalize()` call, per
+fp32 grad element in the stacked input, measured directly (not derived from the `A`/`B`/`X` shapes analytically)
+the same way `activation_bytes_per_token`'s diff-attention and logits terms are. Square `(in, out)` shapes measured
+worst (12 bytes/elem, flat across batch 8-32 and shapes up to 1024x1024); rectangular shapes measured lower (9), so
+12 is used uniformly to stay conservative rather than shape-specific.
+
+**What this does and doesn't fix.** It only bounds the term this section is about — the transient batched-matmul
+buffer inside one `orthogonalize()` call — which is exactly what `_MUON_MAX_STACK` chunking already bounds
+per-step; the reserve just makes `estimate_batch_size` *see* that bound before committing to a batch size, instead
+of the run discovering it empirically on the first optimizer step. It does not model the *persistent* params + grad
++ momentum footprint, which already has its own (optimizer-agnostic) term in `estimate_batch_size` and genuinely
+does scale with `n_experts`; nor does it model activation memory from `max_loops`/`hyper_conn_streams`, which the
+combined-config measurement above found to dominate in practice. `n_experts: 16` in
+`configs/fineweb_moe_hyper_router.yaml` is still the right call for that config for the reasons given above — this
+reserve changes what `auto_batch_size` knows, not what the binding constraint is for every config.
 
 ### Newton-Schulz cost makes effective batch a throughput knob
 
