@@ -104,8 +104,12 @@ distinguished from `tests/test_doc_mask.py`'s multi-document block, where turnin
 ### The loss
 
 `train.compute_dpo_loss(policy_chosen_logp, policy_rejected_logp, ref_chosen_logp, ref_rejected_logp, beta)` is the
-standard objective, `-E[logsigmoid(beta * (policy_logratio - ref_logratio))]`, plus two `no_grad` diagnostics logged
-as `train/dpo_accuracy`/`train/dpo_margin` (pairwise accuracy and implicit reward margin, neither used in the loss).
+standard objective, `-E[logsigmoid(beta * (policy_logratio - ref_logratio))]`, plus three `no_grad` diagnostics
+(none used in the loss), logged as `train/dpo_margin` (implicit reward margin), `train/dpo_margin_accuracy`
+(fraction of the batch where the policy separates chosen from rejected *more than the reference did* — the sign of
+the loss's own sigmoid argument, so it can sit near 50% early in training even when the policy already ranks chosen
+above rejected in absolute terms), and `train/dpo_reward_accuracy` (the conventional reference-independent
+`policy_chosen_logp > policy_rejected_logp`, the number most DPO writeups mean by "accuracy").
 `compute_dpo_loss_from_logits` fuses two `sequence_logprob_sum` calls plus `compute_dpo_loss` into one function so
 `build_dpo_loss_fn` can `torch.compile` it as a unit, mirroring `build_loss_fn`.
 
@@ -131,7 +135,21 @@ per-row token width.
 log a flat 0 rather than a stale value) — `mtp_heads > 1` is already rejected by
 `validate_post_training_config`, and `z_loss` would need its own reduction pass over the concatenated logits that
 isn't needed for DPO correctness. `ponder_cost`/`moe_aux_loss` compose in for free, since both are zero scalar
-tensors when their feature is off.
+tensors when their feature is off. Because `model.z_loss_weight` defaults nonzero, `train.note_dpo_z_loss_omitted`
+prints a one-time startup note under `dpo.enabled` when it's still set, rather than raising the way `mtp_heads > 1`
+does — raising would break every existing default DPO config over a term that was never meant to apply here.
+
+### Why `sft.enabled`/`dpo.enabled` stay two booleans, not a mode enum
+
+Considered and rejected. Mutual exclusion is centrally enforced (`validate_post_training_config` raises if both are
+set), and every dispatch site that branches on the two booleans — `estimate_batch_size`, `build_loss_fn`,
+`chunk_reduction_units`/`split_micro_batch`, `chunk_loss_and_metrics`, `resolve_dpo_doc_mask`'s predicate, `train()`'s
+own loader/loss-fn dispatch, `Config.resolved_seq_len`/`train_width_multiplier`, and `data.format_chat_prompt` — was
+individually audited and is already correctly guarded; there is no live bug from the two-boolean shape today, only
+repeated (not inconsistent) `if dpo.enabled: ... elif sft.enabled: ...` structure. A `PostTrainingMode` enum would
+collapse those to one property read, but it means a `Config` dataclass schema change plus pickle-compat handling in
+`_backfill_missing_fields` for checkpoints saved with only the two booleans — a real migration, not a local fix, and
+not justified without a concrete bug the current shape causes.
 
 ## Shared plumbing
 

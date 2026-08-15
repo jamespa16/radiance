@@ -93,3 +93,21 @@ def test_estimate_batch_size_dpo_uses_pair_width_without_override(monkeypatch):
     cfg = _estimate_cfg(dpo=DPOConfig(enabled=True, dataset="ignored", reference_checkpoint="ckpt"))
     # 1024 usable tokens / (512 data.seq_len * 2 rows/pair) = 1 pair.
     assert _estimate_with_fixed_vram(cfg, monkeypatch) == (1, 4)
+
+
+def test_estimate_batch_size_reserve_bytes_shrinks_the_budget(monkeypatch):
+    # reserve_bytes holds back VRAM for a model that hasn't loaded yet (a DPO cache-miss's
+    # reference checkpoint) - it must reduce the usable token budget exactly like
+    # not_yet_allocated_bytes does, not get silently ignored.
+    cfg = _estimate_cfg()
+    free_bytes = 3 * 1000 * 4 + 1024 * 800  # same fixture as _estimate_with_fixed_vram: 1024 usable tokens
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (free_bytes, 1_000_000_000))
+
+    without_reserve = estimate_batch_size(_FakeModel(), cfg, "cuda", "cuda")
+    # Reserve half the usable budget's worth of bytes (512 tokens * 800 bytes/token): usable tokens
+    # drop from 1024 to 512, halving batch_size from 2 to 1.
+    with_reserve = estimate_batch_size(_FakeModel(), cfg, "cuda", "cuda", reserve_bytes=512 * 800)
+
+    assert without_reserve == (2, 2)
+    assert with_reserve == (1, 4)

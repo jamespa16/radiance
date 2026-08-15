@@ -15,10 +15,10 @@ import torch
 from datasets import Dataset, DatasetDict
 
 from radiance.config import Config, DPOConfig, DataConfig
-from radiance.data import _add_reference_logprobs, _dpo_cache_path
-from radiance.model import DenseTransformer, sequence_logprob_sum
+from radiance.data import _add_reference_logprobs, _dpo_cache_path, dpo_cache_exists
+from radiance.model import DenseTransformer, checkpoint_param_bytes, sequence_logprob_sum
 from radiance.optim import build_optimizer
-from radiance.train import build_lr_scheduler, save_checkpoint
+from radiance.train import build_lr_scheduler, dpo_reference_reserve_bytes, save_checkpoint
 from tests.conftest import TINY_VOCAB
 
 
@@ -259,6 +259,50 @@ def test_add_reference_logprobs_reraises_when_even_one_row_does_not_fit(tmp_path
         _add_reference_logprobs(packed, dpo_cfg, _FakeTokenizer(), device="cpu")
 
 
+def test_add_reference_logprobs_resets_chunk_size_per_split(tmp_path, tiny_cfg, monkeypatch):
+    # A backoff forced by one split's data must not handicap the next split, which gets its own
+    # fresh, unstressed DataLoader loop and may never hit the same OOM. oom_above=8 only ever
+    # trips on the first (16-row, both sides) call of the *first* split processed; if chunk_size
+    # stayed sticky across splits, the second split's first call would arrive already halved.
+    import radiance.model as model_mod
+
+    cfg = tiny_cfg(_train=dict(optimizer="adamw"))
+    ckpt_path = _save_reference_checkpoint(tmp_path, cfg)
+    train_split, *_ = _make_packed_split(cfg.data.seq_len, n=8, seed=0)
+    val_split, *_ = _make_packed_split(cfg.data.seq_len, n=8, seed=1)
+    packed = DatasetDict({"train": train_split, "validation": val_split})
+    dpo_cfg = Config(
+        model=cfg.model,
+        data=cfg.data,
+        train=cfg.train,
+        dpo=DPOConfig(
+            enabled=True, dataset="unused", reference_checkpoint=str(ckpt_path), reference_batch_size=8
+        ),
+    )
+
+    real_load = model_mod.load_transformer_from_checkpoint
+    simulators: list[_OOMSimulator] = []
+
+    def fake_load(*args, **kwargs):
+        ref, ref_cfg = real_load(*args, **kwargs)
+        # OOMs only on the very first call ever made (the train split's first attempt); every
+        # later call, including the validation split's first, must be allowed through.
+        simulators.append(_OOMSimulator(ref, oom_above=8))
+        return simulators[-1], ref_cfg
+
+    monkeypatch.setattr(model_mod, "load_transformer_from_checkpoint", fake_load)
+
+    _add_reference_logprobs(packed, dpo_cfg, _FakeTokenizer(), device="cpu")
+
+    # Exactly one reference model is loaded and shared across both splits, so calls accumulate in
+    # split order: train's 16-row call OOMs, backs off to two 8-row calls (as in the backoff test
+    # above) — then validation's *first* call must be the full un-backed-off 16 rows again, not a
+    # residual halved size carried over from train. Had chunk_size stayed sticky, calls[3] would
+    # be 8 (from a chunk_size of 4) instead, and it would never OOM a second time.
+    assert simulators[0].calls[:3] == [16, 8, 8]
+    assert simulators[0].calls[3] == 16
+
+
 def test_dpo_cache_path_differs_with_reference_checkpoint_size(tmp_path):
     ckpt_a = tmp_path / "a.pt"
     ckpt_a.write_bytes(b"x" * 100)
@@ -338,3 +382,63 @@ def test_dpo_cache_path_raises_ambiguous_when_reference_checkpoint_missing(tmp_p
 
     with pytest.raises(ValueError, match="not possible to tell which"):
         _dpo_cache_path(_dpo_cfg(tmp_path, ref_a))
+
+
+def test_checkpoint_param_bytes_matches_real_state_dict_bytes(tmp_path, tiny_cfg):
+    cfg = tiny_cfg(_train=dict(optimizer="adamw"))
+    raw_model = DenseTransformer(cfg.model, vocab_size=TINY_VOCAB)
+    ckpt_path = _save_reference_checkpoint(tmp_path, cfg)
+
+    expected = sum(t.numel() * t.element_size() for t in raw_model.state_dict().values())
+    assert checkpoint_param_bytes(str(ckpt_path)) == expected
+
+
+def test_dpo_cache_exists_false_without_cache_dir():
+    cfg = Config(dpo=DPOConfig(enabled=True, dataset="foo/bar", reference_checkpoint="unused.pt"))
+    assert dpo_cache_exists(cfg) is False
+
+
+def test_dpo_cache_exists_true_once_the_cache_path_is_built(tmp_path):
+    ref = tmp_path / "ref.pt"
+    ref.write_bytes(b"x" * 100)
+    cfg = _dpo_cfg(tmp_path, ref)
+
+    assert dpo_cache_exists(cfg) is False
+    _dpo_cache_path(cfg).mkdir(parents=True)
+    assert dpo_cache_exists(cfg) is True
+
+
+def test_dpo_cache_exists_false_rather_than_raising_when_ambiguous(tmp_path):
+    # dpo_cache_exists is a batch-sizing probe, not the real cache lookup — an ambiguous or
+    # missing reference checkpoint should read as "no cache" here rather than propagate
+    # _dpo_cache_path's raise; build_dpo_dataloaders still raises it on the real build path.
+    ref_a = tmp_path / "a.pt"
+    ref_b = tmp_path / "b.pt"
+    ref_a.write_bytes(b"x" * 100)
+    ref_b.write_bytes(b"x" * 200)
+    _dpo_cache_path(_dpo_cfg(tmp_path, ref_a)).mkdir(parents=True)
+    _dpo_cache_path(_dpo_cfg(tmp_path, ref_b)).mkdir(parents=True)
+    ref_a.unlink()
+
+    assert dpo_cache_exists(_dpo_cfg(tmp_path, ref_a)) is False
+
+
+def test_dpo_reference_reserve_bytes_zero_when_dpo_disabled():
+    assert dpo_reference_reserve_bytes(Config()) == 0
+
+
+def test_dpo_reference_reserve_bytes_zero_on_cache_hit(tmp_path, tiny_cfg):
+    cfg = tiny_cfg(_train=dict(optimizer="adamw"))
+    ckpt_path = _save_reference_checkpoint(tmp_path, cfg)
+    dpo_cfg = _dpo_cfg(tmp_path, ckpt_path)
+    _dpo_cache_path(dpo_cfg).mkdir(parents=True)  # simulate an already-built cache
+
+    assert dpo_reference_reserve_bytes(dpo_cfg) == 0
+
+
+def test_dpo_reference_reserve_bytes_equals_checkpoint_param_bytes_on_cache_miss(tmp_path, tiny_cfg):
+    cfg = tiny_cfg(_train=dict(optimizer="adamw"))
+    ckpt_path = _save_reference_checkpoint(tmp_path, cfg)
+    dpo_cfg = _dpo_cfg(tmp_path, ckpt_path)
+
+    assert dpo_reference_reserve_bytes(dpo_cfg) == checkpoint_param_bytes(str(ckpt_path))

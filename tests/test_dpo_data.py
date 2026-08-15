@@ -9,8 +9,11 @@ when either side overflows seq_len, rather than truncating it.
 
 from __future__ import annotations
 
+from datasets import Dataset, DatasetDict
+
 from radiance.config import Config, DPOConfig
-from radiance.data import _format_dpo_pair, _tokenize_dpo_row
+from radiance.data import _format_dpo_pair, _load_or_build_dpo_packed, _tokenize_dpo_row
+import radiance.data as data_mod
 
 
 class _FakeTokenizer:
@@ -158,3 +161,38 @@ def test_tokenize_dpo_row_uses_dpo_prefixes_not_sft_prefixes():
 
     expected_user_ids = tokenizer("DPO_USER: hi")["input_ids"]
     assert row["chosen_input_ids"][: len(expected_user_ids)] == expected_user_ids
+
+
+def _dpo_examples(n: int) -> Dataset:
+    return Dataset.from_dict(
+        {
+            "chosen": [[{"role": "user", "content": "hi"}, {"role": "assistant", "content": "a"}]] * n,
+            "rejected": [[{"role": "user", "content": "hi"}, {"role": "assistant", "content": "b"}]] * n,
+        }
+    )
+
+
+def test_load_or_build_dpo_packed_does_not_replace_an_empty_validation_split_with_test(tmp_path, monkeypatch):
+    # A present-but-empty "validation" split is a real (if unusual) HF DatasetDict shape - it must
+    # not be swapped for "test" just because an empty datasets.Dataset is falsy.
+    raw = DatasetDict({"train": _dpo_examples(2), "validation": _dpo_examples(0), "test": _dpo_examples(3)})
+    monkeypatch.setattr(data_mod, "load_dataset", lambda name: raw)
+    # _add_reference_logprobs would load a real reference checkpoint - irrelevant to the
+    # split-selection bug this test targets, so it's replaced with a passthrough.
+    monkeypatch.setattr(data_mod, "_add_reference_logprobs", lambda packed, cfg, tok, device: packed)
+    monkeypatch.setattr(data_mod, "resolve_device", lambda device: "cpu")
+
+    ref_ckpt = tmp_path / "ref.pt"
+    ref_ckpt.write_bytes(b"x")
+    cfg = Config(
+        dpo=DPOConfig(
+            enabled=True,
+            dataset="unused",
+            reference_checkpoint=str(ref_ckpt),
+            cache_dir=str(tmp_path / "cache"),
+        )
+    )
+
+    packed = _load_or_build_dpo_packed(cfg, _FakeTokenizer())
+
+    assert len(packed["validation"]) == 0, "empty validation split silently replaced by test"

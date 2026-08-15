@@ -12,7 +12,7 @@ from datasets import DatasetDict, IterableDataset, load_dataset, load_from_disk
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from radiance.config import Config, doc_mask_is_inert_for_dpo, resolve_device
+from radiance.config import Config, doc_mask_is_inert_for_dpo, resolve_device, resolve_dtype
 
 logger = logging.getLogger(__name__)
 
@@ -817,8 +817,15 @@ def _add_reference_logprobs(
     # call. `chunk_size` is sticky across batches, like micro_chunk_size: a size that doesn't
     # fit once doesn't fit later, and backoff never rebuilds anything, only changes how many
     # forward calls one fetched batch takes.
-    chunk_size = cfg.dpo.reference_batch_size
+    device_type = device.split(":")[0]
+    dtype = resolve_dtype(cfg.train.dtype)
     for split_name, split in packed.items():
+        # Reset per split rather than carrying a backoff from one split into the next: nothing
+        # about a split boundary here has the running step loop's "a size that doesn't fit once
+        # doesn't fit later" invariant (see comment above) — each split starts a fresh, unstressed
+        # DataLoader loop, so a shrink forced by e.g. the train split's data shouldn't handicap
+        # validation/test, which may never hit the same OOM.
+        chunk_size = cfg.dpo.reference_batch_size
         loader = DataLoader(split, batch_size=cfg.dpo.reference_batch_size, shuffle=False)
         chosen_logprobs: list[torch.Tensor] = []
         rejected_logprobs: list[torch.Tensor] = []
@@ -837,7 +844,10 @@ def _add_reference_logprobs(
                             n = min(chunk_size, b - start)
                             c_chunk, c_chunk_mask = c_ids[start : start + n], c_mask[start : start + n]
                             r_chunk, r_chunk_mask = r_ids[start : start + n], r_mask[start : start + n]
-                            logits = ref_model(torch.cat([c_chunk, r_chunk], dim=0)).logits
+                            with torch.autocast(
+                                device_type=device_type, dtype=dtype, enabled=dtype != torch.float32
+                            ):
+                                logits = ref_model(torch.cat([c_chunk, r_chunk], dim=0)).logits
                             chosen_logits, rejected_logits = logits.split(n, dim=0)
                             batch_chosen.append(
                                 sequence_logprob_sum(chosen_logits, c_chunk, c_chunk_mask).cpu()
@@ -947,6 +957,22 @@ def _dpo_cache_path(cfg: Config) -> Path:
     return base_dir / ("ref-" + hashlib.sha256(ref_key.encode()).hexdigest()[:16])
 
 
+def dpo_cache_exists(cfg: Config) -> bool:
+    """Whether _load_or_build_dpo_packed will hit the disk cache rather than rebuild it.
+
+    Lets a caller (train.py's batch-size estimate) know, before touching any GPU memory, whether a
+    DPO cache miss is about to load a second full transformer for reference-logprob precompute.
+    An ambiguous or missing reference checkpoint is reported here as "no cache" rather than raised
+    — build_dpo_dataloaders still raises _dpo_cache_path's real error on the actual build path.
+    """
+    if not cfg.dpo.cache_dir:
+        return False
+    try:
+        return _dpo_cache_path(cfg).exists()
+    except ValueError:
+        return False
+
+
 def _load_or_build_dpo_packed(cfg: Config, tokenizer: PreTrainedTokenizerBase):
     cache_path = _dpo_cache_path(cfg)
     if cfg.dpo.cache_dir and cache_path.exists():
@@ -956,7 +982,9 @@ def _load_or_build_dpo_packed(cfg: Config, tokenizer: PreTrainedTokenizerBase):
 
     raw = load_dataset(cfg.dpo.dataset)
     train_split = raw["train"]
-    val_split = raw.get("validation") or raw.get("test")
+    val_split = raw.get("validation")
+    if val_split is None:
+        val_split = raw.get("test")
     if val_split is None:
         train_split, val_split = _split_off_eval(train_split, cfg.dpo.eval_split_size)
 

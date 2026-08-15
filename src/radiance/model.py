@@ -229,6 +229,17 @@ def load_transformer_from_checkpoint(
     return model, cfg
 
 
+def checkpoint_param_bytes(path: str) -> int:
+    """Total parameter bytes in a checkpoint's state dict, without loading it onto a GPU.
+
+    Used to size how much VRAM a checkpoint will need before deciding to load it — map_location="cpu"
+    keeps this a pure host-memory read, so it's safe to call while another model already occupies the
+    GPU whose free memory a caller is trying to reserve against.
+    """
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    return sum(t.numel() * t.element_size() for t in ckpt["model"].values())
+
+
 def padded_vocab_size(vocab_size: int, multiple: int) -> int:
     """Round a tokenizer's vocab up to a multiple of `multiple` for the token_emb/lm_head matmuls.
 

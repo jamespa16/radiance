@@ -66,9 +66,11 @@ def _accumulate(model, cfg, loss_fn, batch, micro_chunk_size) -> dict[str, torch
     autocast block (disabled at fp32). If this drifts from train()'s loop the tests below stop
     testing it — which is exactly the drift the shared helpers exist to prevent."""
     accums = {name: torch.zeros(()) for name in _ACCUM_METRICS}
-    units = chunk_reduction_units(batch, cfg, micro_chunk_size)
+    units = chunk_reduction_units(batch, cfg.dpo.enabled, cfg.sft.enabled, micro_chunk_size)
     total_units = max(sum(units), 1)
-    for chunk, chunk_units in zip(split_micro_batch(batch, cfg, "cpu", micro_chunk_size), units):
+    for chunk, chunk_units in zip(
+        split_micro_batch(batch, cfg.dpo.enabled, cfg.sft.enabled, "cpu", micro_chunk_size), units
+    ):
         chunk_weight = chunk_units / total_units / cfg.train.grad_accum_steps
         chunk_loss, metrics = chunk_loss_and_metrics(model, model, cfg, loss_fn, chunk)
         (chunk_loss * chunk_weight).backward()
@@ -87,14 +89,19 @@ def _grads(model) -> dict[str, torch.Tensor]:
 def test_split_micro_batch_takes_only_the_columns_the_mode_uses(tiny_cfg):
     cfg = tiny_cfg()
     batch = {"input_ids": _ids(), "loss_mask": torch.ones(BATCH, SEQ, dtype=torch.long)}
-    assert list(split_micro_batch(batch, cfg, "cpu", BATCH)[0]) == ["input_ids"]
+    assert list(split_micro_batch(batch, cfg.dpo.enabled, cfg.sft.enabled, "cpu", BATCH)[0]) == ["input_ids"]
 
     cfg.sft.enabled = True
-    assert list(split_micro_batch(batch, cfg, "cpu", BATCH)[0]) == ["input_ids", "loss_mask"]
+    assert list(split_micro_batch(batch, cfg.dpo.enabled, cfg.sft.enabled, "cpu", BATCH)[0]) == [
+        "input_ids",
+        "loss_mask",
+    ]
 
     cfg.sft.enabled = False
     cfg.dpo.enabled = True
-    assert set(split_micro_batch(_dpo_batch(), cfg, "cpu", BATCH)[0]) == set(_dpo_batch())
+    assert set(split_micro_batch(_dpo_batch(), cfg.dpo.enabled, cfg.sft.enabled, "cpu", BATCH)[0]) == set(
+        _dpo_batch()
+    )
 
 
 def test_split_micro_batch_chunks_every_column_in_lockstep(tiny_cfg):
@@ -105,7 +112,7 @@ def test_split_micro_batch_chunks_every_column_in_lockstep(tiny_cfg):
     cfg.dpo.enabled = True
     batch = _dpo_batch()
 
-    chunks = split_micro_batch(batch, cfg, "cpu", 3)
+    chunks = split_micro_batch(batch, cfg.dpo.enabled, cfg.sft.enabled, "cpu", 3)
     assert [c["chosen_input_ids"].size(0) for c in chunks] == [3, 1], "uneven tail chunk kept"
 
     for column, whole in batch.items():
@@ -115,8 +122,8 @@ def test_split_micro_batch_chunks_every_column_in_lockstep(tiny_cfg):
 def test_split_micro_batch_at_full_width_is_a_single_chunk(tiny_cfg):
     cfg = tiny_cfg()
     batch = {"input_ids": _ids()}
-    assert len(split_micro_batch(batch, cfg, "cpu", BATCH)) == 1
-    assert len(split_micro_batch(batch, cfg, "cpu", BATCH * 10)) == 1
+    assert len(split_micro_batch(batch, cfg.dpo.enabled, cfg.sft.enabled, "cpu", BATCH)) == 1
+    assert len(split_micro_batch(batch, cfg.dpo.enabled, cfg.sft.enabled, "cpu", BATCH * 10)) == 1
 
 
 # --- the reduction units the weighting is built on ---------------------------------------------
@@ -125,8 +132,10 @@ def test_split_micro_batch_at_full_width_is_a_single_chunk(tiny_cfg):
 def test_reduction_units_are_scored_tokens_for_pretrain(tiny_cfg):
     """Every position but the last has a target, and none is ignored."""
     cfg = tiny_cfg()
-    assert chunk_reduction_units({"input_ids": _ids()}, cfg, BATCH) == [BATCH * (SEQ - 1)]
-    assert chunk_reduction_units({"input_ids": _ids()}, cfg, 1) == [SEQ - 1] * BATCH
+    assert chunk_reduction_units({"input_ids": _ids()}, cfg.dpo.enabled, cfg.sft.enabled, BATCH) == [
+        BATCH * (SEQ - 1)
+    ]
+    assert chunk_reduction_units({"input_ids": _ids()}, cfg.dpo.enabled, cfg.sft.enabled, 1) == [SEQ - 1] * BATCH
 
 
 def test_reduction_units_are_supervised_tokens_for_sft(tiny_cfg):
@@ -139,8 +148,8 @@ def test_reduction_units_are_supervised_tokens_for_sft(tiny_cfg):
 
     per_row = mask[:, 1:].sum(dim=1).tolist()
     assert len(set(per_row)) == BATCH, "the fixture must actually be ragged"
-    assert chunk_reduction_units(batch, cfg, 1) == per_row
-    assert chunk_reduction_units(batch, cfg, BATCH) == [sum(per_row)]
+    assert chunk_reduction_units(batch, cfg.dpo.enabled, cfg.sft.enabled, 1) == per_row
+    assert chunk_reduction_units(batch, cfg.dpo.enabled, cfg.sft.enabled, BATCH) == [sum(per_row)]
 
 
 def test_reduction_units_are_rows_for_dpo(tiny_cfg):
@@ -148,7 +157,7 @@ def test_reduction_units_are_rows_for_dpo(tiny_cfg):
     mean however long it is."""
     cfg = tiny_cfg()
     cfg.dpo = DPOConfig(enabled=True, dataset="unused", reference_checkpoint="unused")
-    assert chunk_reduction_units(_dpo_batch(), cfg, 3) == [3, 1]
+    assert chunk_reduction_units(_dpo_batch(), cfg.dpo.enabled, cfg.sft.enabled, 3) == [3, 1]
 
 
 def test_reduction_units_are_computed_without_touching_the_device(tiny_cfg):
@@ -162,7 +171,7 @@ def test_reduction_units_are_computed_without_touching_the_device(tiny_cfg):
             raise AssertionError("chunk_reduction_units moved a tensor to the device")
 
     mask = _ragged_sft_mask().as_subclass(_NoDeviceTensor)
-    units = chunk_reduction_units({"input_ids": _ids(), "loss_mask": mask}, cfg, 2)
+    units = chunk_reduction_units({"input_ids": _ids(), "loss_mask": mask}, cfg.dpo.enabled, cfg.sft.enabled, 2)
     assert sum(units) == int(_ragged_sft_mask()[:, 1:].sum())
 
 
@@ -247,7 +256,7 @@ def test_every_reported_metric_has_an_accumulator(tiny_cfg):
     cfg.dpo = DPOConfig(enabled=True, dataset="unused", reference_checkpoint="unused")
     model = _model(cfg)
     _, dpo_metrics = chunk_loss_and_metrics(
-        model, model, cfg, build_dpo_loss_fn(cfg), split_micro_batch(_dpo_batch(), cfg, "cpu", BATCH)[0]
+        model, model, cfg, build_dpo_loss_fn(cfg), split_micro_batch(_dpo_batch(), cfg.dpo.enabled, cfg.sft.enabled, "cpu", BATCH)[0]
     )
     reported |= set(dpo_metrics)
 
@@ -255,21 +264,23 @@ def test_every_reported_metric_has_an_accumulator(tiny_cfg):
     # DPO's total deliberately omits both — mtp_heads > 1 is rejected outright for post-training,
     # and z_loss would need its own reduction over the concatenated logits.
     assert {"z_loss", "mtp_loss"} & set(dpo_metrics) == set()
-    assert {"dpo_accuracy", "dpo_margin"} & set(pretrain_metrics) == set()
+    assert {"dpo_margin_accuracy", "dpo_reward_accuracy", "dpo_margin"} & set(pretrain_metrics) == set()
 
 
 def test_dpo_chunk_loss_excludes_the_diagnostics_it_reports(tiny_cfg):
-    """dpo_accuracy/dpo_margin are logged, never optimised — they must not leak into the total."""
+    """dpo_margin_accuracy/dpo_reward_accuracy/dpo_margin are logged, never optimised — they must
+    not leak into the total."""
     cfg = tiny_cfg()
     cfg.train.batch_size, cfg.train.grad_accum_steps = BATCH, 1
     cfg.dpo = DPOConfig(enabled=True, dataset="unused", reference_checkpoint="unused")
     model = _model(cfg)
 
-    chunk = split_micro_batch(_dpo_batch(), cfg, "cpu", BATCH)[0]
+    chunk = split_micro_batch(_dpo_batch(), cfg.dpo.enabled, cfg.sft.enabled, "cpu", BATCH)[0]
     chunk_loss, metrics = chunk_loss_and_metrics(model, model, cfg, build_dpo_loss_fn(cfg), chunk)
 
     # ponder_cost/moe_aux_loss are zero scalars with those features off, so the total is the DPO
     # term alone — and notably not the term plus a margin that happens to be a real number.
     torch.testing.assert_close(chunk_loss, metrics["lm_loss"])
     assert not metrics["dpo_margin"].requires_grad
-    assert not metrics["dpo_accuracy"].requires_grad
+    assert not metrics["dpo_margin_accuracy"].requires_grad
+    assert not metrics["dpo_reward_accuracy"].requires_grad

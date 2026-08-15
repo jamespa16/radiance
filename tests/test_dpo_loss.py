@@ -13,7 +13,7 @@ import torch.nn.functional as F
 
 from radiance.config import Config, DPOConfig, ModelConfig, SFTConfig
 from radiance.model import sequence_logprob_sum
-from radiance.train import compute_dpo_loss, validate_post_training_config
+from radiance.train import compute_dpo_loss, note_dpo_z_loss_omitted, validate_post_training_config
 
 
 def test_sequence_logprob_sum_matches_hand_built_log_softmax_reference():
@@ -74,11 +74,16 @@ def test_compute_dpo_loss_equals_log_2_when_policy_matches_reference():
     policy_chosen = ref_chosen.clone().requires_grad_(True)
     policy_rejected = ref_rejected.clone().requires_grad_(True)
 
-    loss, margin, accuracy = compute_dpo_loss(policy_chosen, policy_rejected, ref_chosen, ref_rejected, beta=0.1)
+    loss, margin, margin_accuracy, reward_accuracy = compute_dpo_loss(
+        policy_chosen, policy_rejected, ref_chosen, ref_rejected, beta=0.1
+    )
 
     torch.testing.assert_close(loss, torch.tensor(math.log(2)))
     torch.testing.assert_close(margin, torch.zeros(()))
-    torch.testing.assert_close(accuracy, torch.zeros(()))  # logits == 0 is not > 0
+    torch.testing.assert_close(margin_accuracy, torch.zeros(()))  # logits == 0 is not > 0
+    # reward_accuracy is reference-independent, so tying policy to reference doesn't pin it to any
+    # particular value — cross-check against the same comparison compute_dpo_loss makes internally.
+    torch.testing.assert_close(reward_accuracy, (policy_chosen > policy_rejected).float().mean())
 
     loss.backward()
     torch.testing.assert_close(policy_chosen.grad, -policy_rejected.grad)
@@ -93,7 +98,7 @@ def test_compute_dpo_loss_matches_hand_built_logsigmoid_reference():
     ref_rejected = torch.randn(4)
     beta = 0.3
 
-    loss, _, _ = compute_dpo_loss(policy_chosen, policy_rejected, ref_chosen, ref_rejected, beta)
+    loss, _, _, _ = compute_dpo_loss(policy_chosen, policy_rejected, ref_chosen, ref_rejected, beta)
 
     logits = beta * ((policy_chosen - policy_rejected) - (ref_chosen - ref_rejected))
     expected = -F.logsigmoid(logits).mean()
@@ -107,17 +112,19 @@ def test_compute_dpo_loss_accuracy_and_margin_sanity():
     ref_rejected = torch.zeros(1)
 
     # Policy strongly separates chosen from rejected in the preferred direction.
-    _, margin, accuracy = compute_dpo_loss(
+    _, margin, margin_accuracy, reward_accuracy = compute_dpo_loss(
         torch.tensor([5.0]), torch.tensor([-5.0]), ref_chosen, ref_rejected, beta
     )
-    assert accuracy.item() == 1.0
+    assert margin_accuracy.item() == 1.0
+    assert reward_accuracy.item() == 1.0
     assert margin.item() > 0
 
     # Policy separates them the wrong way.
-    _, margin2, accuracy2 = compute_dpo_loss(
+    _, margin2, margin_accuracy2, reward_accuracy2 = compute_dpo_loss(
         torch.tensor([-5.0]), torch.tensor([5.0]), ref_chosen, ref_rejected, beta
     )
-    assert accuracy2.item() == 0.0
+    assert margin_accuracy2.item() == 0.0
+    assert reward_accuracy2.item() == 0.0
     assert margin2.item() < 0
 
 
@@ -155,3 +162,28 @@ def test_validate_post_training_config_ok_when_only_dpo_enabled():
         dpo=DPOConfig(enabled=True, dataset="foo/bar", reference_checkpoint="foo.pt"),
     )
     validate_post_training_config(cfg)  # must not raise
+
+
+def test_note_dpo_z_loss_omitted_prints_when_dpo_enabled_with_default_z_loss_weight(capsys):
+    cfg = Config(
+        model=_dpo_model_cfg(),
+        dpo=DPOConfig(enabled=True, dataset="foo/bar", reference_checkpoint="foo.pt"),
+    )
+    note_dpo_z_loss_omitted(cfg)
+    assert "z_loss_weight" in capsys.readouterr().out
+
+
+def test_note_dpo_z_loss_omitted_silent_when_z_loss_weight_zeroed(capsys):
+    model_cfg = _dpo_model_cfg()
+    model_cfg.z_loss_weight = 0
+    cfg = Config(
+        model=model_cfg,
+        dpo=DPOConfig(enabled=True, dataset="foo/bar", reference_checkpoint="foo.pt"),
+    )
+    note_dpo_z_loss_omitted(cfg)
+    assert capsys.readouterr().out == ""
+
+
+def test_note_dpo_z_loss_omitted_silent_when_dpo_disabled(capsys):
+    note_dpo_z_loss_omitted(Config(model=_dpo_model_cfg()))
+    assert capsys.readouterr().out == ""
