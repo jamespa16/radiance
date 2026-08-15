@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterator
 
 import torch
 import torch.nn.functional as F
@@ -21,24 +22,31 @@ def load_checkpoint(path: str, device: str) -> tuple[DenseTransformer, Config, P
 
 
 @torch.no_grad()
-def generate(
+def generate_tokens(
     model: DenseTransformer,
     tokenizer: PreTrainedTokenizerBase,
-    prompt: str,
+    input_ids: torch.Tensor,
     max_new_tokens: int = 200,
     temperature: float = 0.8,
     top_k: int = 50,
     device: str = "cpu",
     loops: int | None = None,
-) -> str:
-    """`loops` overrides how many times the weight-shared loop body runs per forward pass.
+) -> Iterator[int]:
+    """Core sampling loop shared by generate() and radiance.serve: yields one new token id per
+    step. Never yields the EOS token itself (breaks before yielding it), matching generate()'s
+    skip_special_tokens=True behavior.
+
+    Takes an already-tokenized `input_ids` (shape `[1, seq_len]`, on `device`) rather than a raw
+    prompt string, so callers that also need the prompt token count or the full id sequence (e.g.
+    generate()) tokenize the prompt exactly once instead of once here and once more themselves.
+
+    `loops` overrides how many times the weight-shared loop body runs per forward pass.
 
     A model trained with stochastic loop depth (model.loop_count_min/max) has seen a range of
     depths, so inference can spend *more* compute per token than training did by raising this —
     test-time compute scaling with no change to the weights. The KV cache is sized to match, since
     it needs one slot per (block, iteration) pair actually executed.
     """
-    input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
     next_input = input_ids[:, -model.cfg.max_seq_len :]
     kv_cache = model.new_kv_cache(loop_count=loops)
 
@@ -65,12 +73,37 @@ def generate(
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
 
-        input_ids = torch.cat([input_ids, next_token], dim=-1)
-        next_input = next_token  # every step after the first decodes a single new token
-
         if tokenizer.eos_token_id is not None and next_token.item() == tokenizer.eos_token_id:
             break
 
+        yield next_token.item()
+        next_input = next_token  # every step after the first decodes a single new token
+
+
+def generate(
+    model: DenseTransformer,
+    tokenizer: PreTrainedTokenizerBase,
+    prompt: str,
+    max_new_tokens: int = 200,
+    temperature: float = 0.8,
+    top_k: int = 50,
+    device: str = "cpu",
+    loops: int | None = None,
+) -> str:
+    """Thin wrapper over generate_tokens(): reassembles the full id sequence (prompt + generated)
+    and decodes it in one call, rather than decoding the prompt and completion separately and
+    string-concatenating — a BPE tokenizer's decode of a completion is not guaranteed to match its
+    decode as a continuation of the prompt (e.g. leading-space merges at the boundary), so the ids
+    must be joined before decoding, not the decoded strings.
+    """
+    input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
+    input_ids = input_ids[:, -model.cfg.max_seq_len :]
+    new_ids = list(
+        generate_tokens(model, tokenizer, input_ids, max_new_tokens, temperature, top_k, device, loops)
+    )
+    if new_ids:
+        new_ids_tensor = torch.tensor([new_ids], dtype=input_ids.dtype, device=device)
+        input_ids = torch.cat([input_ids, new_ids_tensor], dim=-1)
     return tokenizer.decode(input_ids[0], skip_special_tokens=True)
 
 
