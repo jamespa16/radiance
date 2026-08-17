@@ -8,6 +8,21 @@ from radiance.config import Config
 from radiance.dpo_data import dpo_cache_exists
 from radiance.model import DenseTransformer, checkpoint_param_bytes
 from radiance.optim import muon_orthogonalize_reserve_bytes
+
+
+def param_state_dtype_bytes(cfg: Config) -> int:
+    """Bytes per element for a parameter and each of its grad/optimizer-moment buffers.
+
+    fp32 (4) by default, matching the standard mixed-precision recipe (train.dtype only controls
+    autocast's compute dtype; params/grads/moments stay fp32 regardless). Halves to 2 under
+    train.native_bf16, which stores all of them natively in bf16 instead — see TrainConfig's
+    native_bf16 docstring and docs/optim.md's "Native bf16 storage" section. Isolated here (rather
+    than inlined in estimate_batch_size) so a future precision mode only needs a new branch in one
+    place.
+    """
+    return 2 if cfg.train.native_bf16 else 4
+
+
 def dpo_reference_reserve_bytes(cfg: Config) -> int:
     """VRAM estimate_batch_size should hold back for a DPO reference-checkpoint load that hasn't
     happened yet.
@@ -46,14 +61,12 @@ def estimate_batch_size(
     )
     assert device_type == "cuda", "estimate_batch_size requires CUDA"
 
-    # Parameters/grad/optimizer state stay fp32 regardless of train.dtype (see TODO-DTYPE-MODE.md).
     # grad and AdamW's exp_avg/exp_avg_sq are lazily allocated (on first backward()/step()
     # respectively), so mem_get_info below doesn't yet reflect them — add them analytically.
-    param_dtype_bytes = 4
     torch.cuda.synchronize(device)
     free_bytes, _ = torch.cuda.mem_get_info(device)
     num_params = raw_model.num_parameters()
-    not_yet_allocated_bytes = 3 * num_params * param_dtype_bytes  # grad + 2 Adam buffers
+    not_yet_allocated_bytes = 3 * num_params * param_state_dtype_bytes(cfg)  # grad + 2 Adam buffers
     # The FP4 weight caches (~1.125 bytes per covered parameter — 0.5 packed plus 0.0625 of scales,
     # in each of two orientations) are deliberately *not* added here, unlike the three buffers
     # above. FP4Linear.__init__ allocates them eagerly and train() has already run .to(device) by

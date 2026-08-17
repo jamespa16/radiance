@@ -5,6 +5,23 @@ import torch
 from radiance.config import Config
 
 from .transformer import DenseTransformer
+
+
+def cast_params_to_native_bf16(model: "DenseTransformer") -> None:
+    """In-place cast every parameter (not buffer) of `model` to bf16, for train.train() and
+    load_transformer_from_checkpoint's shared train.native_bf16 handling.
+
+    Parameters only, not buffers: RoPE's cos/sin cache and MoE's expert_bias carry no optimizer
+    state, so casting them buys no memory and would cost precision that nothing downstream
+    upcasts back (unlike RMSNorm's gain, which forward() already computes in fp32 regardless of
+    the gain's own storage dtype). Autograd gives each bf16 parameter a bf16 .grad automatically,
+    which is what lets optim.py's state allocators (already dtype-matched to the parameter, see
+    _new_state_like) fall out for free.
+    """
+    for p in model.parameters():
+        p.data = p.data.to(torch.bfloat16)
+
+
 def checkpoint_vocab_size(ckpt: dict) -> int:
     """The vocab size a saved checkpoint's model was built with.
 
@@ -33,6 +50,13 @@ def load_transformer_from_checkpoint(
     cfg = ckpt["config"]
     vocab_size = checkpoint_vocab_size(ckpt)
     model = DenseTransformer(cfg.model, vocab_size=vocab_size, eos_id=eos_id)
+    if cfg.train.native_bf16:
+        # Match training's storage dtype before load_state_dict, not after: load_state_dict's
+        # copy_ preserves the *destination* tensor's dtype, so building this model at the default
+        # fp32 first would silently upcast a bf16-trained checkpoint back to fp32 on load — twice
+        # the VRAM a native_bf16 run was saved specifically to avoid, right where generate/serve
+        # cares about it most (inference has no optimizer state to dwarf the parameter memory).
+        cast_params_to_native_bf16(model)
     model.load_state_dict(ckpt["model"])
     model.to(device)
     model.eval()

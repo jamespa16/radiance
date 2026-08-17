@@ -267,6 +267,30 @@ def test_rate_limit_is_disabled_by_default(tiny_cfg):
         assert client.get("/v1/models").status_code == 200
 
 
+def test_rate_limit_rejects_over_quota_wrong_key_requests_without_matching_keys(tiny_cfg):
+    """Regression guard: once a client's IP has exhausted its quota with invalid-credential
+    requests, further requests from it must 429, without a valid key from a different client
+    ever being able to consume that same IP's exhausted quota."""
+    client, _, _ = _client(tiny_cfg(), api_keys={"secret-key"}, rate_limit_per_minute=1)
+    resp = client.get("/v1/models", headers={"Authorization": "Bearer wrong-key"})
+    assert resp.status_code == 401
+
+    resp = client.get("/v1/models", headers={"Authorization": "Bearer wrong-key"})
+    assert resp.status_code == 429
+    assert resp.headers["retry-after"] == "60"
+
+
+def test_rate_limit_does_not_cross_contaminate_ip_and_key_buckets(tiny_cfg):
+    """Regression guard: a valid API key has its own quota, so it must not be starved by
+    invalid-credential requests that exhausted the shared IP bucket from the same client."""
+    client, _, _ = _client(tiny_cfg(), api_keys={"secret-key"}, rate_limit_per_minute=1)
+    resp = client.get("/v1/models", headers={"Authorization": "Bearer wrong-key"})
+    assert resp.status_code == 401
+
+    resp = client.get("/v1/models", headers={"Authorization": "Bearer secret-key"})
+    assert resp.status_code == 200
+
+
 # --- health/readiness/metrics (#36) ----------------------------------------------------------
 
 

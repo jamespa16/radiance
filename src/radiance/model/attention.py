@@ -88,8 +88,23 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """x: (batch, n_heads, seq, head_dim); cos/sin: (seq, head_dim), broadcast over batch/heads."""
-    return x * cos + rotate_half(x) * sin
+    """x: (batch, n_heads, seq, head_dim); cos/sin: (seq, head_dim), broadcast over batch/heads.
+
+    Computed in fp32 and cast back to x's own dtype at the end, mirroring RMSNorm.forward's
+    upcast-then-downcast convention. cos/sin (RotaryEmbedding's table) always stay fp32, so `x *
+    cos` silently promotes q/k to fp32 whenever x is lower precision — and v, which never goes
+    through apply_rope, does not follow. Under torch.autocast (every train() forward) this is
+    invisible: both scaled_dot_product_attention and flex_attention are autocast-registered ops,
+    so autocast casts their operands itself regardless of what dtype they arrive as — confirmed
+    bit-identical logits with and without this explicit cast, on both the SDPA and flex paths,
+    under `torch.autocast(dtype=bfloat16)`. It matters outside autocast: generate.py/serve.py run
+    the model directly, and once model.native_bf16 makes q/k/v all genuinely low-precision
+    tensors (not autocast's transient casting), the promoted-vs-not mismatch becomes a real
+    `RuntimeError` — every attention op requires q, k and v to share one dtype.
+    """
+    dtype = x.dtype
+    x = x.float()
+    return (x * cos + rotate_half(x) * sin).to(dtype)
 
 
 class RotaryEmbedding(nn.Module):
