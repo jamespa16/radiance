@@ -349,7 +349,14 @@ a hang; warm steps stay ~0.05s throughout. Keep the range narrow, or set `train.
 5. **Prefer a longer horizon.** An arm can rank differently at step 400 than at step 1500+ once the LR schedule is
    far enough into its decay. Establish the setup's own noise floor with a repeat baseline run rather than borrowing
    one measured elsewhere.
-6. **Benchmark the step, not a short run**, when judging a throughput change — at TinyStories size, 400 steps is
+6. **Never compare two runs with different `max_steps` at the same step number.** `warmup_steps =
+   round(max_steps * warmup_ratio)` and the cosine decays over `max_steps`, so a 1000-step run is fully annealed at
+   step 1000 while a 3000-step run is only a third of the way through its schedule. Measured at 0.17 val/loss for
+   the *same config and seed* — see [the loop-vs-depth section](#the-loop-is-dominated--depth-and-moe-are-the-frontier),
+   where this invalidated a whole round of MoE conclusions by ~5x. Compare runs that share `max_steps`, or compare
+   each run at its own endpoint. This is not implied by caution 5: a longer horizon fixes *when* you read, this
+   fixes *what you may read it against*.
+7. **Benchmark the step, not a short run**, when judging a throughput change — at TinyStories size, 400 steps is
    mostly compile, data loading and eval. And decompose the step before judging: FP4's end-to-end number was
    dominated by an optimizer cost it never touched.
 

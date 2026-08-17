@@ -132,7 +132,10 @@ train:
   eval_every: 500
   eval_max_batches: 50
   save_every: 500 # train.py keeps only the newest checkpoint (it unlinks older step_*.pt before
-  # saving), so this is ~3.2 GB steady-state, not 3.2 GB per save.
+  # saving), so this is 3.0 GB steady-state, not 3.0 GB per save — measured, not estimated: a
+  # checkpoint of this model written by the smoke run is 3.0 GB (fp32 masters + Muon momentum +
+  # the AdamW moments for the tensors Muon doesn't own). Note the flip side of that rotation: there
+  # are no intermediate checkpoints to fall back on or to compare, only the newest.
   output_dir: checkpoints/v1
   resume_from: auto # a 43-hour run will be interrupted. This restores optimizer moments and the
   # LR schedule, not just the weights.
