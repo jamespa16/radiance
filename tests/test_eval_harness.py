@@ -18,6 +18,8 @@ from __future__ import annotations
 import pytest
 import torch
 
+pytest.importorskip("lm_eval", reason="eval dependency group not installed")
+
 from lm_eval.api.instance import Instance
 
 from radiance.eval_harness import RadianceLM
