@@ -112,19 +112,6 @@ class RateLimiter:
         self._windows[key] = (start_window, count)
         return count <= self.limit_per_minute
 
-    def over_limit(self, key: str) -> bool:
-        """Non-consuming peek at whether `key` is already at quota in the current window. Used to
-        cheaply reject already-throttled requests before paying for auth (constant-time key
-        comparisons) that `allow()` would reject anyway.
-        """
-        if self.limit_per_minute <= 0:
-            return False
-        window = int(time.monotonic() // 60)
-        start_window, count = self._windows.get(key, (window, 0))
-        if start_window != window:
-            return False
-        return count >= self.limit_per_minute
-
     def _sweep(self, window: int) -> None:
         """Evicts entries from stale windows so `_windows` doesn't grow without bound over the
         life of a long-running server as new client IPs/keys are seen. Runs at most once per
@@ -275,29 +262,18 @@ def create_app(
     app = FastAPI()
 
     async def _auth_and_rate_limit(request: Request) -> None:
-        """Dependency on every /v1/* route: a rate limit followed by bearer-token auth (skipped
-        entirely when no keys are configured, matching the quickstart's no-flags-needed default),
+        """Dependency on every /v1/* route: bearer-token auth (skipped entirely when no keys are
+        configured, matching the quickstart's no-flags-needed default) followed by a rate limit,
         both before the route handler ever touches `lock` — an over-quota, unauthenticated, or
         invalid-key request must never queue behind a real generation. A request presenting a
-        valid key is rate-limited per key, so distinct keys get independent quotas as documented.
-        Requests with a missing or wrong key — which never reach the auth check's success path —
-        are throttled per client IP instead, so they don't get unlimited attempts to brute-force a
-        key; when the client IP is unavailable (e.g. a Unix domain socket) there is no identifier
-        to key a shared bucket on without pooling unrelated callers together, so such requests skip
-        the rate limit and fall through to the auth check.
-
-        A non-consuming `over_limit` peek on the IP bucket runs first, before any key comparison:
-        once a client has already exhausted its IP quota with invalid-credential requests, further
-        requests from it are rejected without paying for the O(len(api_keys)) constant-time
-        comparisons below — the whole point of rate limiting an unauthenticated caller.
+        valid key is rate-limited per key, so distinct keys get independent quotas as documented
+        and can't be starved by unrelated traffic sharing the same IP. Requests with a missing or
+        wrong key — which never reach the auth check's success path — are throttled per client IP
+        instead, so they don't get unlimited attempts to brute-force a key; when the client IP is
+        unavailable (e.g. a Unix domain socket) there is no identifier to key a shared bucket on
+        without pooling unrelated callers together, so such requests skip the rate limit and fall
+        through to the auth check.
         """
-        if request.client is not None and limiter.over_limit(f"ip:{request.client.host}"):
-            raise HTTPException(
-                status_code=429,
-                detail={"error": {"message": "Rate limit exceeded", "type": "rate_limit_error"}},
-                headers={"Retry-After": "60"},
-            )
-
         authorization = request.headers.get("authorization", "")
         token = authorization[len("Bearer ") :] if authorization.startswith("Bearer ") else ""
         matched_key = next((key for key in api_keys if _token_matches(token, key)), None) if api_keys else None
