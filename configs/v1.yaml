@@ -5,7 +5,11 @@
 # Sized empirically, not estimated: every number in the table below is a real fwd+bwd+opt.step on
 # this card, one process per arm (docs/results.md's NVFP4 section records a multi-arm sweep in one
 # process reporting a 3.8 GB gap between two *identical* configs — the peak column was allocator
-# noise). `hours@20tpp` is the wall-clock to reach Chinchilla-optimal 20 tokens/active-param;
+# noise). Those are synthetic-data figures; the chosen shape was then confirmed end-to-end through
+# `radiance-train` on real streaming fineweb, by differencing a 100-step and a 40-step run to
+# cancel startup and compile: **2.183 s/step, 60.0k tok/s** — slightly *faster* than the synthetic
+# bench, so the streaming data pipeline is not a bottleneck at this rate. That is the number the
+# ~43h below is derived from. `hours@20tpp` is the wall-clock to reach Chinchilla-optimal 20 tokens/active-param;
 # `tok/param@48h` is what each shape actually gets trained to inside a 48-hour budget, which is the
 # comparison that decides this file.
 #
@@ -117,7 +121,7 @@ train:
   # wsd_decay_ratio of the run, so the run can be cut short or extended without invalidating the
   # schedule — which cosine cannot do, since its shape depends on max_steps.
 
-  tokens_per_param: 24 # -> ~9.0B tokens, ~68,700 steps, ~43h at the measured 57.6k tok/s. Slightly
+  tokens_per_param: 24 # -> ~9.0B tokens, ~68,700 steps, ~42h at the measured 60.0k tok/s. Slightly
   # past Chinchilla-optimal 20, which is the right side to err on for a model meant to be served:
   # it buys quality at fixed inference cost. max_steps is derived from num_active_parameters() and
   # printed at run start. Drop to 12 for a ~22h run; the schedule rescales with it.
