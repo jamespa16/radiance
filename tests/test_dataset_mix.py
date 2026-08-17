@@ -286,6 +286,23 @@ def test_load_config_resolves_relative_dataset_mix_against_config_dir(tmp_path):
     assert cfg.data.dataset_mix == str(tmp_path / "mix.yaml")
 
 
+def test_load_config_rejects_dataset_mix_and_dataset_together(tmp_path):
+    # A copy-pasted config that leaves data.dataset set alongside data.dataset_mix is a silent
+    # trap (the mix wins, dataset is ignored), so load_config rejects it rather than resolving.
+    (tmp_path / "mix.yaml").write_text(yaml.safe_dump([{"dataset": "test/corpusA"}]))
+    cfg_path = tmp_path / "run.yaml"
+    cfg_path.write_text(textwrap.dedent(
+        """
+        run_name: mix-run
+        data:
+          dataset_mix: mix.yaml
+          dataset: test/corpusB   # leftover from a previous experiment
+        """
+    ))
+    with pytest.raises(ValueError, match="both set"):
+        load_config(str(cfg_path))
+
+
 def test_dataset_mix_takes_precedence_over_dataset(local_store, tiny_cfg, tmp_path):
     tok = _WordTok()
     alpha_id, beta_id = tok.id_for("alpha"), tok.id_for("beta")

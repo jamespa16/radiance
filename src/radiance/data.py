@@ -129,10 +129,13 @@ def _load_or_build_packed_for_dataset(
     independently — changing one entry's weight, or adding a corpus, never re-tokenises the
     others. The disk-cache streaming path is deliberately NOT handled here: it builds torch
     StreamingPackedDataset wrappers rather than HF datasets, so it stays in build_dataloaders.
-    Returns {"train": <packed>, "validation": <packed>|None}. Packed blocks are plain lists of
-    ids; the DataLoader's collate (torch.as_tensor) turns them into tensors, so no set_format is
-    applied here (a mix reorders/shuffles these per corpus and an interleaved result is iterable,
-    not a save-to-disk memory dataset anyway).
+    Returns {"train": <packed>, "validation": <packed>|None}. Both return paths hand back
+    `input_ids` in torch format so a corpus loaded from an existing cache is row-for-row the same
+    type as one just built: `_tokenize_and_pack` applies set_format to a freshly built dataset,
+    and the cache-hit branch re-applies it after load_from_disk because HF does not persist
+    set_format to disk. The DataLoader's collate (torch.as_tensor) is a no-op on torch rows; a
+    mix reorders/shuffles these per corpus and its interleaved result is normalized by the collate
+    regardless of the per-corpus format.
     """
     if cfg.data.streaming and not cfg.data.disk_cache_max_gb:
         raw = load_dataset(dataset_id, streaming=True)
@@ -152,6 +155,9 @@ def _load_or_build_packed_for_dataset(
     cache_path = _packed_cache_path(dataset_id, text_column, cfg)
     if cfg.data.cache_dir and cache_path.exists():
         packed = load_from_disk(str(cache_path))
+        # load_from_disk drops the format _tokenize_and_pack set before save_to_disk (HF doesn't
+        # persist set_format to disk); re-apply it so cached rows are torch like freshly built ones.
+        packed.set_format(type="torch", columns=["input_ids"])
         return packed
 
     raw = load_dataset(dataset_id)
@@ -514,8 +520,24 @@ class _WeightedInterleave(torch.utils.data.IterableDataset):
             yield item
 
 
+_SPLIT_SET_CACHE: dict[str, frozenset[str]] = {}
+
+
+def _dataset_splits(dataset_id: str) -> frozenset[str]:
+    """The split names a (possibly remote) dataset advertises, cached per dataset_id so a corpus
+    pays for the remote metadata/stream setup once per process, not on every probe. Streaming
+    load is used (metadata only, no download) to match how the streaming path otherwise resolves
+    splits. The per-worker stream in StreamingPackedDataset.__iter__ still loads the data itself;
+    this only dedupes the split-set probe (e.g. a corpus listed more than once in a mix)."""
+    splits = _SPLIT_SET_CACHE.get(dataset_id)
+    if splits is None:
+        splits = frozenset(load_dataset(dataset_id, streaming=True).keys())
+        _SPLIT_SET_CACHE[dataset_id] = splits
+    return splits
+
+
 def _has_validation_split(dataset_id: str) -> bool:
-    return "validation" in load_dataset(dataset_id, streaming=True)
+    return "validation" in _dataset_splits(dataset_id)
 
 
 def _build_mixed_disk_cache_dataloaders(cfg: Config, tokenizer: PreTrainedTokenizerBase, entries, weights):
@@ -614,9 +636,12 @@ def _build_mixed_dataloaders(cfg: Config, tokenizer: PreTrainedTokenizerBase):
             seed=cfg.train.seed,
             stopping_strategy="all_exhausted",
         )
+        # Non-streaming corpora only carry a "validation" key when one exists (see
+        # _load_or_build_packed_for_dataset), so probe with .get — a corpus with no validation
+        # split and no eval_split_size carve would otherwise raise KeyError here.
         val_parts = [
             (i, p["validation"]) for i, p in enumerate(packed)
-            if p["validation"] is not None and len(p["validation"]) > 0
+            if p.get("validation") is not None and len(p.get("validation")) > 0
         ]
         if val_parts:
             val_ds = interleave_datasets(
@@ -628,7 +653,12 @@ def _build_mixed_dataloaders(cfg: Config, tokenizer: PreTrainedTokenizerBase):
         else:
             val_ds = None
 
-    train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size, shuffle=False, **loader_kwargs)
+    # Non-streaming train_ds is a finite map-style interleave, so shuffle per epoch like the
+    # single-dataset path (shuffle=not cfg.data.streaming); the streaming train_ds is an
+    # IterableDataset and must stay shuffle=False.
+    train_loader = DataLoader(
+        train_ds, batch_size=cfg.train.batch_size, shuffle=not cfg.data.streaming, **loader_kwargs
+    )
     val_loader = (
         DataLoader(val_ds, batch_size=cfg.train.batch_size, shuffle=False, **loader_kwargs)
         if val_ds is not None else None

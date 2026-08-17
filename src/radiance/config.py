@@ -778,6 +778,18 @@ def load_config(path: str) -> Config:
             "train.dtype: nvfp4 and model.fp4_linear: false contradict each other. "
             "Set one or the other, rather than leaving it to resolution order."
         )
+    # Also caught here (raw-only, like the check above): data.dataset has a default, so a
+    # resolved Config can't tell "left at the default" from "explicitly written down". Setting
+    # both is a copy-paste trap — the mix silently wins and data.dataset / data.text_column are
+    # ignored (docs/data.md) with no warning — the same silent-precedence pitfall guarded above.
+    data_raw = raw.get("data", {})
+    if data_raw.get("dataset_mix") and "dataset" in data_raw:
+        raise ValueError(
+            "data.dataset_mix and data.dataset are both set. While data.dataset_mix is set it "
+            "takes precedence and data.dataset (and data.text_column) are silently ignored — "
+            "remove data.dataset to keep the mix, or drop data.dataset_mix to train on the "
+            "single dataset."
+        )
 
     cfg = _apply_dtype_sugar(Config(
         run_name=raw.get("run_name", Config.run_name),
