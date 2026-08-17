@@ -430,6 +430,32 @@ class TrainConfig:
     device: str = "auto"
     compile: bool = True
     dtype: str = "fp32"
+    native_bf16: bool = False  # opt-in: store parameters, gradients and optimizer moments in bf16
+    # instead of the standard fp32-master-weights recipe. `dtype` alone only controls the
+    # autocast compute dtype (train.py's forward/loss pass); params/grads/AdamW's exp_avg/
+    # exp_avg_sq stay fp32 regardless, so a `dtype: bf16` config saves activation memory only,
+    # not the ~12 bytes/param (grad + 2 Adam buffers, all fp32) that dominate a large model's
+    # *static* VRAM footprint. This flag halves that: bf16 params/grads/moments cost 2+2+2+2=8
+    # bytes/param against fp32's 4+4+4+4=16. Only buffers (RoPE's cos/sin cache, MoE's
+    # expert_bias) stay fp32 — they carry no optimizer state, so casting them would buy no
+    # memory and would cost precision RMSNorm-style upcasting doesn't protect (a bias nudged by
+    # moe_bias_update_rate=1e-3 needs more than bf16's ~3 decimal digits to keep accumulating).
+    #
+    # No inert setting exists here — like fp4_linear (see model.fp4_linear's docstring, "reason
+    # 6"), this is a real numerical-accuracy tradeoff, not a mathematical no-op, so it defaults
+    # off rather than on despite being free. Muon's momentum buffer and the built-in
+    # torch.optim.AdamW path already allocate state matching each parameter's own dtype, so they
+    # need no code change; MuonWithAuxAdam's hand-written auxiliary AdamW groups hardcoded fp32
+    # state and are fixed in optim.py to follow suit. Both tiers of CPU-offload OOM recovery
+    # deliberately keep upcasting to fp32 on migration regardless — that path only triggers once
+    # VRAM is already tight enough to need it, and CPU host memory is the resource under
+    # pressure there, not the halved footprint this flag buys. Requires `dtype: "bf16"` (raises
+    # otherwise — fp16's narrow exponent range
+    # makes native storage without a master copy meaningfully riskier, and "fp32" storage under
+    # a non-bf16 compute dtype doesn't match what this flag promises) and is incompatible with
+    # model.fp4_linear (FP4's own quality margin assumes fp32 masters — see nvfp4/linear.py).
+    # Needs empirical validation (a loss-curve comparison against the fp32-master baseline)
+    # before trusting it for a real run — see docs/optim.md.
 
     @property
     def embed_lr_resolved(self) -> float:
@@ -692,6 +718,18 @@ def _apply_dtype_sugar(cfg: Config) -> Config:
             "folded back in, the GEMM output is ~1e5x the true product — inside bf16's exponent "
             "range and outside fp16's — and GradScaler's loss scale would compose with the "
             "per-tensor global scale in a way nothing here has reasoned about. Use bf16 or nvfp4."
+        )
+    if cfg.train.native_bf16 and cfg.train.dtype != "bf16":
+        raise ValueError(
+            f"train.native_bf16 requires train.dtype: bf16 (got {cfg.train.dtype!r}). fp16's narrow "
+            "exponent range makes storing params/grads/optimizer state natively in it meaningfully "
+            "riskier than bf16 (no fp32 master copy to fall back on), and fp32 storage under any "
+            "other compute dtype doesn't match what this flag promises."
+        )
+    if cfg.train.native_bf16 and cfg.model.fp4_linear:
+        raise ValueError(
+            "train.native_bf16 is incompatible with model.fp4_linear: FP4's quality margin (see "
+            "nvfp4/linear.py) assumes fp32 master weights, and this flag replaces them with bf16."
         )
     return cfg
 

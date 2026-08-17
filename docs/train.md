@@ -232,8 +232,12 @@ a successful one and used to grow the scale.
 
 `cfg.train.dtype` (`"fp32"`, `"fp16"`, `"bf16"`, resolved via `resolve_dtype`; `"nvfp4"` is sugar, see
 [nvfp4.md](nvfp4.md)) runs the forward/loss pass under `torch.autocast` in that dtype while master weights and
-optimizer state stay fp32. A `torch.amp.GradScaler` is enabled only for `fp16` — its narrow exponent range can
-underflow small gradients, where bf16 has fp32's exponent range and needs no scaling.
+optimizer state stay fp32 by default. A `torch.amp.GradScaler` is enabled only for `fp16` — its narrow exponent range
+can underflow small gradients, where bf16 has fp32's exponent range and needs no scaling.
+
+`cfg.train.native_bf16` (opt-in, default `False`, requires `dtype: bf16`) drops the fp32-master-weights recipe
+entirely: parameters, gradients and optimizer moments are all stored in bf16, halving the ~12-16 bytes/param that
+dominate a large model's static VRAM footprint. See [optim.md](optim.md)'s "Native bf16 storage" section.
 
 ---
 

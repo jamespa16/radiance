@@ -33,6 +33,14 @@ def load_transformer_from_checkpoint(
     cfg = ckpt["config"]
     vocab_size = checkpoint_vocab_size(ckpt)
     model = DenseTransformer(cfg.model, vocab_size=vocab_size, eos_id=eos_id)
+    if cfg.train.native_bf16:
+        # Match training's storage dtype before load_state_dict, not after: load_state_dict's
+        # copy_ preserves the *destination* tensor's dtype, so building this model at the default
+        # fp32 first would silently upcast a bf16-trained checkpoint back to fp32 on load — twice
+        # the VRAM a native_bf16 run was saved specifically to avoid, right where generate/serve
+        # cares about it most (inference has no optimizer state to dwarf the parameter memory).
+        for p in model.parameters():
+            p.data = p.data.to(torch.bfloat16)
     model.load_state_dict(ckpt["model"])
     model.to(device)
     model.eval()

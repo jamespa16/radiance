@@ -596,10 +596,18 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
 
 
 def _new_state_like(p: torch.Tensor, device: str | None) -> torch.Tensor:
-    """Zeroed fp32 optimizer state for `p`, pinned on the CPU when offloading."""
+    """Zeroed optimizer state for `p`, matching its dtype (fp32, or bf16 under train.native_bf16),
+    pinned on the CPU when offloading.
+
+    torch.optim.AdamW does this automatically (its exp_avg/exp_avg_sq match the parameter's own
+    dtype); MuonWithAuxAdam's hand-written _step_adamw used to hardcode float32 here, which was
+    invisible before train.native_bf16 existed (every parameter was fp32 anyway) and would have
+    silently doubled the AdamW-owned groups' state memory the moment a bf16-native model tried to
+    use it.
+    """
     if device is None:
-        return torch.zeros_like(p, dtype=torch.float32)
-    return torch.zeros_like(p, device=device, dtype=torch.float32).pin_memory()
+        return torch.zeros_like(p)
+    return torch.zeros_like(p, device=device).pin_memory()
 
 
 def build_optimizer(model: torch.nn.Module, cfg: Config, device: str) -> torch.optim.Optimizer:
@@ -727,6 +735,12 @@ def _offload_muon_aux_adam(optimizer: MuonWithAuxAdam) -> MuonWithAuxAdam:
     more time than the VRAM it returns. In a Muon run the AdamW groups hold the embedding matrix,
     which is typically the single largest tensor in the model, so this still reclaims most of what
     the tier is after.
+
+    Deliberately upcasts to fp32 here regardless of the live state's dtype (bf16 under
+    train.native_bf16): this only runs once VRAM is already tight enough to trigger a two-tier OOM
+    escalation, at which point CPU host memory — not the halved footprint bf16 storage buys — is
+    the resource under pressure, and the accumulated moments benefit from the extra precision on
+    the (now much cheaper) CPU side.
     """
     for group in optimizer.param_groups:
         if group["algorithm"] != "adamw" or group["offload"]:

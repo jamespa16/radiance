@@ -196,6 +196,16 @@ def train(cfg: Config) -> None:
     # eos_id is what recovers packed document boundaries for doc_attention_mask (see
     # model.document_ids) — data.py joins documents with exactly this token.
     raw_model = DenseTransformer(cfg.model, vocab_size=vocab_size, eos_id=tokenizer.eos_token_id).to(device)
+    if cfg.train.native_bf16:
+        # Parameters only, not buffers: RoPE's cos/sin cache and MoE's expert_bias carry no
+        # optimizer state, so casting them buys no memory and would cost precision that nothing
+        # downstream upcasts back (unlike RMSNorm's gain, which forward() already computes in
+        # fp32 regardless of the gain's own storage dtype). Autograd gives each bf16 parameter a
+        # bf16 .grad automatically, which is what lets optim.py's state allocators (already
+        # dtype-matched to the parameter, see _new_state_like) fall out for free.
+        for p in raw_model.parameters():
+            p.data = p.data.to(torch.bfloat16)
+        print("[radiance] train.native_bf16: parameters, gradients and optimizer moments stored in bf16")
 
     # Computed here (rather than only where it's consumed, near the bottom) so init_from below can
     # check "is this run resuming?" before deciding whether to apply it — resuming an interrupted

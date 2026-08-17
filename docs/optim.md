@@ -243,3 +243,56 @@ caller rebuilds the scheduler); for `MuonWithAuxAdam` it flips that optimizer's 
 the AdamW groups are offloaded: Muon's state is a single momentum buffer (half AdamW's footprint) and its step is a
 matmul chain per parameter, so running it against CPU memory would cost far more than the VRAM it returns. In a Muon
 run the AdamW groups hold the embedding matrix anyway, typically the single largest tensor.
+
+## Native bf16 storage (`train.native_bf16`)
+
+Resolves what `TODO-DTYPE-MODE.md` used to track. `cfg.train.dtype` only ever controlled `torch.autocast`'s compute
+dtype in `train.py`'s forward/loss pass — parameters, gradients, and AdamW's `exp_avg`/`exp_avg_sq` stayed fp32
+regardless, the standard fp32-master-weights recipe. That means a `dtype: bf16` config saved *activation* memory
+only, not the ~12 bytes/param (grad + 2 fp32 Adam buffers) that dominate a large model's *static* footprint —
+plausibly why `configs/fineweb_500m.yaml` needed `batch_size` tuned down as far as it did.
+
+`train.native_bf16` (opt-in, default `False`) stores parameters, gradients, and optimizer moments in bf16 instead:
+`8 bytes/param` (2+2+2+2) against fp32's `16` (4+4+4+4). Requires `train.dtype: bf16` and is incompatible with
+`model.fp4_linear` (raised in `config.py`'s `_apply_dtype_sugar`) — see `TrainConfig.native_bf16`'s docstring for why.
+
+Implementation is `train.py` casting every `raw_model.parameter()`'s `.data` to bf16 right after construction (before
+`init_from`/`resume_from`, so a loaded checkpoint's `load_state_dict` copies into already-bf16 tensors rather than
+being silently upcast) — **not** a blanket `model.to(dtype=torch.bfloat16)`, which would also cast buffers. RoPE's
+`cos_cached`/`sin_cached` and MoE's `expert_bias` stay fp32 on purpose: they carry no optimizer state, so casting them
+buys no memory, and nothing downstream upcasts them back the way `RMSNorm.forward` already does for its own gain
+(`x.float()` / `weight.float()` before the norm, cast back to the input dtype after) — a bias nudged by
+`moe_bias_update_rate` (`1e-3`) needs more than bf16's ~3 decimal digits to keep accumulating correctly.
+
+Autograd gives a bf16 parameter a bf16 `.grad` automatically, and Muon's momentum buffer (`torch.zeros_like(p)`) and
+plain `torch.optim.AdamW`'s built-in state allocation already match a parameter's own dtype — so the only code that
+needed fixing was `MuonWithAuxAdam`'s hand-written `_step_adamw`, whose `_new_state_like` hardcoded `torch.float32`
+for `exp_avg`/`exp_avg_sq`. It was invisible before this flag existed (every parameter was always fp32) and would
+otherwise have silently doubled the AdamW-owned groups' state memory the moment a bf16-native model used it. The
+tier-2 CPU-offload path (`_offload_muon_aux_adam`, `_adamw_to_cpu_offload`) deliberately keeps upcasting to fp32 on
+migration regardless: it only runs once VRAM is already tight enough to trigger the escalation, at which point CPU
+host memory — not the halved footprint bf16 buys — is the resource under pressure.
+
+`batching.estimate_batch_size`'s VRAM formula reads the per-element size through `param_state_dtype_bytes(cfg)`
+rather than a hardcoded `4`, so `auto_batch_size` reflects the halved footprint automatically. `generate.py`/
+`serve.py`'s checkpoint loader (`model.load.load_transformer_from_checkpoint`) does the same cast before
+`load_state_dict` when the saved config has `native_bf16` set, so inference gets the memory win too, with no
+autocast needed — the model's own parameter dtype drives compute.
+
+Native bf16 params also exposed a latent dtype trap in `attention.apply_rope`: `x * cos` (RoPE's table stays fp32)
+silently promotes q/k to fp32 while v — which never goes through `apply_rope` — doesn't follow, and every attention
+op requires all three to share a dtype. Under `torch.autocast` (every `train()` forward) this was invisible, because
+`scaled_dot_product_attention` and `flex_attention` are both autocast-registered and get their operands cast by
+autocast itself regardless of what dtype they arrive as — confirmed bit-identical logits with and without the fix,
+on both the SDPA and flex (`doc_attention_mask`) paths. It only becomes a real `RuntimeError` outside autocast, which
+is exactly what `generate.py`/`serve.py` run — so this was unreachable before `native_bf16` existed (parameters were
+always fp32 there) and had to be fixed for inference to work at all under it. `apply_rope` now upcasts to fp32 and
+casts back to `x`'s own dtype, mirroring `RMSNorm.forward`'s existing convention; **no behavior change for any
+existing config**, verified empirically rather than merely argued.
+
+**Unmeasured**: this is a real numerical-accuracy tradeoff (no inert setting exists, same category as
+`model.fp4_linear`), not just a memory optimization. No loss-curve comparison against the fp32-master baseline has
+been run yet — do that before trusting it on a real run, and record the result here per [results.md](results.md)'s
+convention. One candidate confound if the curves separate: `grad_clip`'s norm is now reduced over bf16 gradients
+(≈3 decimal digits of precision) instead of fp32 ones, so it will trip at a slightly different point than the
+fp32-master baseline even at the same `grad_clip` value.
