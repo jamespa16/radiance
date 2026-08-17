@@ -26,6 +26,8 @@ from radiance.sft_data import format_chat_messages
 
 logger = logging.getLogger("radiance.serve")
 
+_HEALTH_PATHS = frozenset({"/healthz", "/readyz", "/metrics"})
+
 
 def _token_matches(token: str, key: str) -> bool:
     """Constant-time comparison that also tolerates non-ASCII input. `secrets.compare_digest`
@@ -109,6 +111,19 @@ class RateLimiter:
         count += 1
         self._windows[key] = (start_window, count)
         return count <= self.limit_per_minute
+
+    def over_limit(self, key: str) -> bool:
+        """Non-consuming peek at whether `key` is already at quota in the current window. Used to
+        cheaply reject already-throttled requests before paying for auth (constant-time key
+        comparisons) that `allow()` would reject anyway.
+        """
+        if self.limit_per_minute <= 0:
+            return False
+        window = int(time.monotonic() // 60)
+        start_window, count = self._windows.get(key, (window, 0))
+        if start_window != window:
+            return False
+        return count >= self.limit_per_minute
 
     def _sweep(self, window: int) -> None:
         """Evicts entries from stale windows so `_windows` doesn't grow without bound over the
@@ -270,7 +285,19 @@ def create_app(
         key; when the client IP is unavailable (e.g. a Unix domain socket) there is no identifier
         to key a shared bucket on without pooling unrelated callers together, so such requests skip
         the rate limit and fall through to the auth check.
+
+        A non-consuming `over_limit` peek on the IP bucket runs first, before any key comparison:
+        once a client has already exhausted its IP quota with invalid-credential requests, further
+        requests from it are rejected without paying for the O(len(api_keys)) constant-time
+        comparisons below — the whole point of rate limiting an unauthenticated caller.
         """
+        if request.client is not None and limiter.over_limit(f"ip:{request.client.host}"):
+            raise HTTPException(
+                status_code=429,
+                detail={"error": {"message": "Rate limit exceeded", "type": "rate_limit_error"}},
+                headers={"Retry-After": "60"},
+            )
+
         authorization = request.headers.get("authorization", "")
         token = authorization[len("Bearer ") :] if authorization.startswith("Bearer ") else ""
         matched_key = next((key for key in api_keys if _token_matches(token, key)), None) if api_keys else None
@@ -314,7 +341,16 @@ def create_app(
             raise
         duration_ms = (time.monotonic() - start) * 1000
         metrics.record_request(is_error=response.status_code >= 400)
-        logger.info(
+        # /healthz, /readyz, and /metrics are polled every few seconds by liveness/readiness
+        # probes; logging that traffic at INFO would drown out real request logs, so it's demoted
+        # to DEBUG unless a probe request actually fails.
+        level = (
+            logging.DEBUG
+            if request.url.path in _HEALTH_PATHS and response.status_code < 400
+            else logging.INFO
+        )
+        logger.log(
+            level,
             "%s",
             {
                 "method": request.method,
@@ -494,6 +530,32 @@ def create_app(
         finally:
             await stream.aclose()
 
+    async def _run_generation(
+        input_ids: torch.Tensor,
+        req: ChatCompletionRequest | CompletionRequest,
+        stop_seqs: list[str],
+        prompt_tokens: int,
+    ) -> AsyncIterator[tuple[str, int, str | None]]:
+        """Runs one generation under `lock` and yields `(delta, completion_tokens, finish_reason)`
+        for each token delta — `finish_reason` is None for every item except the last, which
+        carries an empty delta and the reason computed right after `metrics.record_generation` has
+        run. Both chat_completions and completions drive their streaming and non-streaming branches
+        off this single generator instead of each duplicating the
+        lock/gen_start/metrics/_finish_reason sequence across both branches.
+        """
+        async with lock:
+            gen_start = time.monotonic()
+            stopped_on_sequence = False
+            completion_tokens = 0
+            async for delta, stopped, count in _generate_deltas(input_ids, req, stop_seqs):
+                stopped_on_sequence = stopped
+                completion_tokens = count
+                if delta:
+                    yield delta, completion_tokens, None
+            metrics.record_generation(prompt_tokens, completion_tokens, time.monotonic() - gen_start)
+            finish_reason = _finish_reason(completion_tokens, req.max_tokens, stopped_on_sequence)
+            yield "", completion_tokens, finish_reason
+
     @app.post("/v1/chat/completions", dependencies=[Depends(_auth_and_rate_limit)])
     async def chat_completions(req: ChatCompletionRequest):
         try:
@@ -512,17 +574,15 @@ def create_app(
         created = int(time.time())
 
         if not req.stream:
-            async with lock:
-                gen_start = time.monotonic()
-                text_so_far = ""
-                stopped_on_sequence = False
-                completion_tokens = 0
-                async for delta, stopped, count in _generate_deltas(prompt_ids, req, stop_seqs):
-                    text_so_far += delta
-                    stopped_on_sequence = stopped
-                    completion_tokens = count
-                metrics.record_generation(prompt_tokens, completion_tokens, time.monotonic() - gen_start)
-                finish_reason = _finish_reason(completion_tokens, req.max_tokens, stopped_on_sequence)
+            text_so_far = ""
+            completion_tokens = 0
+            finish_reason = "stop"
+            async for delta, completion_tokens, reason in _run_generation(
+                prompt_ids, req, stop_seqs, prompt_tokens
+            ):
+                text_so_far += delta
+                if reason is not None:
+                    finish_reason = reason
 
             return ChatCompletionResponse(
                 id=completion_id,
@@ -542,41 +602,35 @@ def create_app(
             )
 
         async def event_generator() -> AsyncIterator[str]:
-            async with lock:
-                gen_start = time.monotonic()
-                first_chunk = ChatCompletionStreamChunk(
-                    id=completion_id,
-                    created=created,
-                    model=req.model,
-                    choices=[ChatCompletionStreamChoice(delta=Delta(role="assistant", content=""))],
-                )
-                yield f"data: {first_chunk.model_dump_json()}\n\n"
+            first_chunk = ChatCompletionStreamChunk(
+                id=completion_id,
+                created=created,
+                model=req.model,
+                choices=[ChatCompletionStreamChoice(delta=Delta(role="assistant", content=""))],
+            )
+            yield f"data: {first_chunk.model_dump_json()}\n\n"
 
-                stopped_on_sequence = False
-                completion_tokens = 0
-                async for delta, stopped, count in _generate_deltas(prompt_ids, req, stop_seqs):
-                    stopped_on_sequence = stopped
-                    completion_tokens = count
-                    if delta:
-                        chunk = ChatCompletionStreamChunk(
-                            id=completion_id,
-                            created=created,
-                            model=req.model,
-                            choices=[ChatCompletionStreamChoice(delta=Delta(content=delta))],
-                        )
-                        yield f"data: {chunk.model_dump_json()}\n\n"
+            async for delta, _completion_tokens, finish_reason in _run_generation(
+                prompt_ids, req, stop_seqs, prompt_tokens
+            ):
+                if finish_reason is not None:
+                    final_chunk = ChatCompletionStreamChunk(
+                        id=completion_id,
+                        created=created,
+                        model=req.model,
+                        choices=[ChatCompletionStreamChoice(delta=Delta(), finish_reason=finish_reason)],
+                    )
+                    yield f"data: {final_chunk.model_dump_json()}\n\n"
+                elif delta:
+                    chunk = ChatCompletionStreamChunk(
+                        id=completion_id,
+                        created=created,
+                        model=req.model,
+                        choices=[ChatCompletionStreamChoice(delta=Delta(content=delta))],
+                    )
+                    yield f"data: {chunk.model_dump_json()}\n\n"
 
-                metrics.record_generation(prompt_tokens, completion_tokens, time.monotonic() - gen_start)
-                finish_reason = _finish_reason(completion_tokens, req.max_tokens, stopped_on_sequence)
-
-                final_chunk = ChatCompletionStreamChunk(
-                    id=completion_id,
-                    created=created,
-                    model=req.model,
-                    choices=[ChatCompletionStreamChoice(delta=Delta(), finish_reason=finish_reason)],
-                )
-                yield f"data: {final_chunk.model_dump_json()}\n\n"
-                yield "data: [DONE]\n\n"
+            yield "data: [DONE]\n\n"
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -593,17 +647,15 @@ def create_app(
         created = int(time.time())
 
         if not req.stream:
-            async with lock:
-                gen_start = time.monotonic()
-                text_so_far = ""
-                stopped_on_sequence = False
-                completion_tokens = 0
-                async for delta, stopped, count in _generate_deltas(prompt_ids, req, stop_seqs):
-                    text_so_far += delta
-                    stopped_on_sequence = stopped
-                    completion_tokens = count
-                metrics.record_generation(prompt_tokens, completion_tokens, time.monotonic() - gen_start)
-                finish_reason = _finish_reason(completion_tokens, req.max_tokens, stopped_on_sequence)
+            text_so_far = ""
+            completion_tokens = 0
+            finish_reason = "stop"
+            async for delta, completion_tokens, reason in _run_generation(
+                prompt_ids, req, stop_seqs, prompt_tokens
+            ):
+                text_so_far += delta
+                if reason is not None:
+                    finish_reason = reason
 
             return CompletionResponse(
                 id=completion_id,
@@ -618,33 +670,27 @@ def create_app(
             )
 
         async def event_generator() -> AsyncIterator[str]:
-            async with lock:
-                gen_start = time.monotonic()
-                stopped_on_sequence = False
-                completion_tokens = 0
-                async for delta, stopped, count in _generate_deltas(prompt_ids, req, stop_seqs):
-                    stopped_on_sequence = stopped
-                    completion_tokens = count
-                    if delta:
-                        chunk = CompletionStreamChunk(
-                            id=completion_id,
-                            created=created,
-                            model=req.model,
-                            choices=[CompletionStreamChoice(text=delta)],
-                        )
-                        yield f"data: {chunk.model_dump_json()}\n\n"
+            async for delta, _completion_tokens, finish_reason in _run_generation(
+                prompt_ids, req, stop_seqs, prompt_tokens
+            ):
+                if finish_reason is not None:
+                    final_chunk = CompletionStreamChunk(
+                        id=completion_id,
+                        created=created,
+                        model=req.model,
+                        choices=[CompletionStreamChoice(text="", finish_reason=finish_reason)],
+                    )
+                    yield f"data: {final_chunk.model_dump_json()}\n\n"
+                elif delta:
+                    chunk = CompletionStreamChunk(
+                        id=completion_id,
+                        created=created,
+                        model=req.model,
+                        choices=[CompletionStreamChoice(text=delta)],
+                    )
+                    yield f"data: {chunk.model_dump_json()}\n\n"
 
-                metrics.record_generation(prompt_tokens, completion_tokens, time.monotonic() - gen_start)
-                finish_reason = _finish_reason(completion_tokens, req.max_tokens, stopped_on_sequence)
-
-                final_chunk = CompletionStreamChunk(
-                    id=completion_id,
-                    created=created,
-                    model=req.model,
-                    choices=[CompletionStreamChoice(text="", finish_reason=finish_reason)],
-                )
-                yield f"data: {final_chunk.model_dump_json()}\n\n"
-                yield "data: [DONE]\n\n"
+            yield "data: [DONE]\n\n"
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -684,7 +730,7 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    api_keys = set(args.api_key or [])
+    api_keys = {key for key in (args.api_key or []) if key}
     api_keys |= {key.strip() for key in os.environ.get("RADIANCE_API_KEY", "").split(",") if key.strip()}
 
     model, cfg, tokenizer = load_checkpoint(args.checkpoint, device)

@@ -8,6 +8,8 @@ from radiance.config import Config
 from radiance.dpo_data import dpo_cache_exists
 from radiance.model import DenseTransformer, checkpoint_param_bytes
 from radiance.optim import muon_orthogonalize_reserve_bytes
+
+
 def param_state_dtype_bytes(cfg: Config) -> int:
     """Bytes per element for a parameter and each of its grad/optimizer-moment buffers.
 

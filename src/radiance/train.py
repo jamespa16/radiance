@@ -20,7 +20,7 @@ from radiance.config import (
 from radiance.data import build_dataloaders, build_tokenizer
 from radiance.dpo_data import build_dpo_dataloaders
 from radiance.sft_data import build_sft_dataloaders
-from radiance.model import DenseTransformer, padded_vocab_size
+from radiance.model import DenseTransformer, cast_params_to_native_bf16, padded_vocab_size
 from radiance.optim import build_optimizer, migrate_optimizer_to_cpu_offload
 
 from .batching import (
@@ -197,14 +197,7 @@ def train(cfg: Config) -> None:
     # model.document_ids) — data.py joins documents with exactly this token.
     raw_model = DenseTransformer(cfg.model, vocab_size=vocab_size, eos_id=tokenizer.eos_token_id).to(device)
     if cfg.train.native_bf16:
-        # Parameters only, not buffers: RoPE's cos/sin cache and MoE's expert_bias carry no
-        # optimizer state, so casting them buys no memory and would cost precision that nothing
-        # downstream upcasts back (unlike RMSNorm's gain, which forward() already computes in
-        # fp32 regardless of the gain's own storage dtype). Autograd gives each bf16 parameter a
-        # bf16 .grad automatically, which is what lets optim.py's state allocators (already
-        # dtype-matched to the parameter, see _new_state_like) fall out for free.
-        for p in raw_model.parameters():
-            p.data = p.data.to(torch.bfloat16)
+        cast_params_to_native_bf16(raw_model)
         print("[radiance] train.native_bf16: parameters, gradients and optimizer moments stored in bf16")
 
     # Computed here (rather than only where it's consumed, near the bottom) so init_from below can

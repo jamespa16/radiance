@@ -291,6 +291,35 @@ def test_cpu_offload_tier_mutates_muon_in_place():
     optimizer.step()  # still steps cleanly with offloaded state
 
 
+@requires_cuda
+def test_cpu_offload_grad_buffer_follows_param_dtype_for_lazily_initialized_state():
+    """Regression guard: a param that hasn't stepped yet when a tier-2 CPU-offload escalation
+    hits (so its state is created lazily, under offload, via _new_state_like) used to get
+    bf16 exp_avg/exp_avg_sq (matching the native_bf16 param) but a hardcoded-fp32 grad_cpu —
+    torch._foreach_add_ mixing the two silently truncates precision on write instead of raising.
+    (Already-stepped state migrated by migrate_optimizer_to_cpu_offload is deliberately upcast to
+    fp32 across the board — a different, intentional path not covered by this test.) grad_cpu must
+    match exp_avg/exp_avg_sq's dtype exactly."""
+    from radiance.model import cast_params_to_native_bf16
+
+    model, cfg = _model_and_cfg()
+    cfg.train.dtype = "bf16"
+    cfg.train.native_bf16 = True
+    cast_params_to_native_bf16(model)
+    optimizer = build_optimizer(model, cfg, "cpu")  # never stepped: no state exists yet
+
+    migrated = migrate_optimizer_to_cpu_offload(optimizer, model, cfg, "cpu")
+    model(torch.randint(0, TINY_VOCAB, (2, 8))).logits.float().square().mean().backward()
+    migrated.step()  # lazily allocates exp_avg/exp_avg_sq/grad_cpu under offload
+
+    for group in migrated.param_groups:
+        if group["algorithm"] != "adamw":
+            continue
+        for p in group["params"]:
+            state = migrated.state[p]
+            assert state["grad_cpu"].dtype == state["exp_avg"].dtype == torch.bfloat16
+
+
 # --- muP ------------------------------------------------------------------------------------
 
 

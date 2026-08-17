@@ -719,17 +719,17 @@ def _apply_dtype_sugar(cfg: Config) -> Config:
             "range and outside fp16's — and GradScaler's loss scale would compose with the "
             "per-tensor global scale in a way nothing here has reasoned about. Use bf16 or nvfp4."
         )
+    if cfg.train.native_bf16 and cfg.model.fp4_linear:
+        raise ValueError(
+            "train.native_bf16 is incompatible with model.fp4_linear: FP4's quality margin (see "
+            "nvfp4/linear.py) assumes fp32 master weights, and this flag replaces them with bf16."
+        )
     if cfg.train.native_bf16 and cfg.train.dtype != "bf16":
         raise ValueError(
             f"train.native_bf16 requires train.dtype: bf16 (got {cfg.train.dtype!r}). fp16's narrow "
             "exponent range makes storing params/grads/optimizer state natively in it meaningfully "
             "riskier than bf16 (no fp32 master copy to fall back on), and fp32 storage under any "
             "other compute dtype doesn't match what this flag promises."
-        )
-    if cfg.train.native_bf16 and cfg.model.fp4_linear:
-        raise ValueError(
-            "train.native_bf16 is incompatible with model.fp4_linear: FP4's quality margin (see "
-            "nvfp4/linear.py) assumes fp32 master weights, and this flag replaces them with bf16."
         )
     return cfg
 

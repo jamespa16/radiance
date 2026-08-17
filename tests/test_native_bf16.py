@@ -10,15 +10,9 @@ import torch
 
 from radiance.batching import param_state_dtype_bytes
 from radiance.config import Config, ModelConfig, TrainConfig, _apply_dtype_sugar
-from radiance.model import DenseTransformer
+from radiance.model import DenseTransformer, cast_params_to_native_bf16
 from radiance.optim import MuonWithAuxAdam, build_optimizer
 from tests.conftest import TINY_VOCAB
-
-
-def _cast_to_native_bf16(model: DenseTransformer) -> None:
-    """Mirrors train.py's cast exactly, so the test exercises the same operation train() runs."""
-    for p in model.parameters():
-        p.data = p.data.to(torch.bfloat16)
 
 
 def _model_and_cfg(optimizer: str = "muon", **model_kwargs):
@@ -55,6 +49,15 @@ def test_native_bf16_incompatible_with_fp4_linear():
         ))
 
 
+def test_native_bf16_with_nvfp4_dtype_gets_the_fp4_linear_error_not_the_generic_one():
+    """Regression guard: train.dtype: nvfp4 is left as the literal string "nvfp4" (never rewritten
+    to "bf16") by _apply_dtype_sugar, so this combination used to trip the generic "requires
+    train.dtype: bf16" check before ever reaching the more specific, more actionable
+    fp4_linear-incompatibility error below it. The fp4_linear check must run first."""
+    with pytest.raises(ValueError, match="incompatible with model.fp4_linear"):
+        _apply_dtype_sugar(Config(train=TrainConfig(native_bf16=True, dtype="nvfp4")))
+
+
 def test_native_bf16_defaults_off():
     """The inert case: a config that never sets native_bf16 gets fp32 storage exactly as before."""
     assert TrainConfig().native_bf16 is False
@@ -76,7 +79,7 @@ def test_cast_leaves_buffers_at_fp32():
     """Only nn.Parameters are cast — RoPE's cos/sin cache and (under MoE) expert_bias carry no
     optimizer state, so casting them would cost precision for no memory win."""
     model, _ = _model_and_cfg()
-    _cast_to_native_bf16(model)
+    cast_params_to_native_bf16(model)
 
     for p in model.parameters():
         assert p.dtype == torch.bfloat16
@@ -89,7 +92,7 @@ def test_grads_and_optimizer_state_follow_param_dtype(optimizer):
     """The whole point: with native_bf16 on, grad and every optimizer-moment buffer end up bf16 —
     not just the parameters — which is what actually halves the static VRAM footprint."""
     model, cfg = _model_and_cfg(optimizer=optimizer)
-    _cast_to_native_bf16(model)
+    cast_params_to_native_bf16(model)
     opt = build_optimizer(model, cfg, "cpu")
 
     model(torch.randint(0, TINY_VOCAB, (2, 8))).logits.float().square().mean().backward()

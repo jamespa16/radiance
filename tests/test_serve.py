@@ -267,6 +267,19 @@ def test_rate_limit_is_disabled_by_default(tiny_cfg):
         assert client.get("/v1/models").status_code == 200
 
 
+def test_rate_limit_rejects_over_quota_wrong_key_requests_without_matching_keys(tiny_cfg):
+    """Regression guard: once a client's IP has exhausted its quota with invalid-credential
+    requests, further requests from it must 429 via the cheap `over_limit` peek rather than
+    running the full O(len(api_keys)) constant-time key comparison first."""
+    client, _, _ = _client(tiny_cfg(), api_keys={"secret-key"}, rate_limit_per_minute=1)
+    resp = client.get("/v1/models", headers={"Authorization": "Bearer wrong-key"})
+    assert resp.status_code == 401
+
+    resp = client.get("/v1/models", headers={"Authorization": "Bearer wrong-key"})
+    assert resp.status_code == 429
+    assert resp.headers["retry-after"] == "60"
+
+
 # --- health/readiness/metrics (#36) ----------------------------------------------------------
 
 

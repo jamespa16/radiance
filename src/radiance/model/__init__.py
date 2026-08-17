@@ -12,6 +12,7 @@ from .dpo import sequence_logprob_sum, target_logit_and_logz
 from .ffn import BatchedExperts, FeedForward, MoEFeedForward, MoERouter
 from .hyper_connections import HyperConnection
 from .load import (
+    cast_params_to_native_bf16,
     checkpoint_param_bytes,
     checkpoint_vocab_size,
     load_transformer_from_checkpoint,
@@ -30,6 +31,7 @@ __all__ = [
     "LoopContext",
     "MoEFeedForward",
     "RMSNorm",
+    "cast_params_to_native_bf16",
     "checkpoint_param_bytes",
     "checkpoint_vocab_size",
     "document_ids",

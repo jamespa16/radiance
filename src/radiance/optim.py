@@ -539,7 +539,7 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
                 state["exp_avg"] = _new_state_like(p, state_device)
                 state["exp_avg_sq"] = _new_state_like(p, state_device)
                 if offload:
-                    state["grad_cpu"] = torch.empty_like(p, device="cpu", dtype=torch.float32).pin_memory()
+                    state["grad_cpu"] = torch.empty_like(p, device="cpu").pin_memory()
                 state["step"] = 0
             state["step"] += 1
             if offload:
