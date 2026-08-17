@@ -1,0 +1,84 @@
+# Small-scale dense FineWeb run at 20 tokens/param, bf16 — a stable test config, so
+# the name deliberately carries no size or dtype.
+#
+# ~27M params: d_model 256, head_dim 64 (4 heads, the d_model 256 ratio in
+# configs/tinystories.yaml), 10 layers, ffn_mult 3.0, ffn_depth 2, ACT router
+# (use_router) with max_loops 8. Total:
+# **27,434,810 params** (verified via DenseTransformer(...).num_parameters()).
+#
+# bf16 rather than nvfp4 on purpose: at d_model 256 the quantized GEMMs measure
+# 0.34x per-linear (docs/results.md, NVFP4 section) — FP4 only wins once the GEMMs are
+# large enough to amortize the per-micro-batch quantization (1.18-1.88x at d_model 1280,
+# configs/fineweb_500m_nvfp4.yaml).
+#
+# 20 tokens/param over 27,434,810 params is ~549M tokens — Chinchilla-optimal for this
+# size, with max_steps derived and printed at run start.
+
+run_name: fineweb-small-test-v1
+
+data:
+  dataset: HuggingFaceFW/fineweb # ~15TB, train split only (no validation split exists)
+  text_column: text
+  tokenizer: gpt2
+  seq_len: 1024
+  num_workers: 4
+  cache_dir: .cache/radiance/tokenized
+  streaming: true # required: fineweb is far too large to tokenize/cache to disk up front
+  shuffle_buffer_size: 10000
+  # fineweb has no validation split, so carve a deterministic 2000-example held-out slice off
+  # the front of train instead (excluded from training) — see docs/extending.md.
+  eval_split_size: 2000
+  # Uncomment to also avoid re-fetching/re-tokenizing already-streamed data across repeated
+  # short runs (e.g. while iterating on this config).
+  disk_cache_max_gb: 50
+  disk_cache_shard_size: 100
+  prefetch_factor: 2
+
+model:
+  d_model: 256
+  head_dim: 64 # 4 heads — the d_model 256 ratio in configs/tinystories.yaml
+  n_layers: 10
+  use_router: true # ACT: per-token learned halting replaces the fixed loop count; see docs/model.md
+  max_loops: 8 # hard cap on loop iterations in router mode
+  ponder_weight: 1.0e-2 # ACT ponder-cost coefficient
+  halt_epsilon: 0.01 # a position halts once cumulative halting prob >= 1 - halt_epsilon
+  ffn_mult: 3.0 # ffn_dim = 768
+  ffn_depth: 2
+  dropout: 0.01
+  max_seq_len: 1024
+  # 27,434,810 params (verified via DenseTransformer(...).num_parameters() with the gpt2
+  # tokenizer's 50257-token vocab).
+
+train:
+  batch_size: 64 # 27M model is memory-trivial; auto_batch_size (default True) retunes this
+  # to fit VRAM on CUDA and enables OOM backoff.
+  grad_accum_steps: 1
+  # auto_batch_size defaults to True: on CUDA it overwrites batch_size/grad_accum_steps above
+  # with values estimated from free VRAM + model size, by default targeting the same
+  # effective_batch_size (16) these already imply. Uncomment to target a different effective
+  # batch, or set auto_batch_size: false to use the hand-tuned values exactly.
+  # target_effective_batch_size: 32 # Muon's Newton-Schulz is a flat cost per optimizer step;
+  # a bigger effective batch amortizes it (docs/optim.md). At this size the per-step cost is
+  # small either way, so the default is left as-is.
+  lr: 1.0e-2 # the retuned post-Muon value (TrainConfig.lr, docs/optim.md). The older fineweb_*
+  # configs pin 2.5e-4, which predates the retune and trains the tied embedding ~30-100x too slowly.
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  tokens_per_param: 20 # Chinchilla-optimal; max_steps is derived and printed/logged at run start
+  grad_clip: 1.0
+  log_every: 10
+  eval_every: 100
+  save_every: 100
+  output_dir: checkpoints/fineweb_small_test
+  # Uncomment to make an interrupted run continue from the newest checkpoint in output_dir instead of
+  # restarting — restores optimizer moments and the LR schedule, not just the weights.
+  # resume_from: auto
+  seed: 42
+  device: auto
+  compile: true
+  dtype: bf16
+
+wandb:
+  project: radiance
+  entity: null
+  mode: online
