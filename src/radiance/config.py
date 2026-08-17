@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import MISSING, dataclass, field, fields, is_dataclass
+from pathlib import Path
 
 import torch
 import yaml
@@ -9,6 +10,15 @@ import yaml
 @dataclass
 class DataConfig:
     dataset: str = "roneneldan/TinyStories"
+    dataset_mix: str | None = None  # opt-in: path to a YAML file listing several datasets to train
+    # on together, weighted. When set, it takes precedence over `dataset`/`text_column`: the mix's
+    # entries (each a {dataset, [weight], [text_column]} mapping — see MixDatasetConfig) drive the
+    # data pipeline instead, all sharing this section's tokenizer/seq_len/streaming/cache_dir/etc.
+    # `weight` is a dataset's share of the training *tokens* (normalised across the mix), not a
+    # repetition count. A relative path resolves against the config file's directory (see
+    # load_config), so configs/dataset_mix.yaml can sit next to the config and be referenced as a
+    # bare filename. Works for the non-streaming, streaming, and streaming+disk-cache paths; see
+    # data._build_mixed_dataloaders for how each is mixed.
     text_column: str = "text"
     tokenizer: str = "gpt2"
     seq_len: int = 512
@@ -20,6 +30,22 @@ class DataConfig:
     disk_cache_shard_size: int = 100
     prefetch_factor: int = 2
     eval_split_size: int = 0
+
+
+@dataclass
+class MixDatasetConfig:
+    """One entry of a `data.dataset_mix` file: a corpus and its share of the training mix.
+
+    `weight` is the corpus's relative share of the mix (normalised across all entries when the
+    mix is built); it is a *token* share — the fraction of the packed-block stream that comes
+    from this corpus — not a repetition factor. `text_column` is the column to tokenize; when
+    omitted it falls back to the shared `data.text_column` (resolved in data.load_dataset_mix, so
+    downstream code never sees a None).
+    """
+
+    dataset: str
+    weight: float = 1.0
+    text_column: str | None = None
 
 
 @dataclass
@@ -734,6 +760,13 @@ def _apply_dtype_sugar(cfg: Config) -> Config:
     return cfg
 
 
+def _resolve_dataset_mix_path(mix_path: str, config_dir: Path) -> str:
+    """Resolve a `data.dataset_mix` path against the config file's directory so the mix file can
+    live next to the config (configs/dataset_mix.yaml) and be referenced by a bare filename."""
+    p = Path(mix_path)
+    return str(p if p.is_absolute() else (config_dir / p))
+
+
 def load_config(path: str) -> Config:
     with open(path) as f:
         raw = yaml.safe_load(f) or {}
@@ -745,8 +778,20 @@ def load_config(path: str) -> Config:
             "train.dtype: nvfp4 and model.fp4_linear: false contradict each other. "
             "Set one or the other, rather than leaving it to resolution order."
         )
+    # Also caught here (raw-only, like the check above): data.dataset has a default, so a
+    # resolved Config can't tell "left at the default" from "explicitly written down". Setting
+    # both is a copy-paste trap — the mix silently wins and data.dataset / data.text_column are
+    # ignored (docs/data.md) with no warning — the same silent-precedence pitfall guarded above.
+    data_raw = raw.get("data", {})
+    if data_raw.get("dataset_mix") and "dataset" in data_raw:
+        raise ValueError(
+            "data.dataset_mix and data.dataset are both set. While data.dataset_mix is set it "
+            "takes precedence and data.dataset (and data.text_column) are silently ignored — "
+            "remove data.dataset to keep the mix, or drop data.dataset_mix to train on the "
+            "single dataset."
+        )
 
-    return _apply_dtype_sugar(Config(
+    cfg = _apply_dtype_sugar(Config(
         run_name=raw.get("run_name", Config.run_name),
         data=DataConfig(**raw.get("data", {})),
         model=ModelConfig(**raw.get("model", {})),
@@ -755,3 +800,9 @@ def load_config(path: str) -> Config:
         sft=SFTConfig(**raw.get("sft", {})),
         dpo=DPOConfig(**raw.get("dpo", {})),
     ))
+    # Resolve the mix file against the config's own directory (see _resolve_dataset_mix_path).
+    # Stored resolved so the data pipeline — which only sees cfg — can open it directly and the
+    # checkpoint's embedded config is self-describing.
+    if cfg.data.dataset_mix:
+        cfg.data.dataset_mix = _resolve_dataset_mix_path(cfg.data.dataset_mix, Path(path).parent)
+    return cfg

@@ -47,6 +47,36 @@ this fail fast rather than corrupt). Once a worker's raw partition is fully cons
 data — a one-time warning is logged. Size `disk_cache_max_gb` to cover a full epoch, or skip disk-cache mode
 entirely, for open-ended multi-epoch training over a dataset larger than the cache.
 
+## Dataset mix
+
+`data.dataset_mix` (a path to a YAML file, default `null`) trains on a **weighted blend of several
+corpora** at once instead of the single `data.dataset`. While set, `data.dataset` / `data.text_column`
+are ignored; the mix file lists one `{dataset, [weight], [text_column]}` entry per corpus (see
+`configs/dataset_mix.yaml` + `configs/tinystories_mix.yaml`). A relative path resolves against the
+**config file's directory**, so the mix file sits next to the config. Every corpus shares the rest of
+the data section — `tokenizer`, `seq_len`, `streaming`, `cache_dir`, `eval_split_size`, etc. Only the
+corpus id, its `text_column`, and its `weight` differ per entry.
+
+`weight` is a corpus's share of the training **tokens** (normalised across the mix), not a repetition
+count. Each corpus is tokenized+packed **independently** — with its own per-corpus cache entry (keyed by
+corpus / `text_column` / `tokenizer` / `seq_len` / `eval_split_size`, so changing one entry's weight or
+adding a corpus never re-tokenizes the others) — and the packed `seq_len` blocks are then combined:
+
+- **Non-streaming** — in-memory corpora are per-corpus shuffled and interleaved with
+  `datasets.interleave_datasets(..., stopping_strategy="all_exhausted")`: a finite epoch in which every
+  corpus is fully covered and each contributes ~its weight of the blocks.
+- **Streaming** (with or without `disk_cache_max_gb`) — the live per-corpus block streams are interleaved
+  by a small `_WeightedInterleave`: effectively infinite, each draw from a corpus chosen by weight, an
+  exhausted corpus replayed, an empty one dropped. With `disk_cache_max_gb` each corpus wraps its own
+  `StreamingPackedDataset`, and the bounded cache is partitioned across all `(corpus, split)` namespaces
+  so the combined footprint stays within the budget.
+
+The mixed **validation** split is the same mix restricted to the corpora that have one (a corpus with no
+`validation` split and no `data.eval_split_size` carve simply doesn't contribute to `val/loss`; `val/loss`
+is then measured on that subset — the same limitation the single-dataset path has). A corpus that packs to
+zero blocks at the configured `seq_len` is skipped from the train mix with a warning; if *all* of them do,
+the run raises.
+
 ## SFT and DPO paths
 
 `_format_sft_messages`/`_tokenize_sft_example`, `_tokenize_and_pack_sft` and `format_chat_prompt` live in
