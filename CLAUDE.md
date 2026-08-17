@@ -36,6 +36,10 @@ No manual setup step — `uv run` creates/syncs `.venv` from `pyproject.toml`/`u
 **Create a branch and open a pull request; do not commit straight to `main`.** Commit and push only when asked, as
 usual — the instruction here is about *where*, not *when*.
 
+**Never include a Claude Code session link (`claude.ai/code/session_...`) in a PR description or commit message.**
+Drop that line/footer entirely rather than including it — the rest of the standard attribution (e.g.
+`Co-Authored-By: Claude ...`) is fine.
+
 ## Running training
 
 ```bash
