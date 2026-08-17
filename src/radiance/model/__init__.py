@@ -16,6 +16,7 @@ from .load import (
     checkpoint_param_bytes,
     checkpoint_vocab_size,
     load_transformer_from_checkpoint,
+    mask_vocab_padding,
     padded_vocab_size,
 )
 from .masking import build_block_mask, document_ids
@@ -36,6 +37,7 @@ __all__ = [
     "checkpoint_vocab_size",
     "document_ids",
     "load_transformer_from_checkpoint",
+    "mask_vocab_padding",
     "padded_vocab_size",
     "sequence_logprob_sum",
     "target_logit_and_logz",

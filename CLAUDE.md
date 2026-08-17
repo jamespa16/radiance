@@ -14,6 +14,7 @@ what is written down there is a measurement or a bug that cost a training run, n
 | [docs/optim.md](docs/optim.md) | `optim.py` — Muon, muP, parameter groups, the `lr` retune |
 | [docs/train.md](docs/train.md) | `train.py` (+ `losses.py`, `batching.py`, `checkpointing.py`, `evaluation.py`) + `generate.py` — loop, loss, compile modes, batch sizing, OOM tiers |
 | [docs/post-training.md](docs/post-training.md) | SFT and DPO |
+| [docs/eval.md](docs/eval.md) | `eval_harness.py` — standard benchmarks (HellaSwag, PIQA, ARC, ...) via lm-evaluation-harness |
 | [docs/results.md](docs/results.md) | **every A/B ever run here**, and the cautions for running a new one |
 | [docs/extending.md](docs/extending.md) | how to add a dataset / model variant / optimizer / numeric format |
 
@@ -87,6 +88,17 @@ Bearer <key>` on every `/v1/*` route; omitted, those routes are unauthenticated 
 above needs no flags). `--rate-limit` caps requests/minute per key (or per client IP when no key is configured); `0`
 (default) disables it. Entry point: `radiance.serve:main` — `radiance-serve` console script after install.
 
+## Running standard benchmarks
+
+```bash
+uv run --group eval radiance-eval --checkpoint checkpoints/tinystories/step_1000.pt --tasks piqa,hellaswag,arc_easy
+```
+
+Runs [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness) tasks against a checkpoint
+in-process (batched forward passes against the loaded model, not through `radiance-serve` — see
+[docs/eval.md](docs/eval.md) for why). `lm-eval` is a separate `eval` dependency group (`uv run --group eval ...`),
+not a core dependency. Entry point: `radiance.eval_harness:main` — `radiance-eval` console script after install.
+
 ## Running tests
 
 ```bash
@@ -151,6 +163,8 @@ only the model package imports. `model/` and `nvfp4/` are packages whose `__init
   `losses.py`, batch sizing in `batching.py`, checkpoint save/load in `checkpointing.py`, evaluation in
   `evaluation.py`.
 - **`generate.py`** — checkpoint loading and KV-cached autoregressive sampling.
+- **`eval_harness.py`** — an lm-evaluation-harness `LM` backend (`RadianceLM`) plus the `radiance-eval` CLI; runs
+  standard benchmarks in-process against a loaded checkpoint. `eval` dependency group, not core.
 
 Three cross-cutting conventions that decide most design questions here:
 

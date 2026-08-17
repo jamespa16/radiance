@@ -20,12 +20,16 @@ dev = [
     "pytest>=8.0",
     "httpx>=0.27",
 ]
+eval = [
+    "lm-eval>=0.4.5,<0.5",
+]
 
 [project.scripts]
 radiance-train = "radiance.train:main"
 radiance-generate = "radiance.generate:main"
 radiance-sweep = "radiance.sweep:main"
 radiance-serve = "radiance.serve:main"
+radiance-eval = "radiance.eval_harness:main"
 
 [build-system]
 requires = ["setuptools>=68"]
