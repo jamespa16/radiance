@@ -1,0 +1,19 @@
+# A data.dataset_mix: one entry per corpus to train on together.
+#
+#   dataset      HuggingFace `user/dataset` (or a local path) with a train split. Required.
+#   weight       this corpus's share of the training *tokens* (normalised across the mix).
+#                1.0 and 2.0 -> 1/3 of the tokens from the first corpus, 2/3 from the second.
+#   text_column  which column to tokenize. Optional; defaults to data.text_column.
+#
+# Reference it from a config's data section with  data.dataset_mix: dataset_mix.yaml  — the
+# path is resolved against the config file's directory. While dataset_mix is set, data.dataset
+# is ignored and this mix drives the data pipeline; every corpus shares data.tokenizer,
+# data.seq_len, data.streaming, data.cache_dir and the rest of the data section. See
+# docs/data.md ("Dataset mix") for how the non-streaming / streaming / disk-cache paths combine
+# the corpora, and docs/extending.md for the worked example.
+- dataset: roneneldan/TinyStories
+  weight: 1.0
+# A second corpus, with its own column and a heavier share. Uncomment and edit to mix it in:
+# - dataset: HuggingFaceFW/fineweb
+#   text_column: text
+#   weight: 2.0

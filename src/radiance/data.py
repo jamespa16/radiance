@@ -3,16 +3,18 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import random
+import yaml
 from pathlib import Path
 
 import torch
-from datasets import DatasetDict, IterableDataset, load_dataset, load_from_disk
+from datasets import DatasetDict, IterableDataset, interleave_datasets, load_dataset, load_from_disk
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from radiance.config import Config
+from radiance.config import Config, MixDatasetConfig
 logger = logging.getLogger(__name__)
 
 
@@ -27,8 +29,10 @@ def build_tokenizer(cfg: Config) -> PreTrainedTokenizerBase:
     return tokenizer
 
 
-def _tokenize_and_pack(dataset, tokenizer: PreTrainedTokenizerBase, cfg: Config):
-    text_column = cfg.data.text_column
+def _tokenize_and_pack(dataset, tokenizer: PreTrainedTokenizerBase, cfg: Config, text_column: str | None = None):
+    # A mix entry may tokenize a different column than the shared data.text_column; a single
+    # dataset (or an entry that omits text_column) falls back to the shared value, unchanged.
+    text_column = text_column or cfg.data.text_column
     seq_len = cfg.data.seq_len
 
     def tokenize_fn(batch):
@@ -68,12 +72,16 @@ def _tokenize_and_pack(dataset, tokenizer: PreTrainedTokenizerBase, cfg: Config)
     return packed
 
 
-def _cache_path(cfg: Config) -> Path:
+def _packed_cache_path(dataset_id: str, text_column: str, cfg: Config) -> Path:
+    # Keyed per corpus (not per run) so a dataset used in several mixes — or in a mix and on its
+    # own — shares one tokenized+packed cache entry, and changing one mix entry never invalidates
+    # the others. For the single-dataset case this is byte-identical to the pre-mix cache key, so
+    # existing caches keep working.
     key = "|".join(
         [
-            cfg.data.dataset,
+            dataset_id,
             cfg.data.tokenizer,
-            cfg.data.text_column,
+            text_column,
             str(cfg.data.seq_len),
             str(cfg.data.eval_split_size),
         ]
@@ -101,35 +109,61 @@ def _disk_cache_max_bytes(cfg: Config) -> int | None:
 
 
 def _load_or_build_packed(cfg: Config, tokenizer: PreTrainedTokenizerBase):
+    return _load_or_build_packed_for_dataset(cfg.data.dataset, cfg.data.text_column, cfg, tokenizer)
+
+
+def _require_train_split(raw, dataset_id: str) -> None:
+    if "train" not in raw:
+        raise ValueError(
+            f"dataset {dataset_id!r} has no 'train' split; the data pipeline (and every "
+            "data.dataset_mix entry) needs one"
+        )
+
+
+def _load_or_build_packed_for_dataset(
+    dataset_id: str, text_column: str, cfg: Config, tokenizer: PreTrainedTokenizerBase
+):
+    """Load (or tokenize+pack and cache) one corpus's packed train/validation blocks.
+
+    Per-corpus rather than per-run so a data.dataset_mix caches and reloads each dataset
+    independently — changing one entry's weight, or adding a corpus, never re-tokenises the
+    others. The disk-cache streaming path is deliberately NOT handled here: it builds torch
+    StreamingPackedDataset wrappers rather than HF datasets, so it stays in build_dataloaders.
+    Returns {"train": <packed>, "validation": <packed>|None}. Packed blocks are plain lists of
+    ids; the DataLoader's collate (torch.as_tensor) turns them into tensors, so no set_format is
+    applied here (a mix reorders/shuffles these per corpus and an interleaved result is iterable,
+    not a save-to-disk memory dataset anyway).
+    """
     if cfg.data.streaming and not cfg.data.disk_cache_max_gb:
-        raw = load_dataset(cfg.data.dataset, streaming=True)
+        raw = load_dataset(dataset_id, streaming=True)
+        _require_train_split(raw, dataset_id)
         train_split = raw["train"]
         val_split = raw.get("validation")
         if val_split is None:
             train_split, val_split = split_off_eval(train_split, cfg.data.eval_split_size)
 
         train_split = train_split.shuffle(seed=cfg.train.seed, buffer_size=cfg.data.shuffle_buffer_size)
-        train_packed = _tokenize_and_pack(train_split, tokenizer, cfg)
+        train_packed = _tokenize_and_pack(train_split, tokenizer, cfg, text_column)
         train_packed = train_packed.shuffle(seed=cfg.train.seed, buffer_size=cfg.data.shuffle_buffer_size)
-        val_packed = _tokenize_and_pack(val_split, tokenizer, cfg) if val_split is not None else None
+        val_packed = _tokenize_and_pack(val_split, tokenizer, cfg, text_column) if val_split is not None else None
 
         return {"train": train_packed, "validation": val_packed}
 
-    cache_path = _cache_path(cfg)
+    cache_path = _packed_cache_path(dataset_id, text_column, cfg)
     if cfg.data.cache_dir and cache_path.exists():
         packed = load_from_disk(str(cache_path))
-        packed.set_format(type="torch", columns=["input_ids"])
         return packed
 
-    raw = load_dataset(cfg.data.dataset)
+    raw = load_dataset(dataset_id)
+    _require_train_split(raw, dataset_id)
     train_split = raw["train"]
     val_split = raw.get("validation")
     if val_split is None:
         train_split, val_split = split_off_eval(train_split, cfg.data.eval_split_size)
 
-    packed = DatasetDict({"train": _tokenize_and_pack(train_split, tokenizer, cfg)})
+    packed = DatasetDict({"train": _tokenize_and_pack(train_split, tokenizer, cfg, text_column)})
     if val_split is not None:
-        packed["validation"] = _tokenize_and_pack(val_split, tokenizer, cfg)
+        packed["validation"] = _tokenize_and_pack(val_split, tokenizer, cfg, text_column)
 
     if cfg.data.cache_dir:
         packed.save_to_disk(str(cache_path))
@@ -137,12 +171,15 @@ def _load_or_build_packed(cfg: Config, tokenizer: PreTrainedTokenizerBase):
     return packed
 
 
-def _streaming_cache_digest(cfg: Config) -> str:
+def _streaming_cache_digest(cfg: Config, dataset_id: str, text_column: str) -> str:
+    # Per-corpus namespace so a mix gives each dataset its own cache dir + lock (and its own
+    # bounded budget via StreamingPackedDataset._per_namespace_budget). For the single-dataset
+    # case this is byte-identical to the pre-mix digest, so existing streaming caches keep working.
     key = "|".join(
         [
-            cfg.data.dataset,
+            dataset_id,
             cfg.data.tokenizer,
-            cfg.data.text_column,
+            text_column,
             str(cfg.data.seq_len),
             str(cfg.data.num_workers),
             str(cfg.data.eval_split_size),
@@ -217,14 +254,20 @@ class StreamingPackedDataset(torch.utils.data.IterableDataset):
         split: str,
         num_splits_in_use: int,
         carve_eval_from_train: bool = False,
+        dataset_id: str | None = None,
+        text_column: str | None = None,
     ):
         self.cfg = cfg
         self.tokenizer = tokenizer
         self.split = split
         self.num_splits_in_use = num_splits_in_use
         self.carve_eval_from_train = carve_eval_from_train
+        # A mix passes one corpus's id/column per wrapper; the single-dataset path omits both and
+        # falls back to the shared config values (identical cache namespace, identical behavior).
+        self.dataset_id = dataset_id or cfg.data.dataset
+        self.text_column = text_column or cfg.data.text_column
 
-        self.cache_dir = Path(cfg.data.cache_dir) / _streaming_cache_digest(cfg) / split
+        self.cache_dir = Path(cfg.data.cache_dir) / _streaming_cache_digest(cfg, self.dataset_id, self.text_column) / split
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         self._lock = _CacheLock(self.cache_dir / ".lock")
@@ -292,20 +335,20 @@ class StreamingPackedDataset(torch.utils.data.IterableDataset):
                     yield {"input_ids": block}
 
             if self.carve_eval_from_train:
-                raw = load_dataset(self.cfg.data.dataset, split="train", streaming=True)
+                raw = load_dataset(self.dataset_id, split="train", streaming=True)
                 if self.split == "validation":
                     raw = raw.take(self.cfg.data.eval_split_size)
                 else:
                     raw = raw.skip(self.cfg.data.eval_split_size)
             else:
-                raw = load_dataset(self.cfg.data.dataset, split=self.split, streaming=True)
+                raw = load_dataset(self.dataset_id, split=self.split, streaming=True)
             if num_workers > 1:
                 raw = raw.shard(num_shards=num_workers, index=worker_id)
             raw = raw.skip(manifest["n_raw_consumed"])
 
             seq_len = self.cfg.data.seq_len
             eos_id = self.tokenizer.eos_token_id
-            text_column = self.cfg.data.text_column
+            text_column = self.text_column
             token_buffer: list[int] = []
             block_buffer: list[list[int]] = []
             raw_consumed_since_flush = 0
@@ -373,18 +416,232 @@ class StreamingPackedDataset(torch.utils.data.IterableDataset):
         yield from shuffled(source())
 
 
-def build_dataloaders(cfg: Config, tokenizer: PreTrainedTokenizerBase) -> tuple[DataLoader, DataLoader | None]:
-    def collate(batch):
-        input_ids = torch.stack([torch.as_tensor(ex["input_ids"]) for ex in batch])
-        return {"input_ids": input_ids}
+def _pretrain_collate(batch):
+    input_ids = torch.stack([torch.as_tensor(ex["input_ids"]) for ex in batch])
+    return {"input_ids": input_ids}
 
-    loader_kwargs = dict(
+
+def _dataloader_kwargs(cfg: Config) -> dict:
+    return dict(
         num_workers=cfg.data.num_workers,
         persistent_workers=cfg.data.num_workers > 0,
         prefetch_factor=cfg.data.prefetch_factor if cfg.data.num_workers > 0 else None,
-        collate_fn=collate,
+        collate_fn=_pretrain_collate,
         drop_last=True,
     )
+
+
+def _normalized(weights: list[float]) -> list[float]:
+    """Mix weights -> probabilities. interleave_datasets requires probabilities that sum to 1, and
+    a mix subset (e.g. the validation interleave) re-normalises over just its members."""
+    total = sum(weights)
+    return [w / total for w in weights]
+
+
+def load_dataset_mix(path: str, cfg: Config) -> list[MixDatasetConfig]:
+    """Read a data.dataset_mix YAML file and return its validated, resolved entries.
+
+    The file is a YAML list; each item is a mapping with a required `dataset` and optional
+    `weight` (default 1.0) and `text_column` (default: the shared data.text_column). Weights are
+    validated finite and > 0; text_column is resolved against cfg.data.text_column so the rest of
+    the pipeline never sees a None.
+    """
+    with open(path) as f:
+        raw = yaml.safe_load(f)
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(
+            f"dataset mix file {path!r} must be a non-empty YAML list of "
+            "{{dataset, [weight], [text_column]}} entries"
+        )
+    entries: list[MixDatasetConfig] = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict) or not item.get("dataset"):
+            raise ValueError(f"dataset mix entry {i} in {path!r} must be a mapping with a non-empty 'dataset'")
+        weight = float(item.get("weight", 1.0))
+        if not math.isfinite(weight) or weight <= 0:
+            raise ValueError(
+                f"dataset mix entry {i} ({item['dataset']!r}) has weight {weight!r}; "
+                "weights must be finite and > 0"
+            )
+        entries.append(
+            MixDatasetConfig(
+                dataset=item["dataset"],
+                weight=weight,
+                text_column=item.get("text_column") or cfg.data.text_column,
+            )
+        )
+    return entries
+
+
+class _WeightedInterleave(torch.utils.data.IterableDataset):
+    """Weighted, effectively-infinite interleave of per-corpus packed-block streams.
+
+    Each draw picks a source with probability proportional to its mix weight and yields the next
+    block from that source; an exhausted source is re-iterated (a streaming corpus replays its
+    cache / refetches, matching the single-dataset streaming path's later-epoch behavior) and a
+    source that yields nothing is dropped, renormalising the rest. Per-source iterators are made
+    inside __iter__ so each DataLoader worker gets its own, and each underlying source shards
+    across workers itself (HF streaming / StreamingPackedDataset), so the interleave is
+    worker-safe. The per-worker RNG is seeded from (seed, worker_id) so the mix is deterministic
+    for a given seed.
+    """
+
+    def __init__(self, sources: list, weights: list[float], seed: int):
+        self.sources = sources
+        total = sum(weights)
+        self.probs = [w / total for w in weights]
+        self.seed = seed
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        rng = random.Random(self.seed + worker_id)
+        iters = [iter(s) for s in self.sources]
+        active = list(range(len(self.sources)))
+        while active:
+            probs = [self.probs[i] for i in active]
+            total = sum(probs)
+            pick = active[rng.choices(range(len(active)), weights=[p / total for p in probs], k=1)[0]]
+            try:
+                item = next(iters[pick])
+            except StopIteration:
+                iters[pick] = iter(self.sources[pick])
+                try:
+                    item = next(iters[pick])
+                except StopIteration:
+                    active.remove(pick)  # empty source: drop it and renormalise the rest
+                    continue
+            yield item
+
+
+def _has_validation_split(dataset_id: str) -> bool:
+    return "validation" in load_dataset(dataset_id, streaming=True)
+
+
+def _build_mixed_disk_cache_dataloaders(cfg: Config, tokenizer: PreTrainedTokenizerBase, entries, weights):
+    # The bounded-cache streaming path: one StreamingPackedDataset per (corpus, split). Each sizes
+    # its own cache budget from num_splits_in_use, so passing the total number of (corpus, split)
+    # namespaces keeps the combined footprint within disk_cache_max_gb. We over-count (assume 2
+    # splits per corpus, even those without validation) rather than under-count it: the budget is
+    # a ceiling, so a smaller real footprint is safe, an underestimated one is not.
+    num_splits_in_use = len(entries) * 2
+
+    train_sources = []
+    val_sources = []
+    val_weights = []
+    for e in entries:
+        has_real_validation = _has_validation_split(e.dataset)
+        carve = not has_real_validation and cfg.data.eval_split_size > 0
+        has_validation = has_real_validation or carve
+        train_sources.append(
+            StreamingPackedDataset(
+                cfg, tokenizer, split="train", num_splits_in_use=num_splits_in_use,
+                carve_eval_from_train=carve, dataset_id=e.dataset, text_column=e.text_column,
+            )
+        )
+        if has_validation:
+            val_sources.append(
+                StreamingPackedDataset(
+                    cfg, tokenizer, split="validation", num_splits_in_use=num_splits_in_use,
+                    carve_eval_from_train=carve, dataset_id=e.dataset, text_column=e.text_column,
+                )
+            )
+            val_weights.append(e.weight)
+
+    loader_kwargs = _dataloader_kwargs(cfg)
+    train_ds = _WeightedInterleave(train_sources, weights, cfg.train.seed)
+    train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size, shuffle=False, **loader_kwargs)
+    if val_sources:
+        val_ds = _WeightedInterleave(val_sources, val_weights, cfg.train.seed + 1)
+        val_loader = DataLoader(val_ds, batch_size=cfg.train.batch_size, shuffle=False, **loader_kwargs)
+    else:
+        val_loader = None
+    return train_loader, val_loader
+
+
+def _build_mixed_dataloaders(cfg: Config, tokenizer: PreTrainedTokenizerBase):
+    """Build train/val loaders for a data.dataset_mix (see DataConfig.dataset_mix).
+
+    Each corpus is tokenized+packed independently (per-corpus cache, per-entry text_column) and
+    the packed blocks are then mixed:
+      - non-streaming: in-memory corpora are per-corpus shuffled and combined with
+        interleave_datasets(stopping_strategy='all_exhausted') — a finite epoch in which every
+        corpus is covered and each contributes ~its weight of the blocks;
+      - streaming (with or without disk_cache_max_gb): the live per-corpus block streams are
+        combined with _WeightedInterleave — effectively infinite, each draw from a corpus chosen
+        by weight (the disk-cache variant wraps per-corpus StreamingPackedDatasets).
+    The mixed validation split is the same mix restricted to the corpora that have one (a corpus
+    without a validation split — and no data.eval_split_size carve — simply doesn't contribute to
+    val/loss; this mirrors the single-dataset behavior).
+    """
+    entries = load_dataset_mix(cfg.data.dataset_mix, cfg)
+    weights = [e.weight for e in entries]
+    loader_kwargs = _dataloader_kwargs(cfg)
+
+    if cfg.data.streaming and cfg.data.disk_cache_max_gb:
+        return _build_mixed_disk_cache_dataloaders(cfg, tokenizer, entries, weights)
+
+    packed = [
+        _load_or_build_packed_for_dataset(e.dataset, e.text_column, cfg, tokenizer) for e in entries
+    ]
+
+    if cfg.data.streaming:
+        train_ds = _WeightedInterleave([p["train"] for p in packed], weights, cfg.train.seed)
+        val_parts = [(i, p["validation"]) for i, p in enumerate(packed) if p["validation"] is not None]
+        val_ds = (
+            _WeightedInterleave([v for _, v in val_parts], [weights[i] for i, _ in val_parts], cfg.train.seed + 1)
+            if val_parts else None
+        )
+    else:
+        train_parts = []
+        for i, p in enumerate(packed):
+            t = p["train"]
+            if len(t) == 0:
+                logger.warning(
+                    "[radiance] mix corpus %r packs to 0 blocks at seq_len=%d; skipped from the mix",
+                    entries[i].dataset, cfg.data.seq_len,
+                )
+                continue
+            train_parts.append((i, t))
+        if not train_parts:
+            raise ValueError(
+                "the data.dataset_mix packs to no training blocks — check data.seq_len against "
+                "the corpora's sizes (a corpus smaller than one seq_len packs to nothing)"
+            )
+        train_ds = interleave_datasets(
+            [t.shuffle(seed=cfg.train.seed + 1000 * i) for i, t in train_parts],
+            probabilities=_normalized([weights[i] for i, _ in train_parts]),
+            seed=cfg.train.seed,
+            stopping_strategy="all_exhausted",
+        )
+        val_parts = [
+            (i, p["validation"]) for i, p in enumerate(packed)
+            if p["validation"] is not None and len(p["validation"]) > 0
+        ]
+        if val_parts:
+            val_ds = interleave_datasets(
+                [v.shuffle(seed=cfg.train.seed + 2000 * i) for i, v in val_parts],
+                probabilities=_normalized([weights[i] for i, _ in val_parts]),
+                seed=cfg.train.seed + 1,
+                stopping_strategy="all_exhausted",
+            )
+        else:
+            val_ds = None
+
+    train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size, shuffle=False, **loader_kwargs)
+    val_loader = (
+        DataLoader(val_ds, batch_size=cfg.train.batch_size, shuffle=False, **loader_kwargs)
+        if val_ds is not None else None
+    )
+    return train_loader, val_loader
+
+
+def build_dataloaders(cfg: Config, tokenizer: PreTrainedTokenizerBase) -> tuple[DataLoader, DataLoader | None]:
+    # A data.dataset_mix drives the pipeline instead of the single data.dataset.
+    if cfg.data.dataset_mix:
+        return _build_mixed_dataloaders(cfg, tokenizer)
+
+    loader_kwargs = _dataloader_kwargs(cfg)
 
     if cfg.data.streaming and cfg.data.disk_cache_max_gb:
         raw = load_dataset(cfg.data.dataset, streaming=True)

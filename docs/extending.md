@@ -6,6 +6,15 @@ Each entry names the reference example to read before starting.
 `text_column`; no code changes unless the schema differs. No `validation` split (e.g. `HuggingFaceFW/fineweb`, see
 `configs/fineweb_500m.yaml`): set `data.eval_split_size` to carve one off the front of `train`.
 
+**Mix several datasets.** Set `data.dataset_mix` to a YAML file — one `{dataset, [weight], [text_column]}` per
+corpus, a relative path resolved against the config file's directory (see `configs/dataset_mix.yaml` +
+`configs/tinystories_mix.yaml`). While set, `data.dataset` is ignored. `weight` is a corpus's share of the training
+*tokens* (normalised), each corpus is tokenized+packed and cached **independently**, and the packed blocks are
+interleaved by weight — `interleave_datasets(..., stopping_strategy="all_exhausted")` for non-streaming, a small
+`_WeightedInterleave` for streaming. Works with `streaming` and `streaming`+`disk_cache_max_gb` too; the per-corpus
+`text_column` lets corpora with different schemas mix. See docs/data.md's "Dataset mix" for the validation-split and
+zero-block caveats.
+
 **Dataset too large to tokenize/cache up front.** `data.streaming: true` (see
 `configs/tinystories_streaming.yaml`) — trades a full local shuffle and disk cache for a streaming/shuffle-buffer
 approximation on both splits; no other changes needed for a standard HF hub dataset. To also avoid re-fetching

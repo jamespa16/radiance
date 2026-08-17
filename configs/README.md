@@ -10,6 +10,7 @@ Only the fields you need to change — everything else falls back to the datacla
 ## data
 
 - **`dataset`** — HuggingFace `user/dataset` identifier with `train` (and optionally `validation`) splits.
+- **`dataset_mix`** — path to a YAML file listing several corpora to train on together (one `{dataset, [weight], [text_column]}` per corpus; `weight` is that corpus's share of the training tokens, normalised across the mix). While set, `dataset`/`text_column` are ignored and the mix drives the data pipeline; every corpus shares the rest of the `data` section. A relative path resolves against the config file's directory. Works with `streaming` and `streaming`+`disk_cache_max_gb` too. See `configs/dataset_mix.yaml` + `configs/tinystories_mix.yaml`.
 - **`text_column`** — name of the column containing text in the dataset.
 - **`tokenizer`** — HuggingFace tokenizer name or path (e.g. `"gpt2"`).
 - **`seq_len`** — number of tokens per packed sequence; should match `model.max_seq_len`.
