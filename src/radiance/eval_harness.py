@@ -34,6 +34,7 @@ from lm_eval.models.utils import handle_stop_sequences, normalize_gen_kwargs
 
 from radiance.config import resolve_device
 from radiance.generate import generate_tokens, load_checkpoint
+from radiance.model import mask_vocab_padding
 
 
 def _first_stop_index(text: str, stop_seqs: list[str]) -> int | None:
@@ -79,12 +80,7 @@ class RadianceLM(TemplateLM):
     @torch.no_grad()
     def _model_logprobs(self, batched_inps: torch.Tensor) -> torch.Tensor:
         logits = self.model(batched_inps, loop_count=self.loops).logits.float()
-        # Mask the vocab-padding rows (see model.padded_vocab_size, and the identical mask in
-        # generate.generate_tokens): no tokenizer id maps to them, they're never trained toward
-        # -inf (only implicitly, via the softmax denominator), and an untrained row winning the
-        # argmax would silently corrupt both is_greedy and every logprob in this batch.
-        if logits.size(-1) > len(self.tokenizer):
-            logits[..., len(self.tokenizer) :] = float("-inf")
+        mask_vocab_padding(logits, self.tokenizer)
         return F.log_softmax(logits, dim=-1)
 
     @torch.no_grad()
@@ -107,7 +103,19 @@ class RadianceLM(TemplateLM):
 
             for i in idxs:
                 _, context_enc, continuation_enc = requests[i]
+                # Same sanity checks as lm_eval's own HFLM._loglikelihood_tokens. They also make
+                # the slicing below safe: with a non-empty context and
+                # len(continuation_enc) <= max_length, `contlen` is always >= 1, so
+                # `continuation_enc[-contlen:]` can never hit Python's `[-0:] == [0:]` footgun
+                # (a contlen of 0 would slice out the *entire* continuation, mismatching the
+                # empty logprob slice downstream). HFLM asserts on an oversized continuation
+                # rather than truncating it, because truncating would silently score a different
+                # string than the task asked for.
+                assert len(context_enc) > 0, "context must be non-empty"
                 assert len(continuation_enc) > 0, "continuation must be non-empty"
+                assert len(continuation_enc) <= self.max_length, (
+                    f"continuation length {len(continuation_enc)} exceeds max_length {self.max_length}"
+                )
                 # Truncate from the left when context+continuation overflows max_length, keeping
                 # the continuation intact (mirrors lm_eval's own HFLM behavior).
                 total = (context_enc + continuation_enc)[-(self.max_length + 1) :]
@@ -181,7 +189,13 @@ class RadianceLM(TemplateLM):
             max_gen_toks = min(max_gen_toks, self.max_length - 1)
             max_ctx_len = self.max_length - max_gen_toks
 
-            input_ids = self.tokenizer(context, return_tensors="pt")["input_ids"].to(self._device)
+            # add_special_tokens=False matches tok_encode (the loglikelihood path), so a
+            # BOS-prepending tokenizer scores generate_until and loglikelihood tasks under the
+            # same prompt format. Inert for the gpt2 configs today (their fast tokenizer
+            # ignores the flag); pinned by test_generate_until_tokenizes_with_add_special_tokens_false.
+            input_ids = self.tokenizer(
+                context, add_special_tokens=False, return_tensors="pt"
+            )["input_ids"].to(self._device)
             input_ids = input_ids[:, -max_ctx_len:]
 
             generated_ids: list[int] = []

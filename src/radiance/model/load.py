@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Sized
+
 import torch
 
 from radiance.config import Config
@@ -88,3 +90,18 @@ def padded_vocab_size(vocab_size: int, multiple: int) -> int:
     if multiple <= 1:
         return vocab_size
     return ((vocab_size + multiple - 1) // multiple) * multiple
+
+
+def mask_vocab_padding(logits: torch.Tensor, tokenizer: Sized) -> None:
+    """In-place set the padded-vocab rows of `logits` (see padded_vocab_size) to -inf.
+
+    The padding rows have no tokenizer id and are never trained toward -inf (only implicitly,
+    via the softmax denominator), so at inference an unmasked row can win the argmax and
+    silently corrupt whatever consumes the logits: greedy decoding would emit an id that decodes
+    to nothing (corrupting a KV cache for every later step), and a logprob path's is_greedy
+    flips while every logprob's softmax denominator is deflated. Shared by the inference call
+    sites (generate.generate_tokens, eval_harness.RadianceLM._model_logprobs) so the padding
+    convention has one definition; a no-op when the lm_head isn't padded.
+    """
+    if logits.size(-1) > len(tokenizer):
+        logits[..., len(tokenizer) :] = float("-inf")

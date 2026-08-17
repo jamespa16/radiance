@@ -67,3 +67,28 @@ def test_generate_tokens_never_yields_eos(tiny_cfg):
     new_ids = list(generate_tokens(model, tokenizer, input_ids, max_new_tokens=20, temperature=0, device="cpu"))
 
     assert tokenizer.eos_token_id not in new_ids
+
+
+def test_generate_tokens_never_yields_padded_vocab_id(tiny_cfg):
+    """The lm_head is padded past the tokenizer's vocab (model.padded_vocab_size); the padded
+    rows are never trained toward -inf, so an unmasked sampling step can land on one and decode
+    it to nothing. Pinned through the sampling branch rather than greedy: a random-init greedy
+    run falls into a real-token fixed point that never reaches the padded rows, while multinomial
+    gives them their ~1/9 softmax mass per step — with this seed the unmasked run samples padded
+    id 70, so the test fails deterministically if the mask is ever dropped from generate_tokens.
+    (The mask logic itself is unit-tested directly in
+    test_eval_harness.py::test_mask_vocab_padding_masks_only_padded_rows.)"""
+    cfg = tiny_cfg(loop_count=2)
+    model = DenseTransformer(cfg.model, vocab_size=TINY_VOCAB + 8).eval()
+    tokenizer = WordTokenizer(TINY_VOCAB)
+
+    input_ids = torch.tensor([tokenizer("the quick")["input_ids"]])
+    torch.manual_seed(2)
+    new_ids = list(
+        generate_tokens(
+            model, tokenizer, input_ids, max_new_tokens=30, temperature=1.0, top_k=0, device="cpu"
+        )
+    )
+
+    assert new_ids
+    assert all(token_id < TINY_VOCAB for token_id in new_ids)

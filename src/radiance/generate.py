@@ -10,7 +10,11 @@ from transformers import PreTrainedTokenizerBase
 from radiance.config import Config, resolve_device
 from radiance.data import build_tokenizer
 from radiance.sft_data import format_chat_prompt
-from radiance.model import DenseTransformer, load_transformer_from_checkpoint
+from radiance.model import (
+    DenseTransformer,
+    load_transformer_from_checkpoint,
+    mask_vocab_padding,
+)
 
 
 def load_checkpoint(path: str, device: str) -> tuple[DenseTransformer, Config, PreTrainedTokenizerBase]:
@@ -57,11 +61,7 @@ def generate_tokens(
         )
         logits = model(next_input, kv_cache=kv_cache, loop_count=loops).logits[:, -1, :]
 
-        # Mask the vocab-padding rows (see model.padded_vocab_size): no tokenizer id maps to them,
-        # so sampling one would decode to nothing and corrupt the KV cache for every later step.
-        # They're only ever trained down implicitly via the softmax denominator, never to -inf.
-        if logits.size(-1) > len(tokenizer):
-            logits[:, len(tokenizer) :] = float("-inf")
+        mask_vocab_padding(logits, tokenizer)
 
         if temperature == 0:
             next_token = logits.argmax(dim=-1, keepdim=True)
