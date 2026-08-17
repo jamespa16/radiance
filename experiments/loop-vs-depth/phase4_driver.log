@@ -1,0 +1,5 @@
+[driver] === D_moeloop_lr0.01 ===
+[driver] D_moeloop_lr0.01 done in 796s :: [radiance] step   3000 val/loss 1.5507
+[driver] === E_moedense_lr0.01 ===
+[driver] E_moedense_lr0.01 done in 400s :: [radiance] step   3000 val/loss 1.5752
+[driver] ALL DONE

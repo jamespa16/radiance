@@ -1,0 +1,144 @@
+# Radiance V1 — the shipping model. A ~375M-parameter dense transformer trained on fineweb for
+# ~9B tokens (~43h on one RTX 5090), at every architecture setting this repo has an actual
+# measurement for and no setting it doesn't.
+#
+# Sized empirically, not estimated: every number in the table below is a real fwd+bwd+opt.step on
+# this card, one process per arm (docs/results.md's NVFP4 section records a multi-arm sweep in one
+# process reporting a 3.8 GB gap between two *identical* configs — the peak column was allocator
+# noise). `hours@20tpp` is the wall-clock to reach Chinchilla-optimal 20 tokens/active-param;
+# `tok/param@48h` is what each shape actually gets trained to inside a 48-hour budget, which is the
+# comparison that decides this file.
+#
+#   shape                              total    active   tok/s   peak GB  hours@20tpp  tok/param@48h
+#   dense 1024x22, batch 8 x ga 16      375M      375M   57.6k     18.9      36.2          26.5   <- this config
+#   dense 1024x22, batch 8 x ga 4       375M      375M   51.4k     19.0      40.6          23.7
+#   dense 1024x22, batch 4 x ga 8       375M      375M   46.8k     12.1      44.5          21.6
+#   dense 1152x24, batch 8 x ga 4       505M      505M   40.2k     23.5      69.8          13.8
+#   dense 1280x22, batch 8 x ga 4       570M      570M   36.1k     25.4      87.7          10.9
+#   MoE  e32 k4 m0.25 shared 0         1052M      332M   31.5k     24.2      58.5          16.4
+#   MoE  e16 k2 m0.5  shared 0         1169M      346M   29.9k     26.0      64.3          14.9
+#
+# WHY DENSE 375M AND NOT THE 1.17B MoE, given the ask was for the biggest model. Because at a
+# *fixed 48 hours* the MoE is not bigger in the way that matters — it is the same model, trained on
+# 48% fewer tokens. Both MoE arms are active-parameter-matched to this config (332-346M vs 375M),
+# so they compute roughly the same thing per token; they are ~1.8x slower per token because of
+# dispatch, and they cannot use batch 8 (both OOM), which costs the grad-accum amortisation below.
+# The trade is therefore MoE's measured **+0.049** val/loss at matched active parameters
+# (docs/results.md's loop-vs-depth 2x2 — the largest architecture effect recorded in this repo)
+# against dropping from 26.5 to ~15 tokens/param. Halving the token budget is worth several tenths
+# of val/loss at this scale, i.e. roughly 4-5x the MoE gain. Dense wins, and not narrowly.
+#
+# That verdict is budget-dependent, not permanent: MoE is the right call the moment the compute
+# budget stops being the binding constraint (more GPUs, or a run measured in weeks). It is the
+# first thing to reach for when this run is repeated at greater length — see configs/fineweb_moe.yaml.
+#
+# WHY loop_count: 1, when the weight-shared loop is the central architectural idea here. Because
+# the five-arm A/B in experiments/loop-vs-depth/ measured it and it is **dominated**: at equal
+# FLOPs real depth beats recursion by 0.050 and the gap widens with training length, and a shallow
+# MoE model beats the looped model outright on a third of the compute. The loop is not disabled
+# here as an oversight or a simplification — it is the measured-worse arm. Setting loop_count: 1
+# also makes loop_iter_conditioning / loop_input_injection / BPTT windowing / ACT inert by
+# construction, which is why none of them appear in this file.
+
+run_name: radiance-v1-375m
+
+data:
+  dataset: HuggingFaceFW/fineweb # ~15TB, train split only (no validation split exists)
+  text_column: text
+  tokenizer: gpt2
+  seq_len: 1024 # every measurement in this repo is at 1024, and the long-context play (NSA) was
+  # measured negative and removed. 2048 would buy an unmeasured axis at ~40% of the token budget.
+  num_workers: 8 # 32 cores available; at 57.6k tok/s the loader has to keep up with the GPU
+  cache_dir: .cache/radiance/tokenized
+  streaming: true # required: fineweb is far too large to tokenize/cache to disk up front
+  shuffle_buffer_size: 10000
+  eval_split_size: 2000 # fineweb has no validation split — carve a deterministic held-out slice
+  disk_cache_max_gb: 100 # a 43h run restarted at hour 30 should not re-stream from scratch
+  disk_cache_shard_size: 100
+  prefetch_factor: 4
+
+model:
+  d_model: 1024
+  head_dim: 64 # 16 heads
+  n_layers: 22
+  loop_count: 1 # see file header — the loop is the measured-worse arm, not an omission
+  ffn_mult: 2.0
+  ffn_depth: 2
+  dropout: 0.0 # doc_attention_mask uses flex_attention, which has no attention-weight dropout,
+  # and at 26.5 tokens/param on 15TB of unique text there is nothing to overfit to.
+  max_seq_len: 1024
+
+  # muP carries this repo's one validated Muon lr across the 4x width jump from the d_model: 256 it
+  # was tuned at. This is the documented mechanism for exactly that (docs/optim.md) rather than
+  # guessing a fineweb-width lr from nothing — but see the header note in docs/results.md: nothing
+  # has *established* 1.0e-2 at this width. Run the 3-point probe before committing 43 hours.
+  mup_base_d_model: 256
+
+  # Everything below is left at its default deliberately. The defaults are on and inert-by-
+  # construction (qk_norm, value_residual, attn_out_gate, doc_attention_mask, z_loss), and each of
+  # the opt-in features was considered and declined on a measurement:
+  #   use_moe          -> see the file header. The budget, not the feature, is what rules it out.
+  #   use_router (ACT) -> inert at loop_count: 1; it is a loop feature and the loop is gone.
+  #   hyper_conn_streams -> stays 1: measured neutral-to-negative (docs/results.md), and it is also
+  #                       a loop feature.
+  #   use_diff_attn    -> measured positive (+0.008-0.012) but costs 1.34x step time, and
+  #                       docs/results.md says plainly that the fixed-*compute* verdict is unchecked
+  #                       and could go either way. A 48h budget IS a fixed-compute comparison, so
+  #                       this is precisely the setting its own caveat warns against using it in.
+  #   fp4_linear       -> eligible at these dims (1024 and ffn_dim 2048 are both 128-multiples) and
+  #                       worth 1.20x, which converts directly into tokens. Declined because there
+  #                       is still **no quality A/B** (docs/nvfp4.md), and a release model is the
+  #                       wrong place to find out. It is also incompatible with use_moe.
+  #   mtp_heads        -> untested here, and each head materialises its own vocab-sized logits.
+
+train:
+  # Pinned, verified, and NOT auto-sized. auto_batch_size now reserves for Muon's Newton-Schulz
+  # transient (muon_orthogonalize_reserve_bytes), but these two values are measured on this exact
+  # shape and there is no reason to let an estimate re-derive them.
+  batch_size: 8
+  grad_accum_steps: 16 # effective batch 128 = 131,072 tokens/optimizer step. This is a throughput
+  # setting, not just a statistical one: it amortises Muon's flat per-optimizer-step Newton-Schulz
+  # cost, measured here at 51.4k -> 57.6k tok/s going from ga 4 to ga 16 (+12%) with peak memory
+  # unchanged (19.01 -> 18.91 GB — accumulation adds no activation memory). docs/results.md records
+  # the same effect worth 1.58x at a narrower shape.
+  auto_batch_size: false
+
+  optimizer: muon # the largest single quality win on record: it passed AdamW's *final* 400-step
+  # loss in roughly half the steps (docs/results.md).
+  lr: 1.0e-2 # carried across width by mup_base_d_model; see the probe note above
+  muon_lr: 0.02
+  weight_decay: 0.01
+  warmup_ratio: 0.02 # ~1,370 steps. The default 0.04 is tuned for runs of a few thousand steps;
+  # at 68k steps that would spend 2,750 steps warming up.
+  grad_clip: 1.0
+
+  lr_schedule: cosine # every A/B on record uses cosine. If the 48h budget is a hard wall rather
+  # than a target, switch to "wsd": it holds at full lr and decays only over the last
+  # wsd_decay_ratio of the run, so the run can be cut short or extended without invalidating the
+  # schedule — which cosine cannot do, since its shape depends on max_steps.
+
+  tokens_per_param: 24 # -> ~9.0B tokens, ~68,700 steps, ~43h at the measured 57.6k tok/s. Slightly
+  # past Chinchilla-optimal 20, which is the right side to err on for a model meant to be served:
+  # it buys quality at fixed inference cost. max_steps is derived from num_active_parameters() and
+  # printed at run start. Drop to 12 for a ~22h run; the schedule rescales with it.
+  # NOTE: runs with different tokens_per_param are NOT comparable at the same step number — warmup
+  # and cosine both scale with max_steps. See docs/results.md's loop-vs-depth methodology findings.
+
+  log_every: 20
+  eval_every: 500
+  eval_max_batches: 50
+  save_every: 500 # train.py keeps only the newest checkpoint (it unlinks older step_*.pt before
+  # saving), so this is ~3.2 GB steady-state, not 3.2 GB per save.
+  output_dir: checkpoints/v1
+  resume_from: auto # a 43-hour run will be interrupted. This restores optimizer moments and the
+  # LR schedule, not just the weights.
+
+  seed: 42
+  device: auto
+  compile: true
+  dtype: bf16
+
+wandb:
+  project: radiance
+  entity: null
+  mode: online

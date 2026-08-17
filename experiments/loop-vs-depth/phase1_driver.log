@@ -1,0 +1,19 @@
+[driver] === A_dense_lr0.003 ===
+[driver] A_dense_lr0.003 done in 90s :: [radiance] step    400 val/loss 2.1575
+[driver] === A_dense_lr0.01 ===
+[driver] A_dense_lr0.01 done in 78s :: [radiance] step    400 val/loss 2.0859
+[driver] === A_dense_lr0.03 ===
+[driver] A_dense_lr0.03 done in 77s :: [radiance] step    400 val/loss 2.0850
+[driver] === B_looped_lr0.003 ===
+[driver] B_looped_lr0.003 done in 153s :: [radiance] step    400 val/loss 2.1479
+[driver] === B_looped_lr0.01 ===
+[driver] B_looped_lr0.01 done in 153s :: [radiance] step    400 val/loss 2.0983
+[driver] === B_looped_lr0.03 ===
+[driver] B_looped_lr0.03 done in 153s :: [radiance] step    400 val/loss 2.1239
+[driver] === C_deep_lr0.003 ===
+[driver] C_deep_lr0.003 done in 229s :: [radiance] step    400 val/loss 2.0914
+[driver] === C_deep_lr0.01 ===
+[driver] C_deep_lr0.01 done in 230s :: [radiance] step    400 val/loss 2.0365
+[driver] === C_deep_lr0.03 ===
+[driver] C_deep_lr0.03 done in 229s :: [radiance] step    400 val/loss 2.0400
+[driver] ALL DONE

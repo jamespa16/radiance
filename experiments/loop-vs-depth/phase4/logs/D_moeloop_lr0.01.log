@@ -1,0 +1,156 @@
+[radiance] padding vocab 50,257 -> 50,304 (multiple of 128) for tensor-core-aligned lm_head matmuls
+[radiance] grad_checkpoint on, so compiling without CUDA graphs (mode=None instead of 'reduce-overhead').
+[radiance] optimizer=muon (muon_lr=0.02 over 78 tensors, adamw lr=0.01 over the rest)
+[radiance] step     25/3000 loss 8.7501 lm 8.6395 lr 8.667e-04
+[radiance] step     50/3000 loss 5.9453 lm 5.8340 lr 1.700e-03
+[radiance] step     75/3000 loss 4.9705 lm 4.8602 lr 2.533e-03
+[radiance] step    100/3000 loss 4.0755 lm 3.9653 lr 3.367e-03
+[radiance] step    125/3000 loss 3.6540 lm 3.5418 lr 4.200e-03
+[radiance] step    150/3000 loss 3.1636 lm 3.0503 lr 5.033e-03
+[radiance] step    175/3000 loss 2.9570 lm 2.8425 lr 5.867e-03
+[radiance] step    200/3000 loss 2.8373 lm 2.7221 lr 6.700e-03
+[radiance] step    225/3000 loss 2.8370 lm 2.7215 lr 7.533e-03
+[radiance] step    250/3000 loss 2.6198 lm 2.5037 lr 8.367e-03
+W0811 15:06:58.669000 42400 torch/_dynamo/variables/tensor.py:1759] [4/3] Graph break from `Tensor.item()`, consider setting:
+W0811 15:06:58.669000 42400 torch/_dynamo/variables/tensor.py:1759] [4/3]     torch._dynamo.config.capture_scalar_outputs = True
+W0811 15:06:58.669000 42400 torch/_dynamo/variables/tensor.py:1759] [4/3] or:
+W0811 15:06:58.669000 42400 torch/_dynamo/variables/tensor.py:1759] [4/3]     env TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS=1
+W0811 15:06:58.669000 42400 torch/_dynamo/variables/tensor.py:1759] [4/3] to include these operations in the captured graph.
+W0811 15:06:58.669000 42400 torch/_dynamo/variables/tensor.py:1759] [4/3] 
+W0811 15:06:58.669000 42400 torch/_dynamo/variables/tensor.py:1759] [4/3] Graph break: from user code at:
+W0811 15:06:58.669000 42400 torch/_dynamo/variables/tensor.py:1759] [4/3]   File "/home/james/dev/radiance/src/radiance/model.py", line 1151, in _maybe_checkpoint
+W0811 15:06:58.669000 42400 torch/_dynamo/variables/tensor.py:1759] [4/3]     return fn(*args)
+W0811 15:06:58.669000 42400 torch/_dynamo/variables/tensor.py:1759] [4/3]   File "/home/james/dev/radiance/src/radiance/model.py", line 961, in forward
+W0811 15:06:58.669000 42400 torch/_dynamo/variables/tensor.py:1759] [4/3]     x = x + self.ffn(self.ln2(x, variant), variant)
+W0811 15:06:58.669000 42400 torch/_dynamo/variables/tensor.py:1759] [4/3]             ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+W0811 15:06:58.669000 42400 torch/_dynamo/variables/tensor.py:1759] [4/3]   File "/home/james/dev/radiance/src/radiance/model.py", line 856, in forward
+W0811 15:06:58.669000 42400 torch/_dynamo/variables/tensor.py:1759] [4/3]     capacity = _moe_capacity(self.cfg, n_tokens, assigned if full_capacity else None)
+W0811 15:06:58.669000 42400 torch/_dynamo/variables/tensor.py:1759] [4/3]   File "/home/james/dev/radiance/src/radiance/model.py", line 689, in _moe_capacity
+W0811 15:06:58.669000 42400 torch/_dynamo/variables/tensor.py:1759] [4/3]     return _moe_eval_capacity(assigned, n_tokens)
+W0811 15:06:58.669000 42400 torch/_dynamo/variables/tensor.py:1759] [4/3]   File "/home/james/dev/radiance/src/radiance/model.py", line 671, in _moe_eval_capacity
+W0811 15:06:58.669000 42400 torch/_dynamo/variables/tensor.py:1759] [4/3]     peak = max(1, int(assigned.sum(dim=0).max().item()))
+W0811 15:06:58.669000 42400 torch/_dynamo/variables/tensor.py:1759] [4/3]                       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+W0811 15:06:58.669000 42400 torch/_dynamo/variables/tensor.py:1759] [4/3] 
+W0811 15:06:58.669000 42400 torch/_dynamo/variables/tensor.py:1759] [4/3] 
+[radiance] step    250 val/loss 2.6008
+[radiance] step    275/3000 loss 2.6605 lm 2.5440 lr 9.200e-03
+[radiance] step    300/3000 loss 2.4987 lm 2.3818 lr 1.003e-02
+[radiance] step    325/3000 loss 2.5239 lm 2.4072 lr 1.087e-02
+[radiance] step    350/3000 loss 2.5170 lm 2.4005 lr 1.170e-02
+[radiance] step    375/3000 loss 2.3885 lm 2.2719 lr 1.253e-02
+[radiance] step    400/3000 loss 2.4422 lm 2.3255 lr 1.337e-02
+[radiance] step    425/3000 loss 2.3836 lm 2.2663 lr 1.420e-02
+[radiance] step    450/3000 loss 2.3571 lm 2.2399 lr 1.503e-02
+[radiance] step    475/3000 loss 2.2534 lm 2.1365 lr 1.587e-02
+[radiance] step    500/3000 loss 2.2588 lm 2.1418 lr 1.670e-02
+[radiance] step    500 val/loss 2.2219
+[radiance] step    525/3000 loss 2.3123 lm 2.1961 lr 1.753e-02
+[radiance] step    550/3000 loss 2.2844 lm 2.1678 lr 1.837e-02
+[radiance] step    575/3000 loss 2.3387 lm 2.2223 lr 1.920e-02
+[radiance] step    600/3000 loss 2.2071 lm 2.0899 lr 2.000e-02
+[radiance] step    625/3000 loss 2.1989 lm 2.0827 lr 2.000e-02
+[radiance] step    650/3000 loss 2.1327 lm 2.0159 lr 1.998e-02
+[radiance] step    675/3000 loss 2.1709 lm 2.0546 lr 1.996e-02
+[radiance] step    700/3000 loss 2.0528 lm 1.9364 lr 1.992e-02
+[radiance] step    725/3000 loss 2.1229 lm 2.0059 lr 1.988e-02
+[radiance] step    750/3000 loss 2.1654 lm 2.0490 lr 1.983e-02
+[radiance] step    750 val/loss 2.0560
+[radiance] step    775/3000 loss 2.1596 lm 2.0430 lr 1.976e-02
+[radiance] step    800/3000 loss 2.1518 lm 2.0355 lr 1.969e-02
+[radiance] step    825/3000 loss 2.1260 lm 2.0097 lr 1.961e-02
+[radiance] step    850/3000 loss 2.0757 lm 1.9592 lr 1.952e-02
+[radiance] step    875/3000 loss 2.0923 lm 1.9756 lr 1.942e-02
+[radiance] step    900/3000 loss 2.0001 lm 1.8830 lr 1.931e-02
+[radiance] step    925/3000 loss 2.0667 lm 1.9503 lr 1.920e-02
+[radiance] step    950/3000 loss 1.9883 lm 1.8715 lr 1.907e-02
+[radiance] step    975/3000 loss 2.0252 lm 1.9084 lr 1.894e-02
+[radiance] step   1000/3000 loss 2.0411 lm 1.9240 lr 1.879e-02
+[radiance] step   1000 val/loss 1.9401
+[radiance] step   1025/3000 loss 2.0801 lm 1.9630 lr 1.864e-02
+[radiance] step   1050/3000 loss 1.8756 lm 1.7581 lr 1.848e-02
+[radiance] step   1075/3000 loss 2.0352 lm 1.9190 lr 1.832e-02
+[radiance] step   1100/3000 loss 1.9709 lm 1.8536 lr 1.814e-02
+[radiance] step   1125/3000 loss 1.9646 lm 1.8482 lr 1.796e-02
+[radiance] step   1150/3000 loss 1.9766 lm 1.8589 lr 1.777e-02
+[radiance] step   1175/3000 loss 1.8929 lm 1.7761 lr 1.757e-02
+[radiance] step   1200/3000 loss 1.8723 lm 1.7549 lr 1.736e-02
+[radiance] step   1225/3000 loss 1.9279 lm 1.8108 lr 1.715e-02
+[radiance] step   1250/3000 loss 1.9271 lm 1.8104 lr 1.693e-02
+[radiance] step   1250 val/loss 1.8569
+[radiance] step   1275/3000 loss 1.8744 lm 1.7571 lr 1.671e-02
+[radiance] step   1300/3000 loss 2.0360 lm 1.9203 lr 1.648e-02
+[radiance] step   1325/3000 loss 1.8537 lm 1.7370 lr 1.624e-02
+[radiance] step   1350/3000 loss 1.9540 lm 1.8374 lr 1.600e-02
+[radiance] step   1375/3000 loss 1.9230 lm 1.8058 lr 1.575e-02
+[radiance] step   1400/3000 loss 1.8836 lm 1.7668 lr 1.550e-02
+[radiance] step   1425/3000 loss 1.9724 lm 1.8556 lr 1.524e-02
+[radiance] step   1450/3000 loss 1.8377 lm 1.7207 lr 1.498e-02
+[radiance] step   1475/3000 loss 1.8806 lm 1.7640 lr 1.471e-02
+[radiance] step   1500/3000 loss 1.8927 lm 1.7760 lr 1.444e-02
+[radiance] step   1500 val/loss 1.7929
+[radiance] step   1525/3000 loss 1.8076 lm 1.6906 lr 1.417e-02
+[radiance] step   1550/3000 loss 1.8975 lm 1.7810 lr 1.389e-02
+[radiance] step   1575/3000 loss 1.7554 lm 1.6386 lr 1.361e-02
+[radiance] step   1600/3000 loss 1.8613 lm 1.7448 lr 1.333e-02
+[radiance] step   1625/3000 loss 1.7535 lm 1.6369 lr 1.304e-02
+[radiance] step   1650/3000 loss 1.8049 lm 1.6880 lr 1.276e-02
+[radiance] step   1675/3000 loss 1.7944 lm 1.6775 lr 1.247e-02
+[radiance] step   1700/3000 loss 1.8982 lm 1.7818 lr 1.217e-02
+[radiance] step   1725/3000 loss 1.8605 lm 1.7439 lr 1.188e-02
+[radiance] step   1750/3000 loss 1.8241 lm 1.7078 lr 1.159e-02
+[radiance] step   1750 val/loss 1.7332
+[radiance] step   1775/3000 loss 1.7895 lm 1.6729 lr 1.129e-02
+[radiance] step   1800/3000 loss 1.7782 lm 1.6617 lr 1.100e-02
+[radiance] step   1825/3000 loss 1.8173 lm 1.7010 lr 1.071e-02
+[radiance] step   1850/3000 loss 1.7993 lm 1.6826 lr 1.041e-02
+[radiance] step   1875/3000 loss 1.8045 lm 1.6882 lr 1.012e-02
+[radiance] step   1900/3000 loss 1.7012 lm 1.5845 lr 9.825e-03
+[radiance] step   1925/3000 loss 1.7056 lm 1.5888 lr 9.534e-03
+[radiance] step   1950/3000 loss 1.7659 lm 1.6492 lr 9.244e-03
+[radiance] step   1975/3000 loss 1.7922 lm 1.6755 lr 8.956e-03
+[radiance] step   2000/3000 loss 1.8905 lm 1.7743 lr 8.671e-03
+[radiance] step   2000 val/loss 1.6812
+[radiance] step   2025/3000 loss 1.6904 lm 1.5738 lr 8.387e-03
+[radiance] step   2050/3000 loss 1.7488 lm 1.6324 lr 8.107e-03
+[radiance] step   2075/3000 loss 1.7090 lm 1.5925 lr 7.830e-03
+[radiance] step   2100/3000 loss 1.7670 lm 1.6506 lr 7.556e-03
+[radiance] step   2125/3000 loss 1.7056 lm 1.5890 lr 7.286e-03
+[radiance] step   2150/3000 loss 1.6507 lm 1.5336 lr 7.019e-03
+[radiance] step   2175/3000 loss 1.7338 lm 1.6174 lr 6.757e-03
+[radiance] step   2200/3000 loss 1.7174 lm 1.6007 lr 6.500e-03
+[radiance] step   2225/3000 loss 1.6309 lm 1.5141 lr 6.247e-03
+[radiance] step   2250/3000 loss 1.6751 lm 1.5585 lr 6.000e-03
+[radiance] step   2250 val/loss 1.6333
+[radiance] step   2275/3000 loss 1.7254 lm 1.6087 lr 5.758e-03
+[radiance] step   2300/3000 loss 1.5934 lm 1.4762 lr 5.521e-03
+[radiance] step   2325/3000 loss 1.6681 lm 1.5514 lr 5.290e-03
+[radiance] step   2350/3000 loss 1.7771 lm 1.6608 lr 5.066e-03
+[radiance] step   2375/3000 loss 1.6636 lm 1.5468 lr 4.848e-03
+[radiance] step   2400/3000 loss 1.6878 lm 1.5708 lr 4.636e-03
+[radiance] step   2425/3000 loss 1.5474 lm 1.4304 lr 4.431e-03
+[radiance] step   2450/3000 loss 1.6921 lm 1.5757 lr 4.233e-03
+[radiance] step   2475/3000 loss 1.6305 lm 1.5137 lr 4.043e-03
+[radiance] step   2500/3000 loss 1.6585 lm 1.5419 lr 3.860e-03
+[radiance] step   2500 val/loss 1.5957
+[radiance] step   2525/3000 loss 1.6207 lm 1.5039 lr 3.684e-03
+[radiance] step   2550/3000 loss 1.6135 lm 1.4969 lr 3.517e-03
+[radiance] step   2575/3000 loss 1.7061 lm 1.5897 lr 3.357e-03
+[radiance] step   2600/3000 loss 1.6222 lm 1.5056 lr 3.206e-03
+[radiance] step   2625/3000 loss 1.7386 lm 1.6222 lr 3.063e-03
+[radiance] step   2650/3000 loss 1.7202 lm 1.6035 lr 2.928e-03
+[radiance] step   2675/3000 loss 1.5984 lm 1.4811 lr 2.802e-03
+[radiance] step   2700/3000 loss 1.6218 lm 1.5050 lr 2.685e-03
+[radiance] step   2725/3000 loss 1.5252 lm 1.4082 lr 2.577e-03
+[radiance] step   2750/3000 loss 1.6043 lm 1.4874 lr 2.478e-03
+[radiance] step   2750 val/loss 1.5677
+[radiance] step   2775/3000 loss 1.6094 lm 1.4927 lr 2.388e-03
+[radiance] step   2800/3000 loss 1.5949 lm 1.4783 lr 2.307e-03
+[radiance] step   2825/3000 loss 1.7283 lm 1.6122 lr 2.235e-03
+[radiance] step   2850/3000 loss 1.7524 lm 1.6363 lr 2.173e-03
+[radiance] step   2875/3000 loss 1.4577 lm 1.3405 lr 2.120e-03
+[radiance] step   2900/3000 loss 1.5856 lm 1.4690 lr 2.077e-03
+[radiance] step   2925/3000 loss 1.5825 lm 1.4657 lr 2.043e-03
+[radiance] step   2950/3000 loss 1.5639 lm 1.4473 lr 2.019e-03
+[radiance] step   2975/3000 loss 1.5146 lm 1.3976 lr 2.005e-03
+[radiance] step   3000/3000 loss 1.7263 lm 1.6101 lr 2.000e-03
+[radiance] step   3000 val/loss 1.5507

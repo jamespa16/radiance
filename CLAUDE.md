@@ -16,6 +16,7 @@ what is written down there is a measurement or a bug that cost a training run, n
 | [docs/post-training.md](docs/post-training.md) | SFT and DPO |
 | [docs/eval.md](docs/eval.md) | `eval_harness.py` — standard benchmarks (HellaSwag, PIQA, ARC, ...) via lm-evaluation-harness |
 | [docs/results.md](docs/results.md) | **every A/B ever run here**, and the cautions for running a new one |
+| [experiments/](experiments/) | the harness + working notes behind the larger A/Bs, when the result alone isn't the whole story |
 | [docs/extending.md](docs/extending.md) | how to add a dataset / model variant / optimizer / numeric format |
 
 Comments in `configs/`, `tests/` and `src/` that refer to "CLAUDE.md's `optim.py` section", "Measured results" or

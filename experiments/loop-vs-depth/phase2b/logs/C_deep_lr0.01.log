@@ -1,0 +1,72 @@
+[radiance] padding vocab 50,257 -> 50,304 (multiple of 128) for tensor-core-aligned lm_head matmuls
+[radiance] optimizer=muon (muon_lr=0.02 over 147 tensors, adamw lr=0.01 over the rest)
+[radiance] step     25/3000 loss 8.5081 lm 8.4982 lr 8.667e-04
+[radiance] step     50/3000 loss 5.7239 lm 5.7150 lr 1.700e-03
+[radiance] step     75/3000 loss 4.8822 lm 4.8731 lr 2.533e-03
+[radiance] step    100/3000 loss 3.9713 lm 3.9608 lr 3.367e-03
+[radiance] step    125/3000 loss 3.4325 lm 3.4207 lr 4.200e-03
+[radiance] step    150/3000 loss 3.1593 lm 3.1462 lr 5.033e-03
+[radiance] step    175/3000 loss 2.8472 lm 2.8332 lr 5.867e-03
+[radiance] step    200/3000 loss 2.7429 lm 2.7279 lr 6.700e-03
+[radiance] step    225/3000 loss 2.6249 lm 2.6096 lr 7.533e-03
+[radiance] step    250/3000 loss 2.5467 lm 2.5311 lr 8.367e-03
+[radiance] step    250 val/loss 2.5659
+[radiance] step    275/3000 loss 2.4995 lm 2.4836 lr 9.200e-03
+[radiance] step    300/3000 loss 2.4116 lm 2.3952 lr 1.003e-02
+[radiance] step    325/3000 loss 2.4106 lm 2.3943 lr 1.087e-02
+[radiance] step    350/3000 loss 2.2886 lm 2.2723 lr 1.170e-02
+[radiance] step    375/3000 loss 2.3046 lm 2.2884 lr 1.253e-02
+[radiance] step    400/3000 loss 2.2557 lm 2.2395 lr 1.337e-02
+[radiance] step    425/3000 loss 2.2856 lm 2.2695 lr 1.420e-02
+[radiance] step    450/3000 loss 2.1264 lm 2.1100 lr 1.503e-02
+[radiance] step    475/3000 loss 2.1695 lm 2.1534 lr 1.587e-02
+[radiance] step    500/3000 loss 2.1812 lm 2.1648 lr 1.670e-02
+[radiance] step    500 val/loss 2.2200
+[radiance] step    525/3000 loss 2.1687 lm 2.1528 lr 1.753e-02
+[radiance] step    550/3000 loss 2.2611 lm 2.2454 lr 1.837e-02
+[radiance] step    575/3000 loss 2.1633 lm 2.1472 lr 1.920e-02
+[radiance] step    600/3000 loss 2.2077 lm 2.1921 lr 2.000e-02
+[radiance] step    625/3000 loss 2.0533 lm 2.0373 lr 2.000e-02
+[radiance] step    650/3000 loss 2.1542 lm 2.1383 lr 1.998e-02
+[radiance] step    675/3000 loss 2.0982 lm 2.0824 lr 1.996e-02
+[radiance] step    700/3000 loss 2.0524 lm 2.0363 lr 1.992e-02
+[radiance] step    725/3000 loss 2.0811 lm 2.0650 lr 1.988e-02
+[radiance] step    750/3000 loss 2.0555 lm 2.0395 lr 1.983e-02
+[radiance] step    750 val/loss 2.0362
+[radiance] step    775/3000 loss 1.9997 lm 1.9835 lr 1.976e-02
+[radiance] step    800/3000 loss 2.0261 lm 2.0100 lr 1.969e-02
+[radiance] step    825/3000 loss 1.9557 lm 1.9397 lr 1.961e-02
+[radiance] step    850/3000 loss 1.9150 lm 1.8985 lr 1.952e-02
+[radiance] step    875/3000 loss 1.8663 lm 1.8500 lr 1.942e-02
+[radiance] step    900/3000 loss 1.8764 lm 1.8598 lr 1.931e-02
+[radiance] step    925/3000 loss 1.8541 lm 1.8377 lr 1.920e-02
+[radiance] step    950/3000 loss 1.8260 lm 1.8093 lr 1.907e-02
+[radiance] step    975/3000 loss 1.7929 lm 1.7765 lr 1.894e-02
+[radiance] step   1000/3000 loss 1.9469 lm 1.9310 lr 1.879e-02
+[radiance] step   1000 val/loss 1.9211
+[radiance] step   1025/3000 loss 1.9014 lm 1.8851 lr 1.864e-02
+[radiance] step   1050/3000 loss 1.9007 lm 1.8843 lr 1.848e-02
+[radiance] step   1075/3000 loss 1.8485 lm 1.8321 lr 1.832e-02
+[radiance] step   1100/3000 loss 1.8643 lm 1.8480 lr 1.814e-02
+[radiance] step   1125/3000 loss 1.8587 lm 1.8426 lr 1.796e-02
+[radiance] step   1150/3000 loss 1.7347 lm 1.7180 lr 1.777e-02
+[radiance] step   1175/3000 loss 1.7544 lm 1.7378 lr 1.757e-02
+[radiance] step   1200/3000 loss 1.8709 lm 1.8544 lr 1.736e-02
+[radiance] step   1225/3000 loss 1.8770 lm 1.8608 lr 1.715e-02
+[radiance] step   1250/3000 loss 1.8488 lm 1.8326 lr 1.693e-02
+[radiance] step   1250 val/loss 1.8434
+[radiance] step   1275/3000 loss 1.8708 lm 1.8547 lr 1.671e-02
+[radiance] step   1300/3000 loss 1.7671 lm 1.7505 lr 1.648e-02
+[radiance] step   1325/3000 loss 1.7051 lm 1.6884 lr 1.624e-02
+[radiance] step   1350/3000 loss 1.8603 lm 1.8442 lr 1.600e-02
+[radiance] step   1375/3000 loss 1.7153 lm 1.6985 lr 1.575e-02
+[radiance] step   1400/3000 loss 1.8456 lm 1.8295 lr 1.550e-02
+[radiance] step   1425/3000 loss 1.6810 lm 1.6644 lr 1.524e-02
+[radiance] step   1450/3000 loss 1.7378 lm 1.7215 lr 1.498e-02
+[radiance] step   1475/3000 loss 1.7424 lm 1.7260 lr 1.471e-02
+[radiance] step   1500/3000 loss 1.6938 lm 1.6771 lr 1.444e-02
+[radiance] step   1500 val/loss 1.7786
+[W811 14:14:23.436459760 CUDACachingAllocator.cpp:508] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 55967744, total: 33667612672).
+[W811 14:14:23.142275310 CUDACachingAllocator.cpp:508] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 45481984, total: 33667612672).
+[W811 14:14:23.156700936 CUDACachingAllocator.cpp:508] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 49676288, total: 33667612672).
+[radiance] CUDA OOM at step 1502, ending run early.

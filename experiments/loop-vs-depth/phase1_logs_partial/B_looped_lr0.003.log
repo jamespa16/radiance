@@ -1,0 +1,48 @@
+[radiance] padding vocab 50,257 -> 50,304 (multiple of 128) for tensor-core-aligned lm_head matmuls
+[radiance] optimizer=muon (muon_lr=0.02 over 53 tensors, adamw lr=0.003 over the rest)
+[radiance] step     25/400 loss 6.6758 lm 6.6669 lr 6.500e-03
+[radiance] step     50/400 loss 4.5248 lm 4.5152 lr 1.275e-02
+[radiance] step     75/400 loss 3.4818 lm 3.4697 lr 1.900e-02
+[radiance] step    100/400 loss 3.1762 lm 3.1628 lr 1.983e-02
+[radiance] step    100 val/loss 3.1504
+[radiance] step    125/400 loss 2.8386 lm 2.8244 lr 1.914e-02
+[radiance] step    150/400 loss 2.7475 lm 2.7331 lr 1.796e-02
+[radiance] step    175/400 loss 2.5990 lm 2.5836 lr 1.636e-02
+[W811 11:50:05.814906125 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 3296722944 bytes (free: 3296526336, total: 33670758400).
+[W811 11:50:05.035277289 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 3296722944 bytes (free: 3292332032, total: 33670758400).
+[W811 11:50:05.079426428 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 3296722944 bytes (free: 3296526336, total: 33670758400).
+Traceback (most recent call last):
+  File "/home/james/dev/radiance/.venv/bin/radiance-train", line 10, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/home/james/dev/radiance/src/radiance/train.py", line 628, in main
+    train(cfg)
+    ~~~~~^^^^^
+  File "/home/james/dev/radiance/src/radiance/train.py", line 508, in train
+    scaler.scale(chunk_loss * chunk_weight).backward()
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/home/james/dev/radiance/.venv/lib/python3.13/site-packages/torch/_tensor.py", line 623, in backward
+    torch.autograd.backward(
+    ~~~~~~~~~~~~~~~~~~~~~~~^
+        self, gradient, retain_graph, create_graph, inputs=inputs
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/home/james/dev/radiance/.venv/lib/python3.13/site-packages/torch/autograd/__init__.py", line 395, in backward
+    _engine_run_backward(
+    ~~~~~~~~~~~~~~~~~~~~^
+        tensors,
+        ^^^^^^^^
+    ...<5 lines>...
+        accumulate_grad=True,
+        ^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/home/james/dev/radiance/.venv/lib/python3.13/site-packages/torch/autograd/graph.py", line 979, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        t_outputs, *args, **kwargs
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )  # Calls into the C++ engine to run the backward pass
+    ^
+RuntimeError: NVML_SUCCESS == DriverAPI::get()->nvmlInit_v2_() INTERNAL ASSERT FAILED at "/__w/pytorch/pytorch/c10/cuda/CUDACachingAllocator.cpp":1377, please report a bug to PyTorch. 

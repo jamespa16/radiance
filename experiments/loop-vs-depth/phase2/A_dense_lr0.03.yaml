@@ -1,0 +1,47 @@
+run_name: A_dense_lr0.03
+
+data:
+  dataset: roneneldan/TinyStories
+  text_column: text
+  tokenizer: gpt2
+  seq_len: 512
+  num_workers: 4
+  cache_dir: .cache/radiance/tokenized
+
+model:
+  d_model: 256
+  head_dim: 64
+  n_layers: 6
+  loop_count: 1
+  ffn_mult: 4.0
+  ffn_depth: 3
+  dropout: 0.0
+  max_seq_len: 512
+
+train:
+  # Micro-batch halved with grad_accum making up the difference, so effective_batch_size stays 32 --
+  # the value arm A and CLAUDE.md's own lr sweep were measured at. Arm B (21 executed blocks) peaks
+  # near 30GB at micro-batch 32 and OOMs allocating the 1.65GB logits tensor. Activation memory
+  # scales with the micro-batch, not the effective batch, so this buys ~2x headroom for free.
+  batch_size: 16
+  grad_accum_steps: 2
+  auto_batch_size: false
+  lr: 0.03
+  muon_lr: 0.02
+  weight_decay: 0.01
+  warmup_ratio: 0.2
+  max_steps: 3000
+  grad_clip: 1.0
+  log_every: 25
+  eval_every: 250
+  save_every: 1000000
+  output_dir: /home/james/radiance-ab/phase2/ckpt/A_dense_lr0.03
+  seed: 42
+  device: auto
+  compile: true
+  dtype: bf16
+
+wandb:
+  project: radiance
+  entity: null
+  mode: disabled
