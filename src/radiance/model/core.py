@@ -51,6 +51,16 @@ class LoopContext:
     record_kv: bool = False  # have blocks hand back their post-RoPE (k, v) so an ACT iteration can
     # seed the retained K/V store the sparse iterations read from. Off by default so the common path
     # returns None there and nothing extra is kept alive for backward.
+    key_padding_mask: torch.Tensor | None = None  # (batch, kv_len) bool, True = real token. Only
+    # ever set by batched generation (right-padded prompts of different lengths sharing one
+    # KVCache); the plain SDPA path in CausalSelfAttention.forward folds it into an explicit
+    # causal+padding attn_mask instead of the usual is_causal bool. No grad flows through it.
+    key_positions: torch.Tensor | None = None  # (batch, kv_len) int, each row's *true* absolute
+    # position for every cached key — not a shared offset, since a shorter (more-padded) row's
+    # decode tokens run ahead of its own true sequence length by however much padding it carried
+    # from prefill. Set together with key_padding_mask; its trailing seq_len columns also double
+    # as this call's query positions for both RoPE (DenseTransformer.forward) and the causal
+    # comparison in padded_causal_mask.
 
     @property
     def variant(self) -> int:

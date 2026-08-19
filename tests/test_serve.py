@@ -5,8 +5,11 @@ equivalence-invariant style as the rest of the suite (no golden files).
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 
+import httpx
 import pytest
 import torch
 from fastapi.testclient import TestClient
@@ -26,10 +29,15 @@ def _sft_cfg(tiny_cfg, **model_kwargs):
     return cfg
 
 
-def _client(cfg, **app_kwargs):
+def _app(cfg, **app_kwargs):
     model = DenseTransformer(cfg.model, vocab_size=TINY_VOCAB).eval()
     tokenizer = WordTokenizer(TINY_VOCAB)
     app = create_app(model, cfg, tokenizer, device="cpu", model_name="tiny-test", **app_kwargs)
+    return app, model, tokenizer
+
+
+def _client(cfg, **app_kwargs):
+    app, model, tokenizer = _app(cfg, **app_kwargs)
     return TestClient(app), model, tokenizer
 
 
@@ -311,3 +319,78 @@ def test_metrics_reports_requests_and_tokens(tiny_cfg):
     assert body["prompt_tokens_total"] >= 2
     assert "requests_per_second" in body
     assert "tokens_per_second" in body
+
+
+def _chat_body(prompt: str, **overrides) -> dict:
+    body = {"messages": [{"role": "user", "content": prompt}], "max_tokens": 5, "temperature": 0}
+    body.update(overrides)
+    return body
+
+
+async def _post_all_concurrently(app, bodies: list[dict]) -> list[dict]:
+    """Fires every request in `bodies` at /v1/chat/completions truly concurrently (a single
+    asyncio.gather on one event loop, unlike sequential bare TestClient.post() calls, each of
+    which — per create_app's _ensure_dispatcher_running — gets its own throwaway loop and so can
+    never actually overlap with another), so they have a real chance to land in the same
+    dispatcher batch.
+    """
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        responses = await asyncio.gather(*(client.post("/v1/chat/completions", json=b) for b in bodies))
+    return [r.json()["choices"][0]["message"]["content"] for r in responses]
+
+
+def test_concurrent_requests_get_correct_independent_completions(tiny_cfg):
+    """Three different prompts fired truly concurrently (see _post_all_concurrently) — likely to
+    share a dispatcher batch given the default batch_wait_ms — must each get exactly the same
+    completion as when run alone, proving the right-padding/key-positions machinery in
+    generate_tokens_batched doesn't let one row's content or padding leak into another's.
+    """
+    cfg = _sft_cfg(tiny_cfg, loop_count=2)
+    app, _, _ = _app(cfg, max_batch_size=4, batch_wait_ms=50.0)
+    client = TestClient(app)
+    prompts = ["hello there", "a slow turtle races", "the quick brown fox jumps high"]
+    bodies = [_chat_body(p) for p in prompts]
+
+    sequential = [client.post("/v1/chat/completions", json=b).json()["choices"][0]["message"]["content"] for b in bodies]
+    concurrent = asyncio.run(_post_all_concurrently(app, bodies))
+
+    assert concurrent == sequential
+
+
+def test_requests_with_different_loops_are_never_batched_together(tiny_cfg, monkeypatch):
+    """Loop depth is one value per forward call (see generate_tokens_batched's docstring), so two
+    concurrent requests asking for different --loops overrides must never end up merged into one
+    batched forward pass. Spies on radiance.serve.generate_tokens_batched (rather than comparing
+    decoded output, which a tiny randomly-initialized model's greedy argmax turns out to be
+    remarkably insensitive to loop depth for) to directly confirm the dispatcher issued two
+    separate batch-of-one calls instead of merging them.
+    """
+    import radiance.serve as serve_module
+
+    cfg = _sft_cfg(tiny_cfg, loop_count=4)
+    app, _, _ = _app(cfg, max_batch_size=4, batch_wait_ms=50.0)
+
+    calls: list[tuple[int | None, int]] = []
+    real_generate_tokens_batched = serve_module.generate_tokens_batched
+
+    def spy(model, tokenizer, items, device, loops=None):
+        calls.append((loops, len(items)))
+        return real_generate_tokens_batched(model, tokenizer, items, device, loops)
+
+    monkeypatch.setattr(serve_module, "generate_tokens_batched", spy)
+
+    bodies = [_chat_body("hello there", loops=1), _chat_body("hello there", loops=3)]
+    asyncio.run(_post_all_concurrently(app, bodies))
+
+    assert sorted(calls) == [(1, 1), (3, 1)]
+
+
+def test_lone_request_completes_without_waiting_for_batch_company(tiny_cfg):
+    client, _, _ = _client(tiny_cfg(loop_count=2), batch_wait_ms=20.0)
+    start = time.monotonic()
+    resp = client.post("/v1/completions", json={"prompt": "hello there", "max_tokens": 5, "temperature": 0})
+    elapsed = time.monotonic() - start
+
+    assert resp.status_code == 200
+    assert elapsed < 2.0, "a lone request must not block waiting for batch company that never arrives"

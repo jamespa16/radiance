@@ -9,9 +9,10 @@ same text a single final decode would.
 
 from __future__ import annotations
 
+import pytest
 import torch
 
-from radiance.generate import generate, generate_tokens
+from radiance.generate import BatchItem, generate, generate_tokens, generate_tokens_batched
 from radiance.model import DenseTransformer
 from tests.conftest import TINY_VOCAB
 from tests._fake_tokenizer import WordTokenizer
@@ -67,6 +68,66 @@ def test_generate_tokens_never_yields_eos(tiny_cfg):
     new_ids = list(generate_tokens(model, tokenizer, input_ids, max_new_tokens=20, temperature=0, device="cpu"))
 
     assert tokenizer.eos_token_id not in new_ids
+
+
+def test_generate_tokens_batched_matches_individual_calls_at_greedy(tiny_cfg):
+    """Batching two different-length prompts (right-padded, sharing one KVCache) through
+    generate_tokens_batched must produce, per row, token-for-token the same output as calling
+    generate_tokens on each prompt individually at batch=1 — the core correctness invariant for
+    the padding-mask machinery, pinned at temperature=0 so it's deterministic.
+    """
+    cfg = tiny_cfg(loop_count=2)
+    model = DenseTransformer(cfg.model, vocab_size=TINY_VOCAB).eval()
+    tokenizer = WordTokenizer(TINY_VOCAB)
+    prompt_a = "the quick brown fox jumps"
+    prompt_b = "a slow turtle"
+    ids_a = torch.tensor([tokenizer(prompt_a)["input_ids"]])
+    ids_b = torch.tensor([tokenizer(prompt_b)["input_ids"]])
+
+    items = [
+        BatchItem(input_ids=ids_a, max_new_tokens=6, temperature=0),
+        BatchItem(input_ids=ids_b, max_new_tokens=4, temperature=0),
+    ]
+    torch.manual_seed(0)
+    batched_ids: dict[int, list[int]] = {0: [], 1: []}
+    for step_results in generate_tokens_batched(model, tokenizer, items, device="cpu"):
+        for row, token_id in step_results:
+            if token_id is not None:
+                batched_ids[row].append(token_id)
+
+    torch.manual_seed(0)
+    expected_a = list(generate_tokens(model, tokenizer, ids_a, max_new_tokens=6, temperature=0, device="cpu"))
+    torch.manual_seed(0)
+    expected_b = list(generate_tokens(model, tokenizer, ids_b, max_new_tokens=4, temperature=0, device="cpu"))
+
+    assert batched_ids[0] == expected_a
+    assert batched_ids[1] == expected_b
+
+
+def test_generate_tokens_batched_signals_completion_exactly_once_per_row(tiny_cfg):
+    cfg = tiny_cfg(loop_count=2)
+    model = DenseTransformer(cfg.model, vocab_size=TINY_VOCAB).eval()
+    tokenizer = WordTokenizer(TINY_VOCAB)
+    ids_a = torch.tensor([tokenizer("the quick brown fox")["input_ids"]])
+    ids_b = torch.tensor([tokenizer("a slow turtle races")["input_ids"]])
+
+    items = [
+        BatchItem(input_ids=ids_a, max_new_tokens=8, temperature=0),
+        BatchItem(input_ids=ids_b, max_new_tokens=3, temperature=0),
+    ]
+    torch.manual_seed(0)
+    none_counts = {0: 0, 1: 0}
+    seen_after_none: set[int] = set()
+    for step_results in generate_tokens_batched(model, tokenizer, items, device="cpu"):
+        for row, token_id in step_results:
+            if token_id is None:
+                none_counts[row] += 1
+            elif row in seen_after_none:
+                pytest.fail(f"row {row} produced a token after its completion signal")
+            if token_id is None:
+                seen_after_none.add(row)
+
+    assert none_counts == {0: 1, 1: 1}
 
 
 def test_generate_tokens_never_yields_padded_vocab_id(tiny_cfg):

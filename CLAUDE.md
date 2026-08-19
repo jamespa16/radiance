@@ -79,9 +79,12 @@ Loads one checkpoint (same loader as `radiance-generate`) and serves `/v1/comple
 non-streaming, works with any checkpoint) plus `/v1/chat/completions` (formats requests through the checkpoint's own
 chat turn template, so it 400s unless the checkpoint has `sft.enabled: true` or `dpo.enabled: true`) and
 `/v1/models`, on `127.0.0.1` by default. `/healthz`, `/readyz`, and `/metrics` (uptime, request/error counts,
-tokens/sec) are unauthenticated and unrate-limited. One request at a time — generation is serialized behind a lock,
-no batching. `radiance.generate.generate_tokens` is the shared sampling-loop generator both `radiance-generate` and
-the server stream tokens from.
+tokens/sec) are unauthenticated and unrate-limited. Concurrent requests are batched: a background dispatcher groups
+requests that arrive within `--batch-wait-ms` (default 20ms) of each other, up to `--max-batch-size` (default 8),
+into one forward pass through the shared-weight loop body — right-padded prompts of different lengths share a
+`KVCache`, and only requests with the same `--loops` override can share a batch, since loop depth is one value per
+forward call. `radiance.generate.generate_tokens_batched` is the batched sampling-loop generator the server streams
+tokens from (`radiance.generate.generate_tokens`, single-sequence, is still what `radiance-generate` uses).
 
 `--api-key` (repeatable, or the comma-separated `RADIANCE_API_KEY` env var) requires a matching `Authorization:
 Bearer <key>` on every `/v1/*` route; omitted, those routes are unauthenticated (the default, so the quickstart
