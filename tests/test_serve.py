@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 
 import httpx
@@ -394,3 +395,143 @@ def test_lone_request_completes_without_waiting_for_batch_company(tiny_cfg):
 
     assert resp.status_code == 200
     assert elapsed < 2.0, "a lone request must not block waiting for batch company that never arrives"
+
+
+# --- request batching dispatcher (#46) -------------------------------------------------------
+
+
+def test_batch_wait_zero_still_batches_requests_already_queued(tiny_cfg, monkeypatch):
+    """--batch-wait-ms 0 is documented as "batches opportunistically (whatever's already queued)
+    with no added wait", so two requests already in the dispatcher's queue when it forms a batch
+    must share one forward pass, not each run solo. Spies on generate_tokens_batched to count the
+    actual batch sizes: before the fix, the deadline check ran before the first queue drain, so
+    the drain never happened and every request ran as a batch of one."""
+    import radiance.serve as serve_module
+
+    cfg = _sft_cfg(tiny_cfg, loop_count=2)
+    app, _, _ = _app(cfg, max_batch_size=4, batch_wait_ms=0.0)
+
+    real_generate_tokens_batched = serve_module.generate_tokens_batched
+    calls: list[int] = []
+
+    def spy(model, tokenizer, items, device, loops=None):
+        calls.append(len(items))
+        return real_generate_tokens_batched(model, tokenizer, items, device, loops)
+
+    monkeypatch.setattr(serve_module, "generate_tokens_batched", spy)
+
+    bodies = [_chat_body(p) for p in ["hello there", "a slow turtle races"]]
+    asyncio.run(_post_all_concurrently(app, bodies))
+
+    assert calls == [2]
+
+
+def test_next_batch_starts_without_extra_wait_after_in_flight_batch(tiny_cfg, monkeypatch):
+    """A request that arrives while a batch is generating must not pay its --batch-wait-ms on
+    top of the in-flight generation: the dispatcher forms the next batch while the current one
+    runs (see _dispatcher_loop), so this request's own batch starts the moment the in-flight
+    batch finishes. The spy slows only the first (in-flight) batch and records when each batched
+    call actually starts generating; the gap between the two calls must be bounded by the
+    slowdown alone, not slowdown + batch_wait_ms (what the serialized-formation design produced)."""
+    import radiance.serve as serve_module
+
+    cfg = _sft_cfg(tiny_cfg, loop_count=2)
+    app, _, _ = _app(cfg, max_batch_size=4, batch_wait_ms=150.0)
+
+    real_generate_tokens_batched = serve_module.generate_tokens_batched
+    starts: list[float] = []
+    state = {"calls": 0}
+
+    def slow_first(model, tokenizer, items, device, loops=None):
+        # A generator function on purpose: the body (including the sleep) runs on the first
+        # next(), inside _run_batch's producer thread, so the slowdown simulates a long
+        # in-flight generation without blocking the event loop itself.
+        starts.append(time.monotonic())
+        if state["calls"] == 0:
+            time.sleep(0.4)
+        state["calls"] += 1
+        yield from real_generate_tokens_batched(model, tokenizer, items, device, loops)
+
+    monkeypatch.setattr(serve_module, "generate_tokens_batched", slow_first)
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            first = asyncio.create_task(
+                client.post(
+                    "/v1/completions",
+                    json={"prompt": "hello there", "max_tokens": 3, "temperature": 0},
+                )
+            )
+            # Arrive after the first batch's 150ms formation window closed (so this request
+            # can't join it) but while its slowed generation is still in flight.
+            await asyncio.sleep(0.2)
+            second = asyncio.create_task(
+                client.post(
+                    "/v1/completions",
+                    json={"prompt": "a slow turtle races", "max_tokens": 3, "temperature": 0},
+                )
+            )
+            return await asyncio.gather(first, second)
+
+    responses = asyncio.run(scenario())
+
+    assert all(r.status_code == 200 for r in responses)
+    assert len(starts) == 2, "the two requests must run as separate batches"
+    # 0.4s slowdown + a few ms of real generation, not 0.4s + the 150ms formation wait.
+    assert starts[1] - starts[0] < 0.5
+
+
+def test_batch_setup_failure_fails_the_batch_and_server_keeps_serving(tiny_cfg, monkeypatch, caplog):
+    """A failure during batch setup — before the producer thread exists, e.g. thread-creation
+    exhaustion — must fail the batch's requests with an error (not hang them on their per-request
+    queues), and the server must keep serving subsequent requests. Both requests run on one event
+    loop (a real uvicorn deployment's shape), so nothing per-call can mask a dispatcher that died."""
+    import radiance.serve as serve_module
+
+    cfg = _sft_cfg(tiny_cfg, loop_count=2)
+    app, _, _ = _app(cfg, max_batch_size=4, batch_wait_ms=0.0)
+
+    real_generate_tokens_batched = serve_module.generate_tokens_batched
+    state = {"calls": 0}
+
+    def fail_first_call(model, tokenizer, items, device, loops=None):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            raise RuntimeError("simulated batch setup failure")
+        return real_generate_tokens_batched(model, tokenizer, items, device, loops)
+
+    monkeypatch.setattr(serve_module, "generate_tokens_batched", fail_first_call)
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            # asyncio.wait_for (not just httpx's own timeout, which ASGITransport doesn't
+            # enforce) bounds the await so a regression to the old hang-fails-the-request bug
+            # fails this test in seconds instead of stalling.
+            try:
+                first: httpx.Response | RuntimeError = await asyncio.wait_for(
+                    client.post(
+                        "/v1/completions", json={"prompt": "hello there", "max_tokens": 3, "temperature": 0}
+                    ),
+                    timeout=10.0,
+                )
+            except RuntimeError as exc:
+                first = exc
+            except TimeoutError:
+                pytest.fail("first request hung: the setup failure left it waiting on its queue")
+            second = await client.post(
+                "/v1/completions", json={"prompt": "a slow turtle races", "max_tokens": 3, "temperature": 0}
+            )
+            return first, second
+
+    with caplog.at_level(logging.ERROR, logger="radiance.serve"):
+        first, second = asyncio.run(scenario())
+
+    # Starlette's ServerErrorMiddleware sends the 500 and then re-raises to the ASGI caller, so
+    # through ASGITransport the failure surfaces as the raised exception, not a response object.
+    # Before the fix, this await instead hung on the request's queue until httpx's read timeout.
+    assert isinstance(first, RuntimeError)
+    assert "simulated batch setup failure" in str(first)
+    assert second.status_code == 200
+    assert any("generation batch" in r.getMessage() for r in caplog.records)

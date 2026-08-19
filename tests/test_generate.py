@@ -104,6 +104,38 @@ def test_generate_tokens_batched_matches_individual_calls_at_greedy(tiny_cfg):
     assert batched_ids[1] == expected_b
 
 
+def test_generate_tokens_matches_batched_sampling_at_stochastic_settings(tiny_cfg):
+    """Regression guard for the _sample_next_token extraction: generate_tokens and
+    generate_tokens_batched share _sample_next_token, so a seeded stochastic run (temperature >
+    0, top_k > 0) must produce token-for-token identical sequences. Greedy equivalence is pinned
+    separately (test_generate_tokens_batched_matches_individual_calls_at_greedy); this pins the
+    stochastic path, where a silently re-inlined copy of the sampling logic in either function
+    would drift token-by-token and make radiance-generate and radiance-serve sample
+    differently.
+    """
+    cfg = tiny_cfg(loop_count=2)
+    model = DenseTransformer(cfg.model, vocab_size=TINY_VOCAB).eval()
+    tokenizer = WordTokenizer(TINY_VOCAB)
+    input_ids = torch.tensor([tokenizer("the quick brown fox jumps")["input_ids"]])
+
+    torch.manual_seed(7)
+    single = list(
+        generate_tokens(model, tokenizer, input_ids, max_new_tokens=8, temperature=0.9, top_k=5, device="cpu")
+    )
+
+    torch.manual_seed(7)
+    item = BatchItem(input_ids=input_ids, max_new_tokens=8, temperature=0.9, top_k=5)
+    batched = [
+        token_id
+        for step_results in generate_tokens_batched(model, tokenizer, [item], device="cpu")
+        for row, token_id in step_results
+        if token_id is not None
+    ]
+
+    assert single, "test needs a non-empty completion to compare"
+    assert single == batched
+
+
 def test_generate_tokens_batched_signals_completion_exactly_once_per_row(tiny_cfg):
     cfg = tiny_cfg(loop_count=2)
     model = DenseTransformer(cfg.model, vocab_size=TINY_VOCAB).eval()

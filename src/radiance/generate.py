@@ -26,6 +26,24 @@ def load_checkpoint(path: str, device: str) -> tuple[DenseTransformer, Config, P
     return model, cfg, tokenizer
 
 
+def _sample_next_token(logits_row: torch.Tensor, temperature: float, top_k: int) -> int:
+    """Samples one token id from a single row's (1, vocab) logits.
+
+    Shared by generate_tokens (one call with the request's own temperature/top_k) and
+    generate_tokens_batched (one call per row, so each row can use a different
+    temperature/top_k) — the single source of truth for the argmax/top_k/softmax/multinomial
+    behavior, so the single-sequence and batched paths can't drift apart.
+    """
+    if temperature == 0:
+        return logits_row.argmax(dim=-1).item()
+    logits_row = logits_row / temperature
+    if top_k > 0:
+        top_values, _ = torch.topk(logits_row, min(top_k, logits_row.size(-1)))
+        logits_row = logits_row.masked_fill(logits_row < top_values[:, [-1]], float("-inf"))
+    probs = F.softmax(logits_row, dim=-1)
+    return torch.multinomial(probs, num_samples=1).item()
+
+
 @torch.no_grad()
 def generate_tokens(
     model: DenseTransformer,
@@ -64,21 +82,14 @@ def generate_tokens(
 
         mask_vocab_padding(logits, tokenizer)
 
-        if temperature == 0:
-            next_token = logits.argmax(dim=-1, keepdim=True)
-        else:
-            logits = logits / temperature
-            if top_k > 0:
-                top_values, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits = logits.masked_fill(logits < top_values[:, [-1]], float("-inf"))
-            probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+        token_id = _sample_next_token(logits, temperature, top_k)
 
-        if tokenizer.eos_token_id is not None and next_token.item() == tokenizer.eos_token_id:
+        if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
             break
 
-        yield next_token.item()
-        next_input = next_token  # every step after the first decodes a single new token
+        yield token_id
+        # every step after the first decodes a single new token
+        next_input = torch.tensor([[token_id]], dtype=next_input.dtype, device=next_input.device)
 
 
 @dataclass
@@ -94,22 +105,6 @@ class BatchItem:
     max_new_tokens: int = 200
     temperature: float = 0.8
     top_k: int = 50
-
-
-def _sample_next_token(logits_row: torch.Tensor, temperature: float, top_k: int) -> int:
-    """Samples one token id from a single row's (1, vocab) logits.
-
-    Factored out of generate_tokens' inline version so generate_tokens_batched can apply a
-    different temperature/top_k per row; logic is otherwise identical.
-    """
-    if temperature == 0:
-        return logits_row.argmax(dim=-1).item()
-    logits_row = logits_row / temperature
-    if top_k > 0:
-        top_values, _ = torch.topk(logits_row, min(top_k, logits_row.size(-1)))
-        logits_row = logits_row.masked_fill(logits_row < top_values[:, [-1]], float("-inf"))
-    probs = F.softmax(logits_row, dim=-1)
-    return torch.multinomial(probs, num_samples=1).item()
 
 
 @torch.no_grad()

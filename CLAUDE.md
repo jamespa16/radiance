@@ -83,8 +83,12 @@ tokens/sec) are unauthenticated and unrate-limited. Concurrent requests are batc
 requests that arrive within `--batch-wait-ms` (default 20ms) of each other, up to `--max-batch-size` (default 8),
 into one forward pass through the shared-weight loop body — right-padded prompts of different lengths share a
 `KVCache`, and only requests with the same `--loops` override can share a batch, since loop depth is one value per
-forward call. `radiance.generate.generate_tokens_batched` is the batched sampling-loop generator the server streams
-tokens from (`radiance.generate.generate_tokens`, single-sequence, is still what `radiance-generate` uses).
+forward call. Batches run one at a time (the model is a single shared instance, not concurrent-safe), but the
+dispatcher forms the *next* batch while the current one is generating, so a request's `--batch-wait-ms` window starts
+on its arrival rather than after the in-flight batch finishes, and `--batch-wait-ms 0` still batches whatever is
+already queued with no added wait. `radiance.generate.generate_tokens_batched` is the batched sampling-loop generator
+the server streams tokens from (`radiance.generate.generate_tokens`, single-sequence, is still what
+`radiance-generate` uses).
 
 `--api-key` (repeatable, or the comma-separated `RADIANCE_API_KEY` env var) requires a matching `Authorization:
 Bearer <key>` on every `/v1/*` route; omitted, those routes are unauthenticated (the default, so the quickstart

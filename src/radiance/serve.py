@@ -292,72 +292,97 @@ def create_app(
         `_PendingRequest.queue`: a real token id, or _DONE the one time generate_tokens_batched
         reports a row finished. A generation-time exception is delivered to every request in the
         batch, since they share one forward pass.
+
+        Guarantees that every request in `batch` receives _DONE or an exception on its own queue
+        even when the failure happens outside the producer thread's own try/except — e.g. batch
+        setup (building the items, creating/starting the thread) fails before the producer
+        exists and has no in-thread path to deliver through. Such a failure is logged and
+        swallowed here rather than propagated: one bad batch must not kill the dispatcher task
+        and strand the rest of the queue's requests.
         """
-        items = [
-            BatchItem(
-                input_ids=p.input_ids, max_new_tokens=p.max_tokens, temperature=p.temperature, top_k=p.top_k
-            )
-            for p in batch
-        ]
-        sync_gen = generate_tokens_batched(model, tokenizer, items, device, batch[0].loops)
-
-        running_loop = asyncio.get_running_loop()
-        result_queue: asyncio.Queue = asyncio.Queue()
-        stop_event = threading.Event()
-        batch_done = object()
-
-        def producer() -> None:
-            try:
-                for step_results in sync_gen:
-                    if stop_event.is_set():
-                        return
-                    running_loop.call_soon_threadsafe(result_queue.put_nowait, step_results)
-            except Exception as exc:  # re-raised on the event-loop side, not swallowed
-                running_loop.call_soon_threadsafe(result_queue.put_nowait, exc)
-            finally:
-                running_loop.call_soon_threadsafe(result_queue.put_nowait, batch_done)
-
-        thread = threading.Thread(target=producer, daemon=True)
-        thread.start()
-
         try:
-            while True:
-                item = await result_queue.get()
-                if item is batch_done:
-                    return
-                if isinstance(item, Exception):
-                    for p in batch:
-                        p.queue.put_nowait(item)
-                    return
-                for row, token_id in item:
-                    p = batch[row]
-                    p.queue.put_nowait(_DONE if token_id is None else token_id)
-        finally:
-            stop_event.set()
-            await asyncio.to_thread(thread.join)
+            items = [
+                BatchItem(
+                    input_ids=p.input_ids, max_new_tokens=p.max_tokens, temperature=p.temperature, top_k=p.top_k
+                )
+                for p in batch
+            ]
+            sync_gen = generate_tokens_batched(model, tokenizer, items, device, batch[0].loops)
+
+            running_loop = asyncio.get_running_loop()
+            result_queue: asyncio.Queue = asyncio.Queue()
+            stop_event = threading.Event()
+            batch_done = object()
+
+            def producer() -> None:
+                try:
+                    for step_results in sync_gen:
+                        if stop_event.is_set():
+                            return
+                        running_loop.call_soon_threadsafe(result_queue.put_nowait, step_results)
+                except Exception as exc:  # re-raised on the event-loop side, not swallowed
+                    running_loop.call_soon_threadsafe(result_queue.put_nowait, exc)
+                finally:
+                    running_loop.call_soon_threadsafe(result_queue.put_nowait, batch_done)
+
+            thread = threading.Thread(target=producer, daemon=True)
+            thread.start()
+
+            try:
+                while True:
+                    item = await result_queue.get()
+                    if item is batch_done:
+                        return
+                    if isinstance(item, Exception):
+                        for p in batch:
+                            p.queue.put_nowait(item)
+                        return
+                    for row, token_id in item:
+                        p = batch[row]
+                        p.queue.put_nowait(_DONE if token_id is None else token_id)
+            finally:
+                stop_event.set()
+                await asyncio.to_thread(thread.join)
+        except Exception as exc:
+            logger.exception(
+                "generation batch of %d request(s) failed; failing each of them", len(batch)
+            )
+            for p in batch:
+                p.queue.put_nowait(exc)
 
     async def _dispatcher_loop(queue: "asyncio.Queue") -> None:
-        """Forms one batch at a time from `queue` and runs it: takes the first request
-        immediately, then waits up to `batch_wait_seconds` for more to arrive (capped at
-        `max_batch_size`) so near-simultaneous requests share a forward pass instead of each
-        paying for the shared-weight loop body on their own — the standard micro-batching
-        pattern. A request whose `loops` override doesn't match the batch being formed is put
+        """Forms and runs batches from `queue` one at a time — one forward pass in flight at a
+        time, since the model is a single shared instance, not safe to run concurrently — but
+        overlaps the next batch's *formation* with the current batch's *generation*: as soon as
+        this batch starts generating, a background task starts forming the next one, so a
+        request's `batch_wait_seconds` window is anchored at its arrival, not delayed until the
+        in-flight batch happens to finish (its wait is paid alongside the generation it queues
+        behind, not on top of it), and a fully-formed batch starts the instant the current one
+        completes.
+
+        Formation takes the first request immediately, then drains whatever is already queued
+        before ever waiting — so `--batch-wait-ms 0` still batches opportunistically (everything
+        already in the queue shares the forward pass, with no added wait) — and then waits up to
+        `batch_wait_seconds` for more to arrive (capped at `max_batch_size`) so near-simultaneous
+        requests share a forward pass instead of each paying for the shared-weight loop body on
+        their own. A request whose `loops` override doesn't match the batch being formed is put
         back for the next round instead of blocking this one, since loop depth is one value per
         forward call and can't vary within a batch.
         """
         loop = asyncio.get_running_loop()
-        while True:
+
+        async def _form_batch() -> list[_PendingRequest]:
             first = await queue.get()
             batch = [first]
             leftover: list[_PendingRequest] = []
             deadline = loop.time() + batch_wait_seconds
             while len(batch) < max_batch_size:
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    break
                 try:
                     candidate = queue.get_nowait()
                 except asyncio.QueueEmpty:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        break
                     try:
                         candidate = await asyncio.wait_for(queue.get(), timeout=remaining)
                     except asyncio.TimeoutError:
@@ -368,7 +393,22 @@ def create_app(
                     leftover.append(candidate)
             for item in leftover:
                 queue.put_nowait(item)
-            await _run_batch(batch)
+            return batch
+
+        forming: asyncio.Task[list[_PendingRequest]] | None = None
+        try:
+            batch = await _form_batch()
+            while True:
+                forming = asyncio.ensure_future(_form_batch())
+                await _run_batch(batch)
+                batch = await forming
+                forming = None
+        except BaseException:
+            # Don't leave a formation task behind if this one dies — it may already be holding
+            # requests pulled off `queue`.
+            if forming is not None:
+                forming.cancel()
+            raise
 
     async def _ensure_dispatcher_running() -> "asyncio.Queue":
         """Lazily (re)starts the dispatcher, returning the queue requests should enqueue onto.
