@@ -179,4 +179,8 @@ See `configs/tinystories_dpo.yaml` for a worked example — a three-stage pretra
 where the math says it must, not that DPO improves anything at this scale. `tests/test_dpo_data.py`,
 `tests/test_dpo_loss.py` and `tests/test_dpo_reference_logprob.py` cover the data pipeline, the loss (including the
 policy-equals-reference equivalence check that predicted the smoke run's `log(2)` observation), and the precompute
-pass, at the same unit-test depth SFT already had — no end-to-end `train()` integration test exists for either mode.
+pass at unit-test depth; `tests/test_sft_train_e2e.py` and `tests/test_dpo_train_e2e.py` now also run
+`train.train()` itself end-to-end (tiny model, faked dataset/tokenizer, CPU) for each mode, checking the loss
+actually decreases and the resulting checkpoint reloads and forwards cleanly — the DPO one also pins that
+`resolve_dpo_doc_mask` fires for real inside a full run and that the reference-logprob precompute populates
+`dpo.cache_dir`, neither of which the unit tests above exercise through the real `train()` wiring.
