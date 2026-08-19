@@ -23,24 +23,9 @@ from radiance.model import DenseTransformer, load_transformer_from_checkpoint
 from radiance.optim import build_optimizer
 
 from tests._fake_tokenizer import WordTokenizer
-from tests.test_sft_train_e2e import _FakeWandb
+from tests.test_sft_train_e2e import _FakeWandb, _WORDS, _model_cfg
 
 TINY_VOCAB = 64
-_WORDS = ["hello", "there", "how", "are", "you", "today", "i", "am", "fine", "thanks", "goodbye", "friend"]
-
-
-def _model_cfg() -> ModelConfig:
-    return ModelConfig(
-        d_model=32,
-        head_dim=8,
-        n_layers=3,
-        ffn_mult=2.0,
-        ffn_depth=1,
-        dropout=0.0,
-        max_seq_len=32,
-        vocab_pad_multiple=1,  # keeps the run's vocab_size exactly TINY_VOCAB, matching both the
-        # policy-seed and reference checkpoints below bit-for-bit.
-    )
 
 
 def _dpo_pairs(n: int) -> DatasetDict:
