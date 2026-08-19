@@ -26,8 +26,11 @@ def load_checkpoint(path: str, device: str) -> tuple[DenseTransformer, Config, P
     return model, cfg, tokenizer
 
 
-def _sample_next_token(logits_row: torch.Tensor, temperature: float, top_k: int) -> int:
-    """Samples one token id from a single row's (1, vocab) logits.
+def _sample_next_token(logits_row: torch.Tensor, temperature: float, top_k: int) -> torch.Tensor:
+    """Samples one token for a single row's (1, vocab) logits and returns it as an on-device
+    (1, 1) tensor — the exact shape the next forward pass consumes — so callers can feed it
+    straight back as the next input without a host↔device round trip. Callers that need the id
+    as a Python int (yielding, EOS checks) take .item().
 
     Shared by generate_tokens (one call with the request's own temperature/top_k) and
     generate_tokens_batched (one call per row, so each row can use a different
@@ -35,13 +38,13 @@ def _sample_next_token(logits_row: torch.Tensor, temperature: float, top_k: int)
     behavior, so the single-sequence and batched paths can't drift apart.
     """
     if temperature == 0:
-        return logits_row.argmax(dim=-1).item()
+        return logits_row.argmax(dim=-1, keepdim=True)
     logits_row = logits_row / temperature
     if top_k > 0:
         top_values, _ = torch.topk(logits_row, min(top_k, logits_row.size(-1)))
         logits_row = logits_row.masked_fill(logits_row < top_values[:, [-1]], float("-inf"))
     probs = F.softmax(logits_row, dim=-1)
-    return torch.multinomial(probs, num_samples=1).item()
+    return torch.multinomial(probs, num_samples=1)
 
 
 @torch.no_grad()
@@ -82,14 +85,16 @@ def generate_tokens(
 
         mask_vocab_padding(logits, tokenizer)
 
-        token_id = _sample_next_token(logits, temperature, top_k)
+        next_token = _sample_next_token(logits, temperature, top_k)
+        token_id = next_token.item()
 
         if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
             break
 
         yield token_id
-        # every step after the first decodes a single new token
-        next_input = torch.tensor([[token_id]], dtype=next_input.dtype, device=next_input.device)
+        # every step after the first decodes a single new token; reuse the on-device (1, 1) tensor
+        # _sample_next_token returned so we don't pay a host↔device transfer on every decode step
+        next_input = next_token
 
 
 @dataclass
@@ -169,7 +174,7 @@ def generate_tokens_batched(
         for i, item in enumerate(items):
             if done[i]:
                 continue
-            token_id = _sample_next_token(next_logits[i : i + 1], item.temperature, item.top_k)
+            token_id = _sample_next_token(next_logits[i : i + 1], item.temperature, item.top_k).item()
             step_tokens[i, 0] = token_id
             is_eos = tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id
             if is_eos or yielded_count[i] >= item.max_new_tokens:

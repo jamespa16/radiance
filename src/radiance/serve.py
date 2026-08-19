@@ -294,12 +294,14 @@ def create_app(
         batch, since they share one forward pass.
 
         Guarantees that every request in `batch` receives _DONE or an exception on its own queue
-        even when the failure happens outside the producer thread's own try/except — e.g. batch
-        setup (building the items, creating/starting the thread) fails before the producer
-        exists and has no in-thread path to deliver through. Such a failure is logged and
-        swallowed here rather than propagated: one bad batch must not kill the dispatcher task
-        and strand the rest of the queue's requests.
+        no matter how this call exits: a generation-time or setup failure (building the items,
+        creating/starting the thread) is logged, delivered to the whole batch, and swallowed here
+        rather than propagated, so one bad batch must not kill the dispatcher task and strand the
+        rest of the queue's requests; and a cancellation (the dispatcher task dying mid-generation,
+        e.g. on server shutdown) is re-raised but, in the `finally` below, first fails the batch —
+        a restarted dispatcher reads a fresh queue, so no one else will ever run these requests.
         """
+        terminated = False
         try:
             items = [
                 BatchItem(
@@ -332,10 +334,12 @@ def create_app(
                 while True:
                     item = await result_queue.get()
                     if item is batch_done:
+                        terminated = True
                         return
                     if isinstance(item, Exception):
                         for p in batch:
                             p.queue.put_nowait(item)
+                        terminated = True
                         return
                     for row, token_id in item:
                         p = batch[row]
@@ -349,6 +353,22 @@ def create_app(
             )
             for p in batch:
                 p.queue.put_nowait(exc)
+            terminated = True
+        finally:
+            if not terminated:
+                # A cancellation (the dispatcher task shutting down) or another non-Exception
+                # BaseException reached here: every path above that finishes the batch sets
+                # `terminated`, so this is the "we bailed mid-generation without finishing it"
+                # case. The producer thread is stopped in the inner finally; a restarted
+                # dispatcher reads a fresh queue, so no one else will run these requests. Fail
+                # them so their handlers raise instead of hanging on their own per-request
+                # queues (see the docstring).
+                logger.exception(
+                    "generation batch of %d request(s) abandoned mid-flight; failing each of them",
+                    len(batch),
+                )
+                for p in batch:
+                    p.queue.put_nowait(RuntimeError("dispatcher shut down during generation"))
 
     async def _dispatcher_loop(queue: "asyncio.Queue") -> None:
         """Forms and runs batches from `queue` one at a time — one forward pass in flight at a
@@ -376,24 +396,39 @@ def create_app(
             batch = [first]
             leftover: list[_PendingRequest] = []
             deadline = loop.time() + batch_wait_seconds
-            while len(batch) < max_batch_size:
-                try:
-                    candidate = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    remaining = deadline - loop.time()
-                    if remaining <= 0:
-                        break
+            try:
+                while len(batch) < max_batch_size:
                     try:
-                        candidate = await asyncio.wait_for(queue.get(), timeout=remaining)
-                    except asyncio.TimeoutError:
-                        break
-                if candidate.loops == first.loops:
-                    batch.append(candidate)
-                else:
-                    leftover.append(candidate)
-            for item in leftover:
-                queue.put_nowait(item)
-            return batch
+                        candidate = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        remaining = deadline - loop.time()
+                        if remaining <= 0:
+                            break
+                        try:
+                            candidate = await asyncio.wait_for(queue.get(), timeout=remaining)
+                        except asyncio.TimeoutError:
+                            break
+                    if candidate.loops == first.loops:
+                        batch.append(candidate)
+                    else:
+                        leftover.append(candidate)
+                for item in leftover:
+                    queue.put_nowait(item)
+                return batch
+            except asyncio.CancelledError:
+                # `batch` and `leftover` are already off the dispatcher's `queue`. If we're
+                # cancelled before returning — the dispatcher task is dying (server shutdown, a
+                # crash, ...) — no one will run them: a restarted dispatcher reads a *fresh*
+                # queue, so re-queueing them here would orphan them too, and their handlers would
+                # hang forever on their own per-request queues. Fail each of them so the handler
+                # raises instead (see _run_batch's guarantee that every dequeued request receives
+                # _DONE or an exception).
+                shutdown = RuntimeError("dispatcher shut down before generation started")
+                for p in batch:
+                    p.queue.put_nowait(shutdown)
+                for p in leftover:
+                    p.queue.put_nowait(shutdown)
+                raise
 
         forming: asyncio.Task[list[_PendingRequest]] | None = None
         try:
@@ -405,9 +440,23 @@ def create_app(
                 forming = None
         except BaseException:
             # Don't leave a formation task behind if this one dies — it may already be holding
-            # requests pulled off `queue`.
+            # requests pulled off `queue`, whose handlers would otherwise hang forever on their
+            # own per-request queues. Cancel it and await the cancellation so _form_batch's
+            # handler fails any requests it had already dequeued mid-formation; and if it had
+            # already completed (a formed batch we never got to run), fail that batch's requests
+            # too, since no restarted dispatcher will ever pick them up (it reads a fresh queue).
             if forming is not None:
                 forming.cancel()
+                try:
+                    formed = await forming
+                except BaseException:
+                    # forming's own cancellation/failure — its _form_batch handler already
+                    # handled the requests it held; the original exception is what we re-raise.
+                    formed = None
+                if formed is not None:
+                    shutdown = RuntimeError("dispatcher shut down before generation started")
+                    for p in formed:
+                        p.queue.put_nowait(shutdown)
             raise
 
     async def _ensure_dispatcher_running() -> "asyncio.Queue":

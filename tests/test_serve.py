@@ -432,11 +432,17 @@ def test_next_batch_starts_without_extra_wait_after_in_flight_batch(tiny_cfg, mo
     runs (see _dispatcher_loop), so this request's own batch starts the moment the in-flight
     batch finishes. The spy slows only the first (in-flight) batch and records when each batched
     call actually starts generating; the gap between the two calls must be bounded by the
-    slowdown alone, not slowdown + batch_wait_ms (what the serialized-formation design produced)."""
+    slowdown alone, not slowdown + batch_wait_ms (what the serialized-formation design produced).
+
+    The injected formation wait (400ms) and slowdown (0.6s) are deliberately large, and the
+    threshold (0.8s) sits mid-way between the correct gap (≈ slowdown) and the serialized
+    gap (≈ slowdown + formation wait), so a slow/loaded runner's thread-startup and scheduling
+    overhead can't push the correct behavior past the threshold while a real regression to
+    serialized formation still lands well above it."""
     import radiance.serve as serve_module
 
     cfg = _sft_cfg(tiny_cfg, loop_count=2)
-    app, _, _ = _app(cfg, max_batch_size=4, batch_wait_ms=150.0)
+    app, _, _ = _app(cfg, max_batch_size=4, batch_wait_ms=400.0)
 
     real_generate_tokens_batched = serve_module.generate_tokens_batched
     starts: list[float] = []
@@ -448,7 +454,7 @@ def test_next_batch_starts_without_extra_wait_after_in_flight_batch(tiny_cfg, mo
         # in-flight generation without blocking the event loop itself.
         starts.append(time.monotonic())
         if state["calls"] == 0:
-            time.sleep(0.4)
+            time.sleep(0.6)
         state["calls"] += 1
         yield from real_generate_tokens_batched(model, tokenizer, items, device, loops)
 
@@ -463,9 +469,9 @@ def test_next_batch_starts_without_extra_wait_after_in_flight_batch(tiny_cfg, mo
                     json={"prompt": "hello there", "max_tokens": 3, "temperature": 0},
                 )
             )
-            # Arrive after the first batch's 150ms formation window closed (so this request
-            # can't join it) but while its slowed generation is still in flight.
-            await asyncio.sleep(0.2)
+            # Arrive after the first batch's 400ms formation window closed (so this request
+            # can't join it) but while its slowed (0.6s) generation is still in flight.
+            await asyncio.sleep(0.5)
             second = asyncio.create_task(
                 client.post(
                     "/v1/completions",
@@ -478,8 +484,89 @@ def test_next_batch_starts_without_extra_wait_after_in_flight_batch(tiny_cfg, mo
 
     assert all(r.status_code == 200 for r in responses)
     assert len(starts) == 2, "the two requests must run as separate batches"
-    # 0.4s slowdown + a few ms of real generation, not 0.4s + the 150ms formation wait.
-    assert starts[1] - starts[0] < 0.5
+    # ≈0.6s slowdown + a few ms of real generation, not 0.6s + the 400ms formation wait.
+    assert starts[1] - starts[0] < 0.8
+
+
+def test_dispatcher_shutdown_fails_already_dequeued_requests_instead_of_hanging(tiny_cfg, monkeypatch):
+    """If the dispatcher task dies (cancelled/crashed) while a batch is generating and the
+    concurrently-forming next batch has already dequeued request(s) via _form_batch, those
+    requests must be failed on their own queues (HTTP 500) rather than dropped — otherwise their
+    handlers hang forever on `await queue.get()`, contradicting _run_batch's guarantee that every
+    dequeued request receives _DONE or an exception. Cancels the dispatcher task directly (found
+    via the event loop's task list) to simulate a shutdown landing mid-formation."""
+    import radiance.serve as serve_module
+
+    cfg = _sft_cfg(tiny_cfg, loop_count=2)
+    app, _, _ = _app(cfg, max_batch_size=4, batch_wait_ms=300.0)
+
+    real_generate_tokens_batched = serve_module.generate_tokens_batched
+    state = {"calls": 0}
+
+    def slow_first(model, tokenizer, items, device, loops=None):
+        # Hold batch 1 in flight long enough to fire batch 2's request and cancel the dispatcher
+        # while _form_batch has already dequeued it. Runs in the producer thread, not the loop.
+        state["calls"] += 1
+        if state["calls"] == 1:
+            time.sleep(0.5)
+        yield from real_generate_tokens_batched(model, tokenizer, items, device, loops)
+
+    monkeypatch.setattr(serve_module, "generate_tokens_batched", slow_first)
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            first = asyncio.create_task(
+                client.post(
+                    "/v1/completions",
+                    json={"prompt": "hello there", "max_tokens": 3, "temperature": 0},
+                )
+            )
+            # Wait for batch 1's 300ms formation window to close and its slowed (0.5s)
+            # generation to be in flight, with the dispatcher's concurrent _form_batch active.
+            await asyncio.sleep(0.4)
+            second = asyncio.create_task(
+                client.post(
+                    "/v1/completions",
+                    json={"prompt": "a slow turtle races", "max_tokens": 3, "temperature": 0},
+                )
+            )
+            # Let _form_batch dequeue the second request off the dispatcher's queue and sit in
+            # its own (300ms) formation window holding it, before we kill the dispatcher.
+            await asyncio.sleep(0.2)
+            dispatcher = next(
+                (t for t in asyncio.all_tasks() if t.get_coro().cr_code.co_name == "_dispatcher_loop"),
+                None,
+            )
+            assert dispatcher is not None, "dispatcher task not found"
+            dispatcher.cancel()
+            outcomes: dict[str, object] = {}
+            for name, task in (("first", first), ("second", second)):
+                try:
+                    # A dropped request would hang here forever; wait_for turns that into a
+                    # TimeoutError. A correctly-failed request either returns a 5xx or raises the
+                    # generation error through the transport (see
+                    # test_batch_setup_failure_fails_the_batch_and_server_keeps_serving).
+                    outcomes[name] = await asyncio.wait_for(task, timeout=10.0)
+                except TimeoutError:
+                    pytest.fail(
+                        f"{name} request hung after the dispatcher died: it was dropped, not failed"
+                    )
+                except Exception as exc:  # failed (raised), not hung — a valid terminal signal
+                    outcomes[name] = exc
+            return outcomes
+
+    outcomes = asyncio.run(scenario())
+
+    # Both the in-flight request (batch 1) and the already-dequeued one (batch 2's first) must
+    # have been failed — a 5xx response or a raised generation error — not hung, not silently
+    # served.
+    for name in ("first", "second"):
+        outcome = outcomes[name]
+        failed = isinstance(outcome, Exception) or (
+            isinstance(outcome, httpx.Response) and outcome.status_code >= 500
+        )
+        assert failed, f"{name} request did not fail cleanly after dispatcher shutdown: {outcome!r}"
 
 
 def test_batch_setup_failure_fails_the_batch_and_server_keeps_serving(tiny_cfg, monkeypatch, caplog):
