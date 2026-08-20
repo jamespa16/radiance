@@ -70,3 +70,85 @@ def test_cache_slot_count_matches_attention_calls(tiny_cfg, tiny_ids, mode):
         f"{mode}: forward made {cache._cursor} attention calls but new_kv_cache() allocated "
         f"{len(cache._k)} slots"
     )
+
+
+@pytest.mark.parametrize("mode", list(MODES))
+def test_key_padding_mask_matches_unpadded_single_row_forward(tiny_cfg, tiny_ids, mode):
+    """Two different-length sequences, right-padded into one batch with key_padding_mask, must
+    each score the same as running that sequence alone (unpadded, batch=1) — the correctness bar
+    for batched generation's padding machinery. Compares full-sequence (no kv_cache) forwards
+    since that already exercises every mode's attention path; the incremental-decode case is
+    covered separately by generate_tokens_batched's own equivalence test in test_generate.py.
+    """
+    cfg = tiny_cfg(**MODES[mode])
+    model = DenseTransformer(cfg.model, vocab_size=TINY_VOCAB).eval()
+
+    short = tiny_ids(batch=1, seq=5, seed=1)
+    long = tiny_ids(batch=1, seq=9, seed=2)
+    max_len = long.shape[1]
+
+    padded = torch.zeros((2, max_len), dtype=long.dtype)
+    padded[0, : short.shape[1]] = short[0]
+    padded[1, :] = long[0]
+    key_padding_mask = torch.zeros((2, max_len), dtype=torch.bool)
+    key_padding_mask[0, : short.shape[1]] = True
+    key_padding_mask[1, :] = True
+    key_positions = torch.arange(max_len).unsqueeze(0).expand(2, -1)
+
+    with torch.no_grad():
+        batched = model(padded, key_padding_mask=key_padding_mask, key_positions=key_positions).logits
+        expected_short = model(short).logits
+        expected_long = model(long).logits
+
+    torch.testing.assert_close(
+        batched[0, : short.shape[1]], expected_short[0], rtol=1e-4, atol=1e-4
+    )
+    torch.testing.assert_close(batched[1], expected_long[0], rtol=1e-4, atol=1e-4)
+
+
+def test_key_padding_mask_incremental_decode_matches_unpadded(tiny_cfg, tiny_ids):
+    """Prefill with real padding (a short row alongside a longer one, right-padded), then decode
+    a few more steps with new real tokens shared by both rows — row 0's output must match running
+    its own (unpadded) prompt + those same continuation tokens alone at batch=1. This is the
+    decode-time counterpart to test_key_padding_mask_matches_unpadded_single_row_forward: prefill
+    and decode take different branches in CausalSelfAttention.forward (is_causal bool vs. the
+    padded_causal_mask path once ctx.key_padding_mask is set), and generate_tokens_batched's own
+    equivalence test in test_generate.py already covers the full serving path end-to-end, so this
+    isolates just the padding-survives-into-decode invariant at the model level.
+    """
+    cfg = tiny_cfg(loop_count=2)
+    model = DenseTransformer(cfg.model, vocab_size=TINY_VOCAB).eval()
+
+    short = tiny_ids(batch=1, seq=4, seed=1)
+    long = tiny_ids(batch=1, seq=7, seed=2)
+    extra = tiny_ids(batch=1, seq=3, seed=3)  # shared continuation tokens fed to both rows
+    max_prompt_len = long.shape[1]
+
+    padded_prompt = torch.zeros((2, max_prompt_len), dtype=short.dtype)
+    padded_prompt[0, : short.shape[1]] = short[0]
+    padded_prompt[1, :] = long[0]
+    key_padding_mask = torch.zeros((2, max_prompt_len), dtype=torch.bool)
+    key_padding_mask[0, : short.shape[1]] = True
+    key_padding_mask[1, :] = True
+    key_positions = torch.arange(max_prompt_len).unsqueeze(0).expand(2, -1)
+    real_len = [short.shape[1], long.shape[1]]
+
+    with torch.no_grad():
+        cache = model.new_kv_cache()
+        model(padded_prompt, kv_cache=cache, key_padding_mask=key_padding_mask, key_positions=key_positions)
+        for t in range(extra.shape[1]):
+            key_padding_mask = torch.cat(
+                [key_padding_mask, torch.ones((2, 1), dtype=torch.bool)], dim=1
+            )
+            new_positions = torch.tensor([[real_len[0]], [real_len[1]]])
+            key_positions = torch.cat([key_positions, new_positions], dim=1)
+            real_len = [n + 1 for n in real_len]
+            step_input = extra[:, t : t + 1].expand(2, 1)
+            last_logits = model(
+                step_input, kv_cache=cache, key_padding_mask=key_padding_mask, key_positions=key_positions
+            ).logits[:, -1, :]
+
+        row0_unpadded = torch.cat([short, extra], dim=1)
+        expected = model(row0_unpadded).logits[:, -1, :]
+
+    torch.testing.assert_close(last_logits[0], expected[0], rtol=1e-4, atol=1e-4)

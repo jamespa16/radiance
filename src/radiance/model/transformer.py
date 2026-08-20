@@ -708,6 +708,8 @@ class DenseTransformer(nn.Module):
         input_ids: torch.Tensor,
         kv_cache: KVCache | None = None,
         loop_count: int | None = None,
+        key_padding_mask: torch.Tensor | None = None,
+        key_positions: torch.Tensor | None = None,
     ) -> ModelOutput:
         """Returns a ModelOutput (logits, ponder_cost, mean_loop_depth, moe_aux_loss). The latter
         three are zero scalar tensors when the corresponding feature (use_router / use_moe) is off,
@@ -716,7 +718,17 @@ class DenseTransformer(nn.Module):
         kv_cache is optional and defaults to None (the training/full-sequence path, unchanged).
         When given, input_ids is the *new* chunk only (the whole prompt on the first call, one
         token per call thereafter) and attention is computed against cached past K/V plus this
-        chunk; see KVCache and CausalSelfAttention.forward."""
+        chunk; see KVCache and CausalSelfAttention.forward.
+
+        key_padding_mask/key_positions are optional and both default to None (inert — every
+        existing call site keeps producing identical output). Batched generation (right-padded
+        prompts of different lengths sharing one kv_cache) passes both together: key_padding_mask
+        is a (batch, offset + seq_len) bool tensor, True = real token; key_positions is each row's
+        own *true* absolute position for every one of those keys — not a shared offset, since a
+        shorter (more-padded) row's decode tokens run ahead of its own true length by however much
+        padding it carried from prefill, so a single scalar offset can't describe every row. Its
+        trailing seq_len columns double as this call's RoPE positions. See model/masking.py's
+        padded_causal_mask."""
         batch, seq_len = input_ids.shape
         offset = kv_cache.seq_len if kv_cache is not None else 0
         assert offset + seq_len <= self.cfg.max_seq_len, "sequence length exceeds max_seq_len"
@@ -726,7 +738,10 @@ class DenseTransformer(nn.Module):
         # No-op unless cfg.hyper_conn_streams > 1, in which case everything from here to ln_f
         # carries a (batch, seq, n_streams, d_model) hidden state instead of (batch, seq, d_model).
         x = self._expand_streams(x)
-        cos, sin = self.rope(seq_len, offset)
+        if key_positions is not None:
+            cos, sin = self.rope.forward_ids(key_positions[:, -seq_len:])
+        else:
+            cos, sin = self.rope(seq_len, offset)
 
         if kv_cache is not None:
             kv_cache.begin_step()
@@ -750,6 +765,7 @@ class DenseTransformer(nn.Module):
         # v_first for every later block on every later iteration (cfg.value_residual).
         ctx = LoopContext(
             iteration=0, kv_cache=kv_cache, block_mask=self._mask_for_iteration(doc_masks, 1),
+            key_padding_mask=key_padding_mask, key_positions=key_positions,
         )
         x, v_first, _ = _maybe_checkpoint(self.blocks[0], x, cos, sin, ctx, None, enabled=grad_checkpoint)
         if not self.cfg.value_residual:
@@ -786,6 +802,8 @@ class DenseTransformer(nn.Module):
                             iteration=n,
                             kv_cache=kv_cache,
                             block_mask=self._mask_for_iteration(doc_masks, n),
+                            key_padding_mask=key_padding_mask,
+                            key_positions=key_positions,
                         ),
                         v_first,
                         grad_checkpoint=grad_checkpoint,
@@ -801,7 +819,7 @@ class DenseTransformer(nn.Module):
 
         result = self._forward_act(
             x, cos, sin, v_first, anchor, kv_cache, grad_checkpoint, loop_count, doc_masks,
-            input_ids, doc_ids,
+            input_ids, doc_ids, key_padding_mask, key_positions,
         )
         if kv_cache is not None:
             kv_cache.seq_len += seq_len
@@ -820,6 +838,8 @@ class DenseTransformer(nn.Module):
         doc_masks: dict | None = None,
         input_ids: torch.Tensor | None = None,
         doc_ids: torch.Tensor | None = None,
+        key_padding_mask: torch.Tensor | None = None,
+        key_positions: torch.Tensor | None = None,
     ) -> ModelOutput:
         """Adaptive Computation Time (Graves 2016) over the loop body (blocks[1:]): each token
         position gets its own halting probability per iteration, halts once its cumulative
@@ -898,6 +918,8 @@ class DenseTransformer(nn.Module):
                 block_mask=self._mask_for_iteration(doc_masks, n),
                 # The first iteration seeds the retained K/V store the sparse ones read from.
                 record_kv=block_sparse and n == 1,
+                key_padding_mask=key_padding_mask,
+                key_positions=key_positions,
             )
             if block_sparse and not is_first_or_last:
                 # Interior iteration: compute only the highest-priority still-running positions.

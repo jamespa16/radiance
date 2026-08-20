@@ -22,11 +22,13 @@ checkpoint.
 The obvious alternative — point lm-eval's built-in `local-completions` model at a running
 `radiance-serve` — doesn't work well here for two independent reasons:
 
-1. `create_app` in `serve.py` serializes every generation behind one `asyncio.Lock` ("one request
-   at a time", no batching — see [train.md](train.md)/the server section of the top-level
-   `CLAUDE.md`). lm-eval's loglikelihood tasks issue one HTTP request *per answer choice*: 5-shot
-   MMLU is ~14k questions x 4 choices, HellaSwag is ~40k. Serialized one-forward-per-request HTTP
-   turns a several-minute batched run into hours, for numbers you want to regenerate on every A/B.
+1. Even with `radiance-serve`'s request-batching dispatcher (see the server section of the
+   top-level `CLAUDE.md`), it only groups requests that happen to *arrive* within a short window
+   of each other — it has no notion of a caller-controlled batch, and HTTP round-trip overhead
+   per request still applies. lm-eval's loglikelihood tasks issue one HTTP request *per answer
+   choice*: 5-shot MMLU is ~14k questions x 4 choices, HellaSwag is ~40k. That's a lot of HTTP
+   round-trips for numbers you want to regenerate on every A/B, next to an in-process call that
+   controls its own batch directly.
 2. `/v1/completions` doesn't return per-token `logprobs`/`echo`, which `local-completions` needs
    for exactly those loglikelihood requests. Adding that is a real, separate feature (OpenAI's
    `text_offset`/token-alignment contract) that wouldn't fix (1) anyway.
@@ -39,7 +41,9 @@ every real position) can never influence a real position's logits; they only was
 This is the same trick `lm_eval`'s own `HFLM._loglikelihood_tokens` uses for causal models. See
 `tests/test_eval_harness.py` for the equivalence check (batched must match one-request-at-a-time to
 tight tolerance). `generate_until` (GSM8K, BBH, ...) reuses `generate.generate_tokens` one request
-at a time, since that's a single-sequence KV-cached loop with no batching support today.
+at a time rather than `generate.generate_tokens_batched` (the KV-cached, right-padded batched
+generator `radiance-serve`'s dispatcher uses) — a scope decision, not a limitation of that
+generator, left for whenever `generate_until` throughput on those tasks is actually the bottleneck.
 
 ## Which tasks are worth running
 

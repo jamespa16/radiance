@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Iterator
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -23,6 +24,27 @@ def load_checkpoint(path: str, device: str) -> tuple[DenseTransformer, Config, P
     model, cfg = load_transformer_from_checkpoint(path, device)
     tokenizer = build_tokenizer(cfg)
     return model, cfg, tokenizer
+
+
+def _sample_next_token(logits_row: torch.Tensor, temperature: float, top_k: int) -> torch.Tensor:
+    """Samples one token for a single row's (1, vocab) logits and returns it as an on-device
+    (1, 1) tensor — the exact shape the next forward pass consumes — so callers can feed it
+    straight back as the next input without a host↔device round trip. Callers that need the id
+    as a Python int (yielding, EOS checks) take .item().
+
+    Shared by generate_tokens (one call with the request's own temperature/top_k) and
+    generate_tokens_batched (one call per row, so each row can use a different
+    temperature/top_k) — the single source of truth for the argmax/top_k/softmax/multinomial
+    behavior, so the single-sequence and batched paths can't drift apart.
+    """
+    if temperature == 0:
+        return logits_row.argmax(dim=-1, keepdim=True)
+    logits_row = logits_row / temperature
+    if top_k > 0:
+        top_values, _ = torch.topk(logits_row, min(top_k, logits_row.size(-1)))
+        logits_row = logits_row.masked_fill(logits_row < top_values[:, [-1]], float("-inf"))
+    probs = F.softmax(logits_row, dim=-1)
+    return torch.multinomial(probs, num_samples=1)
 
 
 @torch.no_grad()
@@ -63,21 +85,126 @@ def generate_tokens(
 
         mask_vocab_padding(logits, tokenizer)
 
-        if temperature == 0:
-            next_token = logits.argmax(dim=-1, keepdim=True)
-        else:
-            logits = logits / temperature
-            if top_k > 0:
-                top_values, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits = logits.masked_fill(logits < top_values[:, [-1]], float("-inf"))
-            probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+        next_token = _sample_next_token(logits, temperature, top_k)
+        token_id = next_token.item()
 
-        if tokenizer.eos_token_id is not None and next_token.item() == tokenizer.eos_token_id:
+        if tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id:
             break
 
-        yield next_token.item()
-        next_input = next_token  # every step after the first decodes a single new token
+        yield token_id
+        # every step after the first decodes a single new token; reuse the on-device (1, 1) tensor
+        # _sample_next_token returned so we don't pay a host↔device transfer on every decode step
+        next_input = next_token
+
+
+@dataclass
+class BatchItem:
+    """One request's prompt and sampling settings, for generate_tokens_batched.
+
+    All items in a batch must share the `loops` value passed separately to
+    generate_tokens_batched — loop depth is one value per forward call, unlike temperature/top_k/
+    max_new_tokens which are genuinely independent per row here.
+    """
+
+    input_ids: torch.Tensor  # (1, prompt_len), unpadded, on `device`
+    max_new_tokens: int = 200
+    temperature: float = 0.8
+    top_k: int = 50
+
+
+@torch.no_grad()
+def generate_tokens_batched(
+    model: DenseTransformer,
+    tokenizer: PreTrainedTokenizerBase,
+    items: list[BatchItem],
+    device: str = "cpu",
+    loops: int | None = None,
+) -> Iterator[list[tuple[int, int | None]]]:
+    """Batched counterpart to generate_tokens: runs `items` (right-padded prompts of possibly
+    different lengths, one shared KVCache) through a single forward pass per step instead of one
+    call per request, so the shared-weight loop body is paid for once per *batch* rather than once
+    per request — see model/masking.py's padded_causal_mask for how padding stays excluded from
+    attention.
+
+    Yields, once per generation step, the list of (row_index, token_id) pairs for rows with news
+    this step: `token_id` is a real sampled id for a row still producing output, or `None` exactly
+    once — the step a row hits its own EOS or its own max_new_tokens — signaling that row is done
+    and will never appear again. A done row keeps being fed a placeholder token every later step so
+    the batch's tensor shapes stay uniform until every row finishes (this repo's "idle to
+    completion" batching design), but since attention is masked per row, it can never influence any
+    other row's output, and no further sampling work is spent on it.
+    """
+    batch = len(items)
+    prompts = [item.input_ids[:, -model.cfg.max_seq_len :] for item in items]
+    prompt_lens = [p.shape[1] for p in prompts]
+    max_prompt_len = max(prompt_lens)
+
+    pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+    padded = torch.full((batch, max_prompt_len), pad_id, dtype=prompts[0].dtype, device=device)
+    key_padding_mask = torch.zeros((batch, max_prompt_len), dtype=torch.bool, device=device)
+    for i, (p, plen) in enumerate(zip(prompts, prompt_lens)):
+        padded[i, :plen] = p[0]
+        key_padding_mask[i, :plen] = True
+    # Right-padding keeps every row's real prefill tokens start-aligned with their true absolute
+    # position (position == column index here), so the prefill's key_positions is just an arange —
+    # the divergence only shows up once decode continues past prefill (see the running real_len
+    # tracker below and key_padding_mask's docstring in model/core.py's LoopContext).
+    key_positions = torch.arange(max_prompt_len, device=device).unsqueeze(0).expand(batch, -1)
+    real_len = list(prompt_lens)
+
+    kv_cache = model.new_kv_cache(loop_count=loops)
+    assert kv_cache.seq_len + max_prompt_len <= model.cfg.max_seq_len, (
+        f"batched prefill would exceed model.cfg.max_seq_len ({model.cfg.max_seq_len}); "
+        "reduce the longest prompt in the batch or use a checkpoint trained with a larger max_seq_len"
+    )
+    logits = model(
+        padded, kv_cache=kv_cache, loop_count=loops,
+        key_padding_mask=key_padding_mask, key_positions=key_positions,
+    ).logits
+    mask_vocab_padding(logits, tokenizer)
+    last_idx = torch.tensor([plen - 1 for plen in prompt_lens], device=device)
+    next_logits = logits[torch.arange(batch, device=device), last_idx, :]
+
+    done = [False] * batch
+    yielded_count = [0] * batch
+
+    while not all(done):
+        step_tokens = torch.full((batch, 1), pad_id, dtype=padded.dtype, device=device)
+        step_results: list[tuple[int, int | None]] = []
+        for i, item in enumerate(items):
+            if done[i]:
+                continue
+            token_id = _sample_next_token(next_logits[i : i + 1], item.temperature, item.top_k).item()
+            step_tokens[i, 0] = token_id
+            is_eos = tokenizer.eos_token_id is not None and token_id == tokenizer.eos_token_id
+            if is_eos or yielded_count[i] >= item.max_new_tokens:
+                done[i] = True
+                step_results.append((i, None))
+            else:
+                yielded_count[i] += 1
+                step_results.append((i, token_id))
+        if step_results:
+            yield step_results
+        if all(done):
+            break
+
+        assert kv_cache.seq_len + 1 <= model.cfg.max_seq_len, (
+            f"generation would exceed model.cfg.max_seq_len ({model.cfg.max_seq_len}); "
+            "reduce --max-new-tokens or use a checkpoint trained with a larger max_seq_len"
+        )
+        key_padding_mask = torch.cat(
+            [key_padding_mask, torch.ones((batch, 1), dtype=torch.bool, device=device)], dim=1
+        )
+        new_positions = torch.tensor([[real_len[i]] for i in range(batch)], device=device)
+        key_positions = torch.cat([key_positions, new_positions], dim=1)
+        for i in range(batch):
+            real_len[i] += 1
+        logits = model(
+            step_tokens, kv_cache=kv_cache, loop_count=loops,
+            key_padding_mask=key_padding_mask, key_positions=key_positions,
+        ).logits[:, -1, :]
+        mask_vocab_padding(logits, tokenizer)
+        next_logits = logits
 
 
 def generate(

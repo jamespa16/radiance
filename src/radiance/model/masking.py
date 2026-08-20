@@ -41,6 +41,27 @@ def build_block_mask(
     )
 
 
+def padded_causal_mask(
+    key_padding_mask: torch.Tensor, query_positions: torch.Tensor, key_positions: torch.Tensor
+) -> torch.Tensor:
+    """Boolean (batch, 1, q_len, kv_len) mask combining causal structure with key padding.
+
+    Used by CausalSelfAttention.forward's plain (non-flex) SDPA path when a batch mixes
+    right-padded sequences of different lengths (batched generation): `is_causal` alone can't
+    express "and never attend to a padding key", so — mirroring _sparse_attn_mask's pattern of
+    materializing an explicit mask rather than going through flex_attention — this builds one.
+    `key_padding_mask` is (batch, kv_len), True = real token. `query_positions`/`key_positions`
+    are each row's own *true* absolute position (batch, q_len) / (batch, kv_len) — not a shared
+    offset — because right-padding only keeps every row's real prefill tokens start-aligned with
+    their true positions; once a shorter row's decode continues, its later real tokens sit at
+    cache-column indices that run ahead of its own true sequence length by however much padding
+    that row had, so causal comparison has to happen in true-position space, not column-index
+    space (see the KVCache decode-offset note in model/transformer.py's key_positions docs).
+    """
+    causal = query_positions.unsqueeze(-1) >= key_positions.unsqueeze(1)  # (batch, q_len, kv_len)
+    return (causal & key_padding_mask.unsqueeze(1)).unsqueeze(1)  # (batch, 1, q_len, kv_len)
+
+
 def _sparse_attn_mask(
     token_idx: torch.Tensor, seq_len: int, doc_ids: torch.Tensor | None = None
 ) -> torch.Tensor:

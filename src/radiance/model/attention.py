@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from radiance.config import ModelConfig
 
 from .core import LoopContext
+from .masking import padded_causal_mask
 from .norms import RMSNorm, _make_iter_lora
 # flex_attention's compiled kernel rejects head dimensions below this.
 _FLEX_MIN_HEAD_DIM = 16
@@ -107,6 +108,16 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     return (x * cos + rotate_half(x) * sin).to(dtype)
 
 
+def _broadcast_rope(t: torch.Tensor) -> torch.Tensor:
+    """Reshapes a RotaryEmbedding cos/sin table for elementwise use against (batch, n_heads, seq,
+    head_dim) q/k. Two shapes come in: (seq, head_dim) from RotaryEmbedding.forward (one offset
+    shared by the whole batch) or (batch, seq, head_dim) from forward_ids (per-row positions,
+    batched generation's right-padded prompts of different lengths) — insert a broadcastable heads
+    dim in the right spot for either.
+    """
+    return t[None, None, :, :] if t.dim() == 2 else t[:, None, :, :]
+
+
 class RotaryEmbedding(nn.Module):
     """Precomputes RoPE cos/sin tables up to max_seq_len at construction time (same role the old
     learned pos_emb table played). Rotation depends only on absolute sequence position, never on
@@ -128,6 +139,14 @@ class RotaryEmbedding(nn.Module):
 
     def forward(self, seq_len: int, offset: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
         return self.cos_cached[offset : offset + seq_len], self.sin_cached[offset : offset + seq_len]
+
+    def forward_ids(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-row lookup instead of one contiguous offset:offset+seq_len slice — batched
+        generation's right-padded prompts of different lengths put different rows at different
+        true absolute positions for the same query-chunk index, so `position_ids` is
+        (batch, seq_len) rather than one shared offset. Returns (batch, seq_len, head_dim), unlike
+        forward()'s (seq_len, head_dim); see _broadcast_rope for how callers reconcile the two."""
+        return self.cos_cached[position_ids], self.sin_cached[position_ids]
 
 
 class CausalSelfAttention(nn.Module):
@@ -272,14 +291,17 @@ class CausalSelfAttention(nn.Module):
             # cos/sin are already head_dim//2-wide here — DenseTransformer builds self.rope at
             # head_dim // 2 whenever use_diff_attn is set (V is never rotated, and this is the only
             # width diff-attention's Q/K ever take), so no separate table is needed.
-            q1 = apply_rope(q1, cos[None, None, :, :], sin[None, None, :, :])
-            k1 = apply_rope(k1, cos[None, None, :, :], sin[None, None, :, :])
-            q2 = apply_rope(q2, cos[None, None, :, :], sin[None, None, :, :])
-            k2 = apply_rope(k2, cos[None, None, :, :], sin[None, None, :, :])
+            cos_b, sin_b = _broadcast_rope(cos), _broadcast_rope(sin)
+            q1 = apply_rope(q1, cos_b, sin_b)
+            k1 = apply_rope(k1, cos_b, sin_b)
+            q2 = apply_rope(q2, cos_b, sin_b)
+            k2 = apply_rope(k2, cos_b, sin_b)
         else:
-            q = apply_rope(q, cos[None, None, :, :], sin[None, None, :, :])
-            k = apply_rope(k, cos[None, None, :, :], sin[None, None, :, :])
+            cos_b, sin_b = _broadcast_rope(cos), _broadcast_rope(sin)
+            q = apply_rope(q, cos_b, sin_b)
+            k = apply_rope(k, cos_b, sin_b)
 
+        attn_mask = None
         if kv_cache is None:
             is_causal = True
         else:
@@ -293,6 +315,17 @@ class CausalSelfAttention(nn.Module):
             else:
                 k, v = kv_cache.write(k, v)
 
+        if ctx.key_padding_mask is not None:
+            # Batched generation only (right-padded prompts of different lengths, sharing one
+            # kv_cache — see model/core.py's LoopContext docstring). Padding excludes key
+            # positions is_causal alone can't express, and — because a shorter row's own true
+            # position runs behind the padded batch's shared column count once decode continues —
+            # causality itself has to be computed in each row's true-position space too, so this
+            # replaces is_causal with one explicit mask covering both.
+            query_positions = ctx.key_positions[:, -seq_len:]
+            attn_mask = padded_causal_mask(ctx.key_padding_mask, query_positions, ctx.key_positions)
+            is_causal = False
+
         enable_gqa = self.n_kv_heads != self.n_heads
         if self.use_diff_attn:
             if ctx.block_mask is not None:
@@ -300,10 +333,10 @@ class CausalSelfAttention(nn.Module):
             else:
                 dropout_p = self.dropout if self.training else 0.0
                 a1 = F.scaled_dot_product_attention(
-                    q1, k1, v, dropout_p=dropout_p, is_causal=is_causal, enable_gqa=enable_gqa
+                    q1, k1, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, enable_gqa=enable_gqa
                 )
                 a2 = F.scaled_dot_product_attention(
-                    q2, k2, v, dropout_p=dropout_p, is_causal=is_causal, enable_gqa=enable_gqa
+                    q2, k2, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, enable_gqa=enable_gqa
                 )
             # lambda reparameterized as exp(dot) - exp(dot) + lambda_init rather than a bare
             # parameter: at init the two exp(dot) terms nearly cancel (small random lambda_q/k),
@@ -326,6 +359,7 @@ class CausalSelfAttention(nn.Module):
                 q,
                 k,
                 v,
+                attn_mask=attn_mask,
                 dropout_p=self.dropout if self.training else 0.0,
                 is_causal=is_causal,
                 enable_gqa=enable_gqa,
