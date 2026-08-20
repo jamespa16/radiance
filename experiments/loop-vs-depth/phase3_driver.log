@@ -1,0 +1,13 @@
+[driver] === D_moeloop_lr0.003 ===
+[driver] D_moeloop_lr0.003 done in 284s :: [radiance] step   1000 val/loss 1.7799
+[driver] === D_moeloop_lr0.01 ===
+[driver] D_moeloop_lr0.01 done in 272s :: [radiance] step   1000 val/loss 1.7667
+[driver] === D_moeloop_lr0.03 ===
+[driver] D_moeloop_lr0.03 done in 273s :: [radiance] step   1000 val/loss 1.7727
+[driver] === E_moedense_lr0.003 ===
+[driver] E_moedense_lr0.003 done in 141s :: [radiance] step   1000 val/loss 1.8083
+[driver] === E_moedense_lr0.01 ===
+[driver] E_moedense_lr0.01 done in 139s :: [radiance] step   1000 val/loss 1.7832
+[driver] === E_moedense_lr0.03 ===
+[driver] E_moedense_lr0.03 done in 140s :: [radiance] step   1000 val/loss 1.7918
+[driver] ALL DONE

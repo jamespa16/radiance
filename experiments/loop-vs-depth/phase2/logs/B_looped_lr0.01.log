@@ -1,0 +1,92 @@
+[radiance] padding vocab 50,257 -> 50,304 (multiple of 128) for tensor-core-aligned lm_head matmuls
+[radiance] optimizer=muon (muon_lr=0.02 over 53 tensors, adamw lr=0.01 over the rest)
+[radiance] step     25/3000 loss 8.4805 lm 8.4707 lr 8.667e-04
+[radiance] step     50/3000 loss 5.8539 lm 5.8451 lr 1.700e-03
+[radiance] step     75/3000 loss 5.0278 lm 5.0187 lr 2.533e-03
+[radiance] step    100/3000 loss 4.2164 lm 4.2065 lr 3.367e-03
+[radiance] step    125/3000 loss 3.5806 lm 3.5690 lr 4.200e-03
+[radiance] step    150/3000 loss 3.2413 lm 3.2289 lr 5.033e-03
+[radiance] step    175/3000 loss 2.9687 lm 2.9547 lr 5.867e-03
+[radiance] step    200/3000 loss 2.8213 lm 2.8069 lr 6.700e-03
+[radiance] step    225/3000 loss 2.7343 lm 2.7192 lr 7.533e-03
+[radiance] step    250/3000 loss 2.6507 lm 2.6354 lr 8.367e-03
+[radiance] step    250 val/loss 2.6477
+[radiance] step    275/3000 loss 2.5825 lm 2.5665 lr 9.200e-03
+[radiance] step    300/3000 loss 2.5051 lm 2.4886 lr 1.003e-02
+[radiance] step    325/3000 loss 2.4649 lm 2.4486 lr 1.087e-02
+[radiance] step    350/3000 loss 2.4310 lm 2.4147 lr 1.170e-02
+[radiance] step    375/3000 loss 2.4209 lm 2.4048 lr 1.253e-02
+[radiance] step    400/3000 loss 2.2427 lm 2.2265 lr 1.337e-02
+[radiance] step    425/3000 loss 2.2609 lm 2.2444 lr 1.420e-02
+[radiance] step    450/3000 loss 2.2595 lm 2.2431 lr 1.503e-02
+[radiance] step    475/3000 loss 2.2733 lm 2.2572 lr 1.587e-02
+[radiance] step    500/3000 loss 2.2021 lm 2.1858 lr 1.670e-02
+[radiance] step    500 val/loss 2.2510
+[radiance] step    525/3000 loss 2.1471 lm 2.1309 lr 1.753e-02
+[radiance] step    550/3000 loss 2.1727 lm 2.1568 lr 1.837e-02
+[radiance] step    575/3000 loss 2.1104 lm 2.0943 lr 1.920e-02
+[radiance] step    600/3000 loss 2.2680 lm 2.2523 lr 2.000e-02
+[radiance] step    625/3000 loss 2.1303 lm 2.1141 lr 2.000e-02
+[radiance] step    650/3000 loss 2.1395 lm 2.1234 lr 1.998e-02
+[radiance] step    675/3000 loss 2.1204 lm 2.1042 lr 1.996e-02
+[radiance] step    700/3000 loss 2.0431 lm 2.0270 lr 1.992e-02
+[radiance] step    725/3000 loss 2.1040 lm 2.0878 lr 1.988e-02
+[radiance] step    750/3000 loss 2.0485 lm 2.0323 lr 1.983e-02
+[radiance] step    750 val/loss 2.0775
+[radiance] step    775/3000 loss 2.0247 lm 2.0085 lr 1.976e-02
+[radiance] step    800/3000 loss 2.0017 lm 1.9853 lr 1.969e-02
+[radiance] step    825/3000 loss 2.0744 lm 2.0581 lr 1.961e-02
+[radiance] step    850/3000 loss 2.0046 lm 1.9882 lr 1.952e-02
+[radiance] step    875/3000 loss 1.9547 lm 1.9383 lr 1.942e-02
+[radiance] step    900/3000 loss 2.0005 lm 1.9843 lr 1.931e-02
+[radiance] step    925/3000 loss 1.9449 lm 1.9284 lr 1.920e-02
+[radiance] step    950/3000 loss 1.9231 lm 1.9066 lr 1.907e-02
+[radiance] step    975/3000 loss 2.0050 lm 1.9888 lr 1.894e-02
+[radiance] step   1000/3000 loss 1.9480 lm 1.9316 lr 1.879e-02
+[radiance] step   1000 val/loss 1.9652
+[radiance] step   1025/3000 loss 1.9043 lm 1.8878 lr 1.864e-02
+[radiance] step   1050/3000 loss 1.9457 lm 1.9294 lr 1.848e-02
+[radiance] step   1075/3000 loss 1.8565 lm 1.8399 lr 1.832e-02
+[radiance] step   1100/3000 loss 1.9502 lm 1.9341 lr 1.814e-02
+[radiance] step   1125/3000 loss 2.0599 lm 2.0441 lr 1.796e-02
+[radiance] step   1150/3000 loss 1.9426 lm 1.9263 lr 1.777e-02
+[radiance] step   1175/3000 loss 1.8904 lm 1.8740 lr 1.757e-02
+[radiance] step   1200/3000 loss 1.7888 lm 1.7719 lr 1.736e-02
+[radiance] step   1225/3000 loss 1.9076 lm 1.8912 lr 1.715e-02
+[radiance] step   1250/3000 loss 1.9038 lm 1.8876 lr 1.693e-02
+[radiance] step   1250 val/loss 1.8885
+[radiance] step   1275/3000 loss 1.8307 lm 1.8143 lr 1.671e-02
+[radiance] step   1300/3000 loss 1.8987 lm 1.8825 lr 1.648e-02
+[radiance] step   1325/3000 loss 1.7907 lm 1.7742 lr 1.624e-02
+[radiance] step   1350/3000 loss 1.7773 lm 1.7607 lr 1.600e-02
+[radiance] step   1375/3000 loss 1.8438 lm 1.8273 lr 1.575e-02
+[radiance] step   1400/3000 loss 1.9348 lm 1.9187 lr 1.550e-02
+[radiance] step   1425/3000 loss 1.7985 lm 1.7822 lr 1.524e-02
+[radiance] step   1450/3000 loss 1.8174 lm 1.8008 lr 1.498e-02
+[radiance] step   1475/3000 loss 1.8770 lm 1.8605 lr 1.471e-02
+[radiance] step   1500/3000 loss 1.7825 lm 1.7659 lr 1.444e-02
+[radiance] step   1500 val/loss 1.8259
+[W811 13:32:14.517884144 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1648361472 bytes (free: 1678311424, total: 33667612672).
+[W811 13:32:14.981765607 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1648361472 bytes (free: 1665728512, total: 33667612672).
+[W811 13:32:15.439422383 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1648361472 bytes (free: 1655242752, total: 33667612672).
+[W811 13:32:15.888327660 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1648361472 bytes (free: 1646854144, total: 33667612672).
+[W811 13:32:16.353776492 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1648361472 bytes (free: 1636368384, total: 33667612672).
+[W811 13:32:16.803131890 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1648361472 bytes (free: 1625882624, total: 33667612672).
+[W811 13:32:16.267031817 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1648361472 bytes (free: 1615396864, total: 33667612672).
+[W811 13:32:17.731453920 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1648361472 bytes (free: 1604911104, total: 33667612672).
+[W811 13:32:17.179854033 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1648361472 bytes (free: 1596522496, total: 33667612672).
+[W811 13:32:18.636146238 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1648361472 bytes (free: 1583939584, total: 33667612672).
+[W811 13:32:18.097044884 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1648361472 bytes (free: 1573453824, total: 33667612672).
+[W811 13:32:19.324514683 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1648361472 bytes (free: 1676214272, total: 33667612672).
+[W811 13:32:19.564582311 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1648361472 bytes (free: 1565065216, total: 33667612672).
+[W811 13:32:19.791930983 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1648361472 bytes (free: 1667825664, total: 33667612672).
+[radiance] step   1525/3000 loss 1.8495 lm 1.8332 lr 1.417e-02
+[W811 13:32:19.048623479 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1648361472 bytes (free: 1554579456, total: 33667612672).
+[W811 13:32:19.280772895 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1648361472 bytes (free: 1657339904, total: 33667612672).
+[W811 13:32:20.519945971 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1648361472 bytes (free: 1546190848, total: 33667612672).
+[W811 13:32:20.774754645 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1648361472 bytes (free: 1639579648, total: 33667612672).
+[W811 13:32:20.016205549 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1648361472 bytes (free: 1528365056, total: 33667612672).
+[W811 13:32:20.244350370 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1648361472 bytes (free: 1631125504, total: 33667612672).
+[W811 13:32:21.503661550 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1648361472 bytes (free: 1517879296, total: 33667612672).
+[W811 13:32:21.525379829 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1648361472 bytes (free: 1677262848, total: 33667612672).
+[radiance] CUDA OOM at step 1528, ending run early.

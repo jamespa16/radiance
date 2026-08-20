@@ -1,0 +1,5 @@
+[driver] === B_looped_lr0.01 ===
+[driver] B_looped_lr0.01 INVALID: 'ending run early' (OOM) after 675s
+[driver] === C_deep_lr0.01 ===
+[driver] C_deep_lr0.01 INVALID: 'ending run early' (OOM) after 943s
+[driver] ALL DONE

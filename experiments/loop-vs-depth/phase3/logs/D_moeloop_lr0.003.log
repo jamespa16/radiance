@@ -1,0 +1,68 @@
+[radiance] padding vocab 50,257 -> 50,304 (multiple of 128) for tensor-core-aligned lm_head matmuls
+[radiance] grad_checkpoint on, so compiling without CUDA graphs (mode=None instead of 'reduce-overhead').
+[radiance] optimizer=muon (muon_lr=0.02 over 78 tensors, adamw lr=0.003 over the rest)
+[radiance] step     25/1000 loss 8.7929 lm 8.6816 lr 2.600e-03
+[radiance] step     50/1000 loss 5.7286 lm 5.6183 lr 5.100e-03
+[radiance] step     75/1000 loss 4.3165 lm 4.2063 lr 7.600e-03
+[radiance] step    100/1000 loss 3.5733 lm 3.4617 lr 1.010e-02
+[radiance] step    125/1000 loss 3.3245 lm 3.2114 lr 1.260e-02
+[radiance] step    150/1000 loss 2.9424 lm 2.8286 lr 1.510e-02
+[radiance] step    175/1000 loss 2.8071 lm 2.6926 lr 1.760e-02
+[radiance] step    200/1000 loss 2.7376 lm 2.6228 lr 2.000e-02
+[radiance] step    225/1000 loss 2.7340 lm 2.6187 lr 1.996e-02
+[radiance] step    250/1000 loss 2.5205 lm 2.4047 lr 1.983e-02
+W0811 14:46:02.338000 37293 torch/_dynamo/variables/tensor.py:1759] [4/3] Graph break from `Tensor.item()`, consider setting:
+W0811 14:46:02.338000 37293 torch/_dynamo/variables/tensor.py:1759] [4/3]     torch._dynamo.config.capture_scalar_outputs = True
+W0811 14:46:02.338000 37293 torch/_dynamo/variables/tensor.py:1759] [4/3] or:
+W0811 14:46:02.338000 37293 torch/_dynamo/variables/tensor.py:1759] [4/3]     env TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS=1
+W0811 14:46:02.338000 37293 torch/_dynamo/variables/tensor.py:1759] [4/3] to include these operations in the captured graph.
+W0811 14:46:02.338000 37293 torch/_dynamo/variables/tensor.py:1759] [4/3] 
+W0811 14:46:02.338000 37293 torch/_dynamo/variables/tensor.py:1759] [4/3] Graph break: from user code at:
+W0811 14:46:02.338000 37293 torch/_dynamo/variables/tensor.py:1759] [4/3]   File "/home/james/dev/radiance/src/radiance/model.py", line 1151, in _maybe_checkpoint
+W0811 14:46:02.338000 37293 torch/_dynamo/variables/tensor.py:1759] [4/3]     return fn(*args)
+W0811 14:46:02.338000 37293 torch/_dynamo/variables/tensor.py:1759] [4/3]   File "/home/james/dev/radiance/src/radiance/model.py", line 961, in forward
+W0811 14:46:02.338000 37293 torch/_dynamo/variables/tensor.py:1759] [4/3]     x = x + self.ffn(self.ln2(x, variant), variant)
+W0811 14:46:02.338000 37293 torch/_dynamo/variables/tensor.py:1759] [4/3]             ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+W0811 14:46:02.338000 37293 torch/_dynamo/variables/tensor.py:1759] [4/3]   File "/home/james/dev/radiance/src/radiance/model.py", line 856, in forward
+W0811 14:46:02.338000 37293 torch/_dynamo/variables/tensor.py:1759] [4/3]     capacity = _moe_capacity(self.cfg, n_tokens, assigned if full_capacity else None)
+W0811 14:46:02.338000 37293 torch/_dynamo/variables/tensor.py:1759] [4/3]   File "/home/james/dev/radiance/src/radiance/model.py", line 689, in _moe_capacity
+W0811 14:46:02.338000 37293 torch/_dynamo/variables/tensor.py:1759] [4/3]     return _moe_eval_capacity(assigned, n_tokens)
+W0811 14:46:02.338000 37293 torch/_dynamo/variables/tensor.py:1759] [4/3]   File "/home/james/dev/radiance/src/radiance/model.py", line 671, in _moe_eval_capacity
+W0811 14:46:02.338000 37293 torch/_dynamo/variables/tensor.py:1759] [4/3]     peak = max(1, int(assigned.sum(dim=0).max().item()))
+W0811 14:46:02.338000 37293 torch/_dynamo/variables/tensor.py:1759] [4/3]                       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+W0811 14:46:02.338000 37293 torch/_dynamo/variables/tensor.py:1759] [4/3] 
+W0811 14:46:02.338000 37293 torch/_dynamo/variables/tensor.py:1759] [4/3] 
+[radiance] step    250 val/loss 2.5026
+[radiance] step    275/1000 loss 2.5603 lm 2.4444 lr 1.961e-02
+[radiance] step    300/1000 loss 2.4107 lm 2.2946 lr 1.931e-02
+[radiance] step    325/1000 loss 2.4377 lm 2.3208 lr 1.894e-02
+[radiance] step    350/1000 loss 2.4302 lm 2.3133 lr 1.848e-02
+[radiance] step    375/1000 loss 2.2762 lm 2.1593 lr 1.796e-02
+[radiance] step    400/1000 loss 2.3277 lm 2.2101 lr 1.736e-02
+[radiance] step    425/1000 loss 2.2833 lm 2.1659 lr 1.671e-02
+[radiance] step    450/1000 loss 2.2416 lm 2.1235 lr 1.600e-02
+[radiance] step    475/1000 loss 2.1323 lm 2.0145 lr 1.524e-02
+[radiance] step    500/1000 loss 2.1229 lm 2.0050 lr 1.444e-02
+[radiance] step    500 val/loss 2.0830
+[radiance] step    525/1000 loss 2.1558 lm 2.0382 lr 1.361e-02
+[radiance] step    550/1000 loss 2.1298 lm 2.0121 lr 1.276e-02
+[radiance] step    575/1000 loss 2.1646 lm 2.0464 lr 1.188e-02
+[radiance] step    600/1000 loss 2.0468 lm 1.9289 lr 1.100e-02
+[radiance] step    625/1000 loss 2.0323 lm 1.9144 lr 1.012e-02
+[radiance] step    650/1000 loss 1.9559 lm 1.8380 lr 9.244e-03
+[radiance] step    675/1000 loss 2.0034 lm 1.8853 lr 8.387e-03
+[radiance] step    700/1000 loss 1.8762 lm 1.7579 lr 7.556e-03
+[radiance] step    725/1000 loss 1.9475 lm 1.8294 lr 6.757e-03
+[radiance] step    750/1000 loss 1.9795 lm 1.8614 lr 6.000e-03
+[radiance] step    750 val/loss 1.8812
+[radiance] step    775/1000 loss 1.9869 lm 1.8686 lr 5.290e-03
+[radiance] step    800/1000 loss 1.9714 lm 1.8529 lr 4.636e-03
+[radiance] step    825/1000 loss 1.9566 lm 1.8382 lr 4.043e-03
+[radiance] step    850/1000 loss 1.9088 lm 1.7905 lr 3.517e-03
+[radiance] step    875/1000 loss 1.9016 lm 1.7834 lr 3.063e-03
+[radiance] step    900/1000 loss 1.8325 lm 1.7140 lr 2.685e-03
+[radiance] step    925/1000 loss 1.8809 lm 1.7626 lr 2.388e-03
+[radiance] step    950/1000 loss 1.8192 lm 1.7007 lr 2.173e-03
+[radiance] step    975/1000 loss 1.8586 lm 1.7399 lr 2.043e-03
+[radiance] step   1000/1000 loss 1.8621 lm 1.7436 lr 2.000e-03
+[radiance] step   1000 val/loss 1.7799

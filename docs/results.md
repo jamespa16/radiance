@@ -40,6 +40,64 @@ tuned `lr` across width, and nothing here establishes that `1.0e-2` is right for
 `batch_size: 32` with `auto_batch_size: false`; the deltas are sound because every arm shares those settings, but the
 absolute numbers belong to their own series.
 
+## The loop is dominated — depth and MoE are the frontier
+
+The most consequential result on this page, because it is about the axis the rest of the framework is built to
+serve: loop conditioning, input injection, BPTT windowing, ACT, ACT capacity sparsity and hyper-connections all
+exist to make `blocks[1:]`'s weight-shared loop pay. **It does not pay.** Nothing had measured the loop against a
+plain dense stack before this — the one loop-related A/B on record compared looping-with-conditioning against
+looping-without, which presupposes the loop.
+
+Five arms on TinyStories (`d_model: 256`, `head_dim: 64`, `ffn_mult: 4.0`, `ffn_depth: 3`, `seq_len: 512`), **each
+arm LR-swept separately**, 3000 steps, effective batch 32 pinned. Full harness, logs and working notes in
+[experiments/loop-vs-depth/](../experiments/loop-vs-depth/).
+
+| arm | total | active | executed blocks | `val/loss` @3000 |
+|---|---|---|---|---|
+| A dense (`n_layers: 6`, `loop_count: 1`) | 31.8M | 31.8M | 6 | 1.6240 |
+| B looped (`n_layers: 6`, `loop_count: 4`) | 31.9M | 31.9M | 21 | 1.5893 |
+| **C deep (`n_layers: 21`, `loop_count: 1`)** | 79.1M | 79.1M | 21 | **1.5394** |
+| D MoE + loop (`n_layers: 6`, `loop_count: 4`) | 73.5M | 31.5M | 21 | 1.5507 |
+| E MoE dense (`n_layers: 6`, `loop_count: 1`) | 54.2M | 31.5M | 6 | 1.5752 |
+
+B vs A is equal-parameter; B vs C is equal-FLOP (both 21 executed blocks). D and E are active-parameter-matched to
+B (31.5M vs 31.9M, a 1.3% shortfall running *against* the MoE arms), with `moe_n_shared: 0` so no unconditional
+FLOPs are added. Noise floor **0.008**, from running arm B three independent times — not the 0.002 quoted
+elsewhere on this page, which belongs to a different configuration.
+
+**The loop is dominated in both settings once cost is counted.** E beats B (1.5752 vs 1.5893) on **6 executed
+blocks instead of 21** — a third of the compute — and in less wall time. C beats D (1.5394 vs 1.5507), also in less
+wall time. The Pareto frontier is C (best quality) and E (cheapest); B and D are both inside it. The 2x2:
+
+| | dense | looped | loop gain |
+|---|---|---|---|
+| no MoE | 1.6240 | 1.5893 | +0.0347 |
+| MoE | 1.5752 | 1.5507 | +0.0245 |
+| **MoE gain** | **+0.0488** | **+0.0386** | |
+
+Both effects are real (3-6x noise) and **sub-additive** — combined A→D is +0.073 where the two individual gains sum
+to +0.084. They supply overlapping capacity rather than complementary mechanisms. **MoE's +0.0488 at matched active
+parameters is the largest architecture effect recorded on this page**, which is what makes `use_moe` the first
+thing to reach for and the loop the first thing to drop.
+
+Three methodological findings came out of this, and they matter more than the verdict:
+
+1. **A 400-step verdict can invert.** At 400 steps the loop *lost* to dense by 0.013; by step 1000 it *led* by
+   0.051; by 3000 the lead had decayed to 0.035 and was still shrinking, while C's lead over B grew from 0.032 to
+   0.050. Depth pulls away from recursion the longer you train. **Most A/Bs on this page are 400-step runs** — that
+   is not a hypothetical concern about them.
+2. **Never compare two runs with different `max_steps` at the same step number.** `warmup_steps = round(max_steps *
+   warmup_ratio)` and the cosine decays over `max_steps`, so a 1000-step run is fully annealed at step 1000 while a
+   3000-step run is mid-schedule. Measured directly: arm D scored 1.7667 at step 1000 of a 1000-step run and 1.9401
+   at step 1000 of a 3000-step run — **same config, same seed, a 0.17 gap that is purely schedule**. An earlier
+   version of these notes reported MoE gains computed across exactly that mismatch; they were wrong by ~5x.
+3. **The per-arm LR sweep was load-bearing, not diligence.** At `lr: 3e-3` arm B *leads* arm A by 0.010; at `1e-2`
+   it trails. The arms' LR curves cross, so a single shared LR would have supported either conclusion.
+
+Caveats: TinyStories at `d_model: 256`, one seed, and the per-arm LRs were tuned at 400 steps then applied at 3000
+(longer runs often prefer slightly lower LRs). Arm B uses the repo's default loop configuration; a different
+conditioning scheme is a separate question this does not address.
+
 ## ACT sparsity — neutral on quality, positive on throughput
 
 A throughput change rather than a quality one, so it is measured separately. On `configs/tinystories_router.yaml`
@@ -291,7 +349,14 @@ a hang; warm steps stay ~0.05s throughout. Keep the range narrow, or set `train.
 5. **Prefer a longer horizon.** An arm can rank differently at step 400 than at step 1500+ once the LR schedule is
    far enough into its decay. Establish the setup's own noise floor with a repeat baseline run rather than borrowing
    one measured elsewhere.
-6. **Benchmark the step, not a short run**, when judging a throughput change — at TinyStories size, 400 steps is
+6. **Never compare two runs with different `max_steps` at the same step number.** `warmup_steps =
+   round(max_steps * warmup_ratio)` and the cosine decays over `max_steps`, so a 1000-step run is fully annealed at
+   step 1000 while a 3000-step run is only a third of the way through its schedule. Measured at 0.17 val/loss for
+   the *same config and seed* — see [the loop-vs-depth section](#the-loop-is-dominated--depth-and-moe-are-the-frontier),
+   where this invalidated a whole round of MoE conclusions by ~5x. Compare runs that share `max_steps`, or compare
+   each run at its own endpoint. This is not implied by caution 5: a longer horizon fixes *when* you read, this
+   fixes *what you may read it against*.
+7. **Benchmark the step, not a short run**, when judging a throughput change — at TinyStories size, 400 steps is
    mostly compile, data loading and eval. And decompose the step before judging: FP4's end-to-end number was
    dominated by an optimizer cost it never touched.
 

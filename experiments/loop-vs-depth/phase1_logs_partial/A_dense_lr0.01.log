@@ -1,0 +1,22 @@
+[radiance] padding vocab 50,257 -> 50,304 (multiple of 128) for tensor-core-aligned lm_head matmuls
+[radiance] optimizer=muon (muon_lr=0.02 over 42 tensors, adamw lr=0.01 over the rest)
+[radiance] step     25/400 loss 5.7912 lm 5.7823 lr 6.500e-03
+[radiance] step     50/400 loss 4.1322 lm 4.1208 lr 1.275e-02
+[radiance] step     75/400 loss 3.4286 lm 3.4148 lr 1.900e-02
+[radiance] step    100/400 loss 2.9349 lm 2.9197 lr 1.983e-02
+[radiance] step    100 val/loss 3.0519
+[radiance] step    125/400 loss 2.7769 lm 2.7616 lr 1.914e-02
+[radiance] step    150/400 loss 2.5840 lm 2.5683 lr 1.796e-02
+[radiance] step    175/400 loss 2.4989 lm 2.4831 lr 1.636e-02
+[radiance] step    200/400 loss 2.4219 lm 2.4058 lr 1.444e-02
+[radiance] step    200 val/loss 2.4829
+[radiance] step    225/400 loss 2.2601 lm 2.2438 lr 1.232e-02
+[radiance] step    250/400 loss 2.2084 lm 2.1918 lr 1.012e-02
+[radiance] step    275/400 loss 2.2129 lm 2.1964 lr 7.968e-03
+[radiance] step    300/400 loss 2.2025 lm 2.1856 lr 6.000e-03
+[radiance] step    300 val/loss 2.2322
+[radiance] step    325/400 loss 2.2423 lm 2.2254 lr 4.331e-03
+[radiance] step    350/400 loss 2.0820 lm 2.0648 lr 3.063e-03
+[radiance] step    375/400 loss 2.0705 lm 2.0532 lr 2.270e-03
+[radiance] step    400/400 loss 2.0723 lm 2.0548 lr 2.000e-03
+[radiance] step    400 val/loss 2.1044
