@@ -257,6 +257,21 @@ picked 43. The loss change is by far the larger of the two and shrinks with widt
 wide model — the same comparison on `configs/fineweb_500m.yaml` (`d_model: 1280`) is 343.8 -> 338.7 ms/step and 24.5
 -> 20.8 GB.
 
+### Periodic Row-wise Muon — throughput measured, quality not
+
+`train.muon_ns_period: K` runs the full Newton-Schulz update every K steps and a row-normalised step in between
+([arXiv:2608.20818](https://arxiv.org/abs/2608.20818); mechanism in [optim.md](optim.md)). Optimizer step alone on
+`configs/fineweb_500m.yaml` (572M, RTX 5090): **169.5 -> 72.4 ms at K=3, 2.33x** (K=2 1.75x, K=4 2.79x). Against
+231 ms of eager fwd+bwd at the shipped 4x1024 micro-batch that is ~1.32x end-to-end, and the share grows once the
+model side is compiled.
+
+**This is not an A/B and must not be read as one.** Only the wall-clock half is measured here; no `val/loss`
+comparison has been run, which is exactly why the default stays at `K=1` (vanilla Muon, bit-identical) rather than
+the paper's `K=3`. Unlike the throughput work above, this one is *not* supposed to change wall-clock and nothing
+else — it takes a genuinely different step on K-1 of every K steps. Running the A/B is the open item; see the
+cautions below, and note the interaction with effective batch size: the section above makes Newton-Schulz cheaper
+per token by spending more tokens per step, so measure the two together rather than stacking their speedups.
+
 ## Startup compile cost
 
 Measured on the first forward/backward with `mode=None` (`d_model: 256`, `n_layers: 4`, `loop_count: 6`, batch 8 x
