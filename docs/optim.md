@@ -120,6 +120,54 @@ Set `train.target_effective_batch_size` (the config carries it commented out) ra
 `tokens_per_param`'s derived `max_steps` and interacts with the tuned `lr`, so it is a run-shaping decision, not a
 free win to apply silently.
 
+### Periodic Row-wise Muon (`train.muon_ns_period`)
+
+The other end of the same cost. The section above spends *more tokens per step* to amortise Newton-Schulz; this
+runs it *less often*. From [arXiv:2608.20818](https://arxiv.org/abs/2608.20818): do the full NS5 spectral update
+once every `K` steps, and on the K-1 steps in between replace it with `gamma * RowNorm(momentum)` — rescale every
+row of the shorter axis to unit L2 norm. `muon_ns_period: 1` (the default) refreshes every step and is vanilla Muon
+exactly; the row-wise branch is unreachable.
+
+**Why a row norm is the right cheap surrogate, and not just a cheap one.** Orient the matrix so `rows <= cols`
+(which `orthogonalize` already does internally). An exactly orthogonal `r x c` factor satisfies `X @ X.mT = I`, so
+every row of it *already has unit norm*. RowNorm is therefore the diagonal of the constraint NS5 enforces: it keeps
+each row's magnitude and gives up only the mutual orthogonality between rows, which the next refresh restores. Both
+land at `||.||_F ~ sqrt(min(rows, cols))`, which is the magnitude the `sqrt(fan-out / fan-in)` shape scale in
+`_step_muon` is calibrated against — so the two step types compose with the same scale and the same LR.
+
+That makes the **orientation load-bearing rather than cosmetic**. Normalising the long axis instead also yields
+unit-norm vectors, just `sqrt(max/min)` too many of them: a step `2x` too large at a `(64, 16)` shape, silently
+shape-dependent, and mis-corrected by the same shape scale downstream. It is invisible on square weights, which is
+why `test_row_normalize_lands_at_the_same_magnitude_as_newton_schulz` parametrises over both rectangular
+orientations and asserts the wrong-axis magnitude explicitly.
+
+`gamma` (0.15) discounts the row-wise step relative to a refresh. `gamma = 1` would reproduce a refresh step's row
+norms exactly; it sits well below 1 because consecutive row-wise steps are *correlated* — nothing removes the
+direction they share, so they accumulate instead of spreading across singular directions the way orthogonalised
+steps do. The value is the paper's grid (`K in {2,3,4} x gamma in {0.10, 0.15, 0.25, 0.35}` at 1.3B), not a derived
+constant.
+
+Measured on `configs/fineweb_500m.yaml` (572M, `d_model: 1280`, 22 layers, RTX 5090), optimizer step alone:
+
+| `K` | optimizer step | speedup |
+|---|---|---|
+| 1 (default, = vanilla Muon) | 169.5 ms | 1.00x |
+| 2 | 96.4 ms | 1.75x |
+| 3 | 72.4 ms | **2.33x** |
+| 4 | 60.5 ms | 2.79x |
+
+Against 231 ms of eager fwd+bwd at the shipped `4 x 1024` micro-batch, `K=3` is ~1.32x end-to-end — and the
+optimizer's share only grows once the model side is compiled, which is the same Amdahl argument NVFP4 ran into from
+the other direction (see [results.md](results.md)).
+
+**Three things do not transfer from the paper and are not implemented.** Two thirds of its reported win is
+*communication* — sharded momentum, bucketed all-gather, overlap — which a single-GPU run does not pay at all. Its
+quality result is on diffusion transformers at 1.3B-15B, so the "within 0.5%" claim is about scales well above
+anything trained here. And the transient-buffer reserve (`muon_orthogonalize_reserve_bytes`) deliberately does
+**not** shrink with `K`: the spike becomes periodic rather than smaller, and a refresh step still has to fit, so
+sizing the reserve to the average would just move the OOM to every Kth step. Hence the default of 1 — the
+throughput is measured here, the quality is not.
+
 ## Parameter classification
 
 **Both param-group builders classify norm gains by their owning module (`norm_gain_param_ids`), not by `param.dim() <

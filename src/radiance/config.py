@@ -396,6 +396,25 @@ class TrainConfig:
     # grab-bag of tensors whose ideal step sizes differ by orders of magnitude, and the fix is a
     # separate field rather than a compromise value. Measured: see the sweep in CLAUDE.md.
     muon_momentum: float = 0.95
+    muon_ns_period: int = 1  # K in Periodic Row-wise Muon (arXiv:2608.20818): run the full 5-step
+    # Newton-Schulz spectral update once every K optimizer steps, and take the much cheaper
+    # `muon_rownorm_gamma * RowNorm(momentum)` step on the K-1 steps in between. 1 (the default)
+    # refreshes every step, which is vanilla Muon *exactly* — the row-wise branch is never reached —
+    # so this is the range-collapsed inert default this file's convention asks for.
+    #
+    # It stays at 1 rather than at the paper's K=3 on convention 2 in CLAUDE.md — a feature is
+    # defaulted on because of a *measurement*, and the quality measurement has not been made here.
+    # The throughput half has: 169.5 -> 72.4 ms per optimizer step on configs/fineweb_500m.yaml,
+    # 2.3x (docs/optim.md). The quality half is the paper's, and it does not transfer for free:
+    # their result is on 1.3B-15B *diffusion* transformers with momentum sharded across many GPUs,
+    # where two thirds of the reported win is communication volume a single-GPU run never pays,
+    # and "within 0.5% at 1.3B-4B" is a claim about scales well above anything trained here. K > 1
+    # takes a genuinely cheaper step on K-1 of every K steps; A/B it before changing this default.
+    muon_rownorm_gamma: float = 0.15  # scale on the row-normalised update taken on non-refresh
+    # steps; only read when muon_ns_period > 1. The paper's grid value (K in {2,3,4} x gamma in
+    # {0.10, 0.15, 0.25, 0.35} at 1.3B, which picked K=3, gamma=0.15). gamma = 1 would reproduce a
+    # refresh step's row norms exactly; it sits well below 1 because consecutive row-wise steps
+    # share a direction that nothing orthogonalises away. See optim._step_muon_rownorm.
     weight_decay: float = 0.01
     warmup_ratio: float = 0.04  # warmup_steps = round(max_steps * warmup_ratio)
     min_lr_ratio: float = 0.1  # the schedule decays to min_lr_ratio * lr, not to 0 — the tail of a

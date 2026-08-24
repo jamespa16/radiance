@@ -301,6 +301,10 @@ def muon_orthogonalize_reserve_bytes(model: torch.nn.Module, cfg: Config) -> int
     covers the *persistent* grad/momentum footprint (which does scale with num_params); this covers
     the *transient* per-optimizer-step spike that footprint estimate has no term for at all.
 
+    cfg.train.muon_ns_period deliberately does *not* shrink this. It makes the spike periodic
+    rather than per-step, but the peak is unchanged and a refresh step still has to fit — sizing
+    the reserve to the average would just move the OOM to every Kth step.
+
     Returns 0 when cfg.train.optimizer isn't "muon" (nothing to reserve for) or the model has no
     Muon-owned tensors (e.g. every hidden weight excluded some other way).
 
@@ -374,6 +378,61 @@ def orthogonalize(grad: torch.Tensor, steps: int = 5, eps: float = 1.0e-7) -> to
     return X.to(grad.dtype)
 
 
+def row_normalize(grad: torch.Tensor, eps: float = 1.0e-7) -> torch.Tensor:
+    """Rescale every row of the **shorter** axis to unit L2 norm: the cheap stand-in for
+    `orthogonalize` that Periodic Row-wise Muon (arXiv:2608.20818) uses on non-refresh steps.
+
+    Why this is the natural surrogate rather than an arbitrary cheaper normaliser: orient the
+    matrix so rows <= cols (which is what `orthogonalize` does internally too, and what the paper
+    calls its canonical orientation). An exactly orthogonal r x c factor with r <= c satisfies
+    X @ X.mT = I, so *every row already has unit norm* — row normalisation is precisely the
+    diagonal of the constraint Newton-Schulz enforces, keeping each row's magnitude and dropping
+    only the mutual orthogonality between rows. That is what makes it a well-scaled approximation
+    of the same update rather than a different optimizer: both produce a Frobenius norm of
+    ~sqrt(min(rows, cols)), which is exactly the magnitude `_step_muon`'s shape scale then corrects
+    to sqrt(fan-out / fan-in).
+
+    The orientation is therefore load-bearing, not cosmetic. Normalising along the *longer* axis
+    instead would give max(rows, cols) unit-norm vectors and a Frobenius norm of sqrt(max(...)) —
+    a step sqrt(max/min) too large, silently shape-dependent, and mis-corrected by the same shape
+    scale downstream. Rather than transposing (which would leave the result non-contiguous for the
+    `torch._foreach_*` path), this picks the reduction axis and broadcasts, so it is also generic
+    over leading batch dims: a BatchedExperts (n_experts, in, out) tensor is handled per expert
+    with no unbinding, the same way `orthogonalize` is.
+
+    Cost is one reduction plus one divide over the tensor, against `ns_steps` iterations of three
+    matmuls — which is the entire point of doing it on K-1 of every K steps.
+    """
+    dim = -1 if grad.size(-2) <= grad.size(-1) else -2
+    return grad / grad.norm(dim=dim, keepdim=True).clamp_min(eps)
+
+
+def _resume_param_groups(
+    optimizer: torch.optim.Optimizer, state_dict: dict, force_keys: tuple[str, ...] = ()
+) -> None:
+    """Shared `load_state_dict` body for `MuonWithAuxAdam` and `CPUOffloadAdamW`: backfill any
+    `defaults` key the saved state predates, then force `force_keys` to the value this instance was
+    constructed with instead of whatever the checkpoint saved. See the callers' docstrings for why
+    each half is needed.
+    """
+    torch.optim.Optimizer.load_state_dict(optimizer, state_dict)
+    for group in optimizer.param_groups:
+        for key, value in optimizer.defaults.items():
+            group.setdefault(key, value)
+        for key in force_keys:
+            group[key] = optimizer.defaults[key]
+
+
+def _muon_shape_scale(rows: int, cols: int) -> float:
+    """sqrt(fan-out / fan-in) restoration factor: Newton-Schulz (and its row-normalised surrogate,
+    see `row_normalize`) drive a matrix's Frobenius norm to ~sqrt(min(rows, cols)) regardless of its
+    shape, and this rescales that back to the standard muP-correct magnitude. Shared by `_step_muon`
+    and `_step_muon_rownorm` so the refresh and row-wise steps stay scale-matched to each other —
+    see the comment on `scale` in `_step_muon` for the full derivation.
+    """
+    return max(1.0, rows / cols) ** 0.5
+
+
 class MuonWithAuxAdam(torch.optim.Optimizer):
     """Muon for the hidden weight matrices, AdamW for everything else, in one Optimizer object.
 
@@ -395,15 +454,21 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
         momentum: float = 0.95,
         nesterov: bool = True,
         ns_steps: int = 5,
+        ns_period: int = 1,
+        rownorm_gamma: float = 0.15,
         betas: tuple[float, float] = (0.9, 0.999),
         eps: float = 1.0e-8,
         device: str = "cpu",
     ) -> None:
+        if ns_period < 1:
+            raise ValueError(f"muon_ns_period must be >= 1 (got {ns_period}); 1 runs Newton-Schulz every step")
         defaults = dict(
             algorithm="adamw",
             momentum=momentum,
             nesterov=nesterov,
             ns_steps=ns_steps,
+            ns_period=ns_period,
+            rownorm_gamma=rownorm_gamma,
             betas=betas,
             eps=eps,
             offload=False,
@@ -412,6 +477,31 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
         super().__init__(param_groups, defaults)
         self._device = device
         self._is_cuda = device.split(":")[0] == "cuda"
+
+    def load_state_dict(self, state_dict) -> None:
+        """Backfill any group key the saved state predates, then re-apply `ns_period`/`rownorm_gamma`
+        from *this instance's construction* rather than the checkpoint.
+
+        torch.optim.Optimizer.load_state_dict replaces each live param_group wholesale with the
+        saved one (it carries over only "params"), so every key added to `defaults` after a
+        checkpoint was written simply disappears from the group on resume — and the next step()
+        raises KeyError on it. That is latent for every key here, not just the new ones; resuming a
+        checkpoint from before `ns_period`/`rownorm_gamma` existed is just the first time it would
+        have fired. Reapplying `defaults` for missing keys only (never overwriting a saved value)
+        makes resume forward-compatible the same way Config.__setstate__ does for the schema.
+
+        `ns_period`/`rownorm_gamma` need more than that, though: build_optimizer constructs this
+        instance from *this run's* `cfg.train.muon_ns_period`/`muon_rownorm_gamma` before
+        `load_state_dict` runs, but once a checkpoint has been saved by this PR's code it already
+        carries those keys — so the backfill-if-missing rule above is a no-op for them, and the
+        edited config value would be silently discarded by the wholesale group replacement, right
+        when the config.py comment inviting an A/B of this default over a resume is what a user is
+        actually doing. Forcing them back to `self.defaults` (populated from the constructor
+        argument, i.e. the current config) after the backfill makes that edit take effect. `step` is
+        deliberately left alone: it is genuine progress, not a config knob, and resuming should
+        continue the periodic phase from where the checkpoint left off.
+        """
+        _resume_param_groups(self, state_dict, force_keys=("ns_period", "rownorm_gamma"))
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -489,6 +579,21 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
         if weight_decay != 0:
             torch._foreach_mul_(params, 1 - lr * weight_decay)
 
+        # Periodic Row-wise Muon: run the full Newton-Schulz spectral update only every `ns_period`
+        # steps, and take the cheap row-normalised step in between. `ns_period == 1` refreshes every
+        # step, which is vanilla Muon exactly — the branch below is never taken and nothing about
+        # the arithmetic changes — so this is inert at its default. See _step_muon_rownorm.
+        #
+        # The counter lives on the group rather than in self.state because it is per-group, not
+        # per-parameter, and group keys round-trip through Optimizer.state_dict(). `.get` rather
+        # than `[...]` so a checkpoint saved before this field existed resumes at step 0 (a full
+        # refresh) instead of raising.
+        step = group.get("step", 0)
+        group["step"] = step + 1
+        if group["ns_period"] > 1 and step % group["ns_period"] != 0:
+            self._step_muon_rownorm(group, params, updates, lr)
+            return
+
         # Flatten every tensor into its individual (in, out) matrices: a plain 2-D weight unbinds to
         # itself (one entry), a BatchedExperts-style (n_experts, in, out) tensor unbinds to
         # n_experts entries. Each entry remembers where its update belongs — (param index, expert
@@ -509,7 +614,7 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
             # standard sqrt(fan-out / fan-in) scaling, which is also what makes Muon approximately
             # muP-correct without a separate width correction (see build_muon_param_groups). It
             # depends only on the matrix shape, so it is constant across a batch.
-            scale = max(1.0, shape[-2] / shape[-1]) ** 0.5
+            scale = _muon_shape_scale(shape[-2], shape[-1])
             for start in range(0, len(entries), _MUON_MAX_STACK):
                 chunk = entries[start : start + _MUON_MAX_STACK]
                 if len(chunk) == 1:
@@ -522,6 +627,51 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
                 )
                 targets = [params[i] if e is None else params[i][e] for i, e, _ in chunk]
                 torch._foreach_add_(targets, list(stacked.unbind(0)), alpha=-lr * scale)
+
+    def _step_muon_rownorm(
+        self, group: dict, params: list, updates: list, lr: float
+    ) -> None:
+        """The non-refresh half of Periodic Row-wise Muon: `gamma * RowNorm(momentum)` in place of
+        `NS5(momentum)`, carrying the same shape scale and the same LR.
+
+        The measurement this exists to act on is that Newton-Schulz is not a rounding error in the
+        step. It is `ns_steps` iterations of three matmuls over every hidden weight in the model,
+        run once per optimizer step, and it does not shrink when anything else gets faster — which
+        is why it showed up as a flat, untouched cost that capped the end-to-end win from NVFP4
+        (docs/results.md) and why its transient buffers, not parameter count, are what
+        `muon_orthogonalize_reserve_bytes` has to hold VRAM back for. Refreshing every K steps cuts
+        that by a factor of K.
+
+        Why the in-between step can be this cheap without becoming a different optimizer: see
+        `row_normalize`. The orthogonal factor NS5 converges to already has unit-norm rows in the
+        short-axis orientation, so RowNorm keeps the per-row magnitude the shape scale is calibrated
+        against and gives up only the cross-row decorrelation, which the next refresh restores.
+
+        `gamma` (0.15) then discounts that step relative to a refresh. It is a tuned constant from
+        the paper's 1.3B grid (K in {2,3,4} x gamma in {0.10, 0.15, 0.25, 0.35}), not a derived one:
+        gamma = 1 would match a refresh step's row norms exactly, and it is set well below 1 because
+        consecutive row-wise steps are *correlated* in a way orthogonalised ones are not — nothing
+        removes the shared direction between them, so they accumulate rather than spreading across
+        singular directions.
+
+        No shape grouping, chunking, or unbinding here, unlike the refresh path: row normalisation
+        is a reduction, not a matmul, so there is nothing to batch and no transient buffer to bound.
+        `row_normalize` is still called once per tensor rather than through `torch._foreach_*` — there
+        is no `torch._foreach_norm` to batch the reduction across tensors of different shape — but
+        that is one reduction each, not an NS iteration's three matmuls, which is the cost this path
+        exists to avoid. Only the scale-and-add below batches across tensors: the per-tensor shape
+        scale goes in as a scalar list on `_foreach_mul_` (it is uniform across a BatchedExperts
+        tensor's leading expert dim, since every expert shares the (in, out) shape), for two foreach
+        launches total.
+        """
+        gamma = group["rownorm_gamma"]
+        directions = [row_normalize(u) for u in updates]
+        # Same sqrt(fan-out / fan-in) restoration the refresh path applies per shape — see
+        # _muon_shape_scale.
+        torch._foreach_mul_(
+            directions, [gamma * _muon_shape_scale(u.shape[-2], u.shape[-1]) for u in updates]
+        )
+        torch._foreach_add_(params, directions, alpha=-lr)
 
     def _step_adamw(self, group: dict) -> None:
         lr, weight_decay = group["lr"], group["weight_decay"]
@@ -627,6 +777,8 @@ def build_optimizer(model: torch.nn.Module, cfg: Config, device: str) -> torch.o
         return MuonWithAuxAdam(
             build_muon_param_groups(model, cfg),
             momentum=cfg.train.muon_momentum,
+            ns_period=cfg.train.muon_ns_period,
+            rownorm_gamma=cfg.train.muon_rownorm_gamma,
             device=device,
         )
     raise ValueError(f"Unknown train.optimizer {cfg.train.optimizer!r}, expected 'muon' or 'adamw'")
@@ -653,6 +805,20 @@ class CPUOffloadAdamW(torch.optim.Optimizer):
         super().__init__(params, dict(lr=lr, weight_decay=weight_decay, betas=betas, eps=eps))
         self._device = device
         self._is_cuda = device.split(":")[0] == "cuda"
+
+    def load_state_dict(self, state_dict) -> None:
+        """Backfill any group key the saved state predates.
+
+        torch.optim.Optimizer.load_state_dict replaces each live param_group wholesale with the
+        saved one (it carries over only "params"), so every key added to `defaults` (`lr`,
+        `weight_decay`, `betas`, `eps` here) after a checkpoint was written simply disappears from
+        the group on resume — and the next step() raises KeyError on it. Reapplying `defaults` for
+        missing keys only (never overwriting a saved value) makes resume forward-compatible the same
+        way Config.__setstate__ does for the schema. Unlike `MuonWithAuxAdam`, this class has no
+        A/B-over-resume knob analogous to `ns_period`/`rownorm_gamma`, so nothing needs forcing back
+        to the constructed value — see `_resume_param_groups`.
+        """
+        _resume_param_groups(self, state_dict)
 
     @torch.no_grad()
     def step(self, closure=None):

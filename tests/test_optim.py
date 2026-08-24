@@ -594,3 +594,155 @@ def test_muon_step_chunks_within_batched_expert_tensors(monkeypatch):
     unbounded = run(max_stack=1000)  # 1 orthogonalize() call over all 12 at once
 
     torch.testing.assert_close(chunked, unbounded, rtol=2e-2, atol=1e-3)
+
+
+# --- Periodic Row-wise Muon (arXiv:2608.20818) ----------------------------------------------
+
+
+@pytest.mark.parametrize("shape", [(32, 32), (64, 16), (16, 64), (4, 10, 6)])
+def test_row_normalize_lands_at_the_same_magnitude_as_newton_schulz(shape):
+    """The claim that makes RowNorm a *stand-in* for Newton-Schulz rather than a different update:
+    an orthogonal r x c factor with r <= c satisfies X @ X.mT = I, so its rows already have unit
+    norm. Both therefore land at ||.||_F ~ sqrt(min(rows, cols)) — the magnitude the shape scale in
+    _step_muon is calibrated against.
+
+    The agreement is to ~15%, not to precision, and that is the coefficients' doing rather than
+    slack in the test: the quintic drives singular values into a band around 1 instead of onto it
+    (see test_orthogonalize_drives_singular_values_toward_one), so a refresh step's own Frobenius
+    norm sits a little under sqrt(r) too. What the test really pins is the *orientation*, checked
+    below by the margin between right and wrong: normalising the long axis also yields unit-norm
+    vectors, just sqrt(max/min) too many of them, and nothing downstream would notice.
+    """
+    torch.manual_seed(0)
+    grad = torch.randn(*shape)
+    rows, cols = shape[-2], shape[-1]
+    short, long = min(rows, cols), max(rows, cols)
+
+    ns = orthogonalize(grad).norm(dim=(-2, -1)) / short**0.5
+    rownorm = optim_module.row_normalize(grad).norm(dim=(-2, -1)) / short**0.5
+    torch.testing.assert_close(rownorm, torch.ones_like(rownorm), rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(ns, rownorm, rtol=0.15, atol=0.0)
+
+    # The wrong axis, for contrast: off by sqrt(max/min), which is 2x at (64, 16) and exactly 1x at
+    # (32, 32) — the square case is why the orientation bug cannot be caught on square shapes alone.
+    dim = -1 if rows > cols else -2
+    wrong = (grad / grad.norm(dim=dim, keepdim=True)).norm(dim=(-2, -1)) / short**0.5
+    torch.testing.assert_close(wrong, torch.full_like(wrong, (long / short) ** 0.5), rtol=1e-5, atol=1e-5)
+
+
+def test_ns_period_one_never_takes_the_row_wise_branch(monkeypatch):
+    """The inert default: at muon_ns_period=1 every step is a refresh, so vanilla Muon's arithmetic
+    is untouched no matter what muon_rownorm_gamma says."""
+    called = []
+    monkeypatch.setattr(
+        MuonWithAuxAdam,
+        "_step_muon_rownorm",
+        lambda self, *a, **k: called.append(1),
+    )
+    model, cfg = _model_and_cfg()
+    cfg.train.muon_rownorm_gamma = 0.9  # would be very visible if it were ever read
+    optimizer = build_optimizer(model, cfg, "cpu")
+
+    for _ in range(4):
+        model(torch.randint(0, TINY_VOCAB, (2, 8))).logits.square().mean().backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+    assert called == []
+
+
+def test_ns_period_refreshes_on_the_first_step_and_every_kth_after(monkeypatch):
+    """rho_t = 1[t mod K == 0] with t counted from 0, so step 0 is a *full* spectral step. Starting
+    the schedule on a row-wise step instead would take the very first update — the one applied to a
+    freshly initialised model — from an unorthogonalised direction."""
+    refreshes = []
+    real = optim_module.orthogonalize
+    monkeypatch.setattr(
+        optim_module, "orthogonalize", lambda *a, **k: (refreshes.append(1), real(*a, **k))[1]
+    )
+    model, cfg = _model_and_cfg()
+    cfg.train.muon_ns_period = 3
+    optimizer = build_optimizer(model, cfg, "cpu")
+
+    seen = []
+    for _ in range(7):
+        model(torch.randint(0, TINY_VOCAB, (2, 8))).logits.square().mean().backward()
+        refreshes.clear()
+        optimizer.step()
+        optimizer.zero_grad()
+        seen.append(bool(refreshes))
+
+    assert seen == [True, False, False, True, False, False, True]
+
+
+def test_row_wise_step_direction_and_magnitude():
+    """One non-refresh step, checked against the closed form: the parameter moves by
+    -lr * gamma * sqrt(fan-out / fan-in) * RowNorm(momentum), with weight decay applied first."""
+    torch.manual_seed(0)
+    grad = torch.randn(16, 4) * 0.1
+    param = torch.randn(16, 4, requires_grad=True)
+    lr, wd, gamma, momentum = 0.02, 0.01, 0.15, 0.95
+    opt = MuonWithAuxAdam(
+        [{"params": [param], "algorithm": "muon", "lr": lr, "weight_decay": wd}],
+        ns_period=2,
+        rownorm_gamma=gamma,
+        momentum=momentum,
+    )
+
+    param.grad = grad.clone()
+    opt.step()  # step 0: refresh
+    before = param.detach().clone()
+    buf = opt.state[param]["momentum_buffer"].clone()
+
+    param.grad = grad.clone()
+    opt.step()  # step 1: row-wise
+    update = torch.lerp(grad, torch.lerp(buf, grad, 1 - momentum), momentum)  # nesterov
+    scale = gamma * (16 / 4) ** 0.5
+    expected = before * (1 - lr * wd) - lr * scale * optim_module.row_normalize(update)
+
+    torch.testing.assert_close(param.detach(), expected)
+
+
+def test_ns_period_below_one_raises():
+    param = torch.zeros(4, 4, requires_grad=True)
+    with pytest.raises(ValueError, match="muon_ns_period"):
+        MuonWithAuxAdam(
+            [{"params": [param], "algorithm": "muon", "lr": 0.02, "weight_decay": 0.0}], ns_period=0
+        )
+
+
+def test_step_counter_survives_a_checkpoint_round_trip():
+    """The refresh phase lives on the param group, so a resumed run must not silently restart the
+    K-cycle (and a checkpoint written before the field existed must still load). `ns_period` is the
+    opposite: it is a config-editable A/B knob, so a resume must pick up *this run's* config value,
+    not whatever the checkpoint happened to save — see MuonWithAuxAdam.load_state_dict."""
+    model, cfg = _model_and_cfg()
+    cfg.train.muon_ns_period = 3
+    optimizer = build_optimizer(model, cfg, "cpu")
+    model(torch.randint(0, TINY_VOCAB, (2, 8))).logits.square().mean().backward()
+    optimizer.step()
+    optimizer.step()
+
+    state = optimizer.state_dict()
+
+    fresh_model, fresh_cfg = _model_and_cfg()
+    fresh_cfg.train.muon_ns_period = 5
+    fresh = build_optimizer(fresh_model, fresh_cfg, "cpu")
+    fresh.load_state_dict(state)
+    muon_group = next(g for g in fresh.param_groups if g["algorithm"] == "muon")
+    assert muon_group["step"] == 2
+    assert muon_group["ns_period"] == 5
+
+    # A pre-existing checkpoint has no "step"/"ns_period" key at all: resume at step 0 (a refresh)
+    # and this run's config ns_period, never raise.
+    for group in state["param_groups"]:
+        group.pop("step", None)
+        group.pop("ns_period", None)
+    legacy_model, legacy_cfg = _model_and_cfg()
+    legacy_cfg.train.muon_ns_period = 5
+    legacy = build_optimizer(legacy_model, legacy_cfg, "cpu")
+    legacy.load_state_dict(state)
+    legacy_muon_group = next(g for g in legacy.param_groups if g["algorithm"] == "muon")
+    assert legacy_muon_group.get("step", 0) == 0
+    assert legacy_muon_group["ns_period"] == 5
+    legacy.step()
