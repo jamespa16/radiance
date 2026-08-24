@@ -407,6 +407,32 @@ def row_normalize(grad: torch.Tensor, eps: float = 1.0e-7) -> torch.Tensor:
     return grad / grad.norm(dim=dim, keepdim=True).clamp_min(eps)
 
 
+def _resume_param_groups(
+    optimizer: torch.optim.Optimizer, state_dict: dict, force_keys: tuple[str, ...] = ()
+) -> None:
+    """Shared `load_state_dict` body for `MuonWithAuxAdam` and `CPUOffloadAdamW`: backfill any
+    `defaults` key the saved state predates, then force `force_keys` to the value this instance was
+    constructed with instead of whatever the checkpoint saved. See the callers' docstrings for why
+    each half is needed.
+    """
+    torch.optim.Optimizer.load_state_dict(optimizer, state_dict)
+    for group in optimizer.param_groups:
+        for key, value in optimizer.defaults.items():
+            group.setdefault(key, value)
+        for key in force_keys:
+            group[key] = optimizer.defaults[key]
+
+
+def _muon_shape_scale(rows: int, cols: int) -> float:
+    """sqrt(fan-out / fan-in) restoration factor: Newton-Schulz (and its row-normalised surrogate,
+    see `row_normalize`) drive a matrix's Frobenius norm to ~sqrt(min(rows, cols)) regardless of its
+    shape, and this rescales that back to the standard muP-correct magnitude. Shared by `_step_muon`
+    and `_step_muon_rownorm` so the refresh and row-wise steps stay scale-matched to each other —
+    see the comment on `scale` in `_step_muon` for the full derivation.
+    """
+    return max(1.0, rows / cols) ** 0.5
+
+
 class MuonWithAuxAdam(torch.optim.Optimizer):
     """Muon for the hidden weight matrices, AdamW for everything else, in one Optimizer object.
 
@@ -453,7 +479,8 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
         self._is_cuda = device.split(":")[0] == "cuda"
 
     def load_state_dict(self, state_dict) -> None:
-        """Backfill any group key the saved state predates.
+        """Backfill any group key the saved state predates, then re-apply `ns_period`/`rownorm_gamma`
+        from *this instance's construction* rather than the checkpoint.
 
         torch.optim.Optimizer.load_state_dict replaces each live param_group wholesale with the
         saved one (it carries over only "params"), so every key added to `defaults` after a
@@ -462,11 +489,19 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
         checkpoint from before `ns_period`/`rownorm_gamma` existed is just the first time it would
         have fired. Reapplying `defaults` for missing keys only (never overwriting a saved value)
         makes resume forward-compatible the same way Config.__setstate__ does for the schema.
+
+        `ns_period`/`rownorm_gamma` need more than that, though: build_optimizer constructs this
+        instance from *this run's* `cfg.train.muon_ns_period`/`muon_rownorm_gamma` before
+        `load_state_dict` runs, but once a checkpoint has been saved by this PR's code it already
+        carries those keys — so the backfill-if-missing rule above is a no-op for them, and the
+        edited config value would be silently discarded by the wholesale group replacement, right
+        when the config.py comment inviting an A/B of this default over a resume is what a user is
+        actually doing. Forcing them back to `self.defaults` (populated from the constructor
+        argument, i.e. the current config) after the backfill makes that edit take effect. `step` is
+        deliberately left alone: it is genuine progress, not a config knob, and resuming should
+        continue the periodic phase from where the checkpoint left off.
         """
-        super().load_state_dict(state_dict)
-        for group in self.param_groups:
-            for key, value in self.defaults.items():
-                group.setdefault(key, value)
+        _resume_param_groups(self, state_dict, force_keys=("ns_period", "rownorm_gamma"))
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -579,7 +614,7 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
             # standard sqrt(fan-out / fan-in) scaling, which is also what makes Muon approximately
             # muP-correct without a separate width correction (see build_muon_param_groups). It
             # depends only on the matrix shape, so it is constant across a batch.
-            scale = max(1.0, shape[-2] / shape[-1]) ** 0.5
+            scale = _muon_shape_scale(shape[-2], shape[-1])
             for start in range(0, len(entries), _MUON_MAX_STACK):
                 chunk = entries[start : start + _MUON_MAX_STACK]
                 if len(chunk) == 1:
@@ -621,16 +656,20 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
 
         No shape grouping, chunking, or unbinding here, unlike the refresh path: row normalisation
         is a reduction, not a matmul, so there is nothing to batch and no transient buffer to bound.
-        The per-tensor shape scale goes in as a scalar list on `_foreach_mul_` (it is uniform across
-        a BatchedExperts tensor's leading expert dim, since every expert shares the (in, out) shape),
-        which keeps the whole step to three foreach launches.
+        `row_normalize` is still called once per tensor rather than through `torch._foreach_*` — there
+        is no `torch._foreach_norm` to batch the reduction across tensors of different shape — but
+        that is one reduction each, not an NS iteration's three matmuls, which is the cost this path
+        exists to avoid. Only the scale-and-add below batches across tensors: the per-tensor shape
+        scale goes in as a scalar list on `_foreach_mul_` (it is uniform across a BatchedExperts
+        tensor's leading expert dim, since every expert shares the (in, out) shape), for two foreach
+        launches total.
         """
         gamma = group["rownorm_gamma"]
         directions = [row_normalize(u) for u in updates]
-        # Same sqrt(fan-out / fan-in) restoration the refresh path applies per shape — see the
-        # comment on `scale` in _step_muon.
+        # Same sqrt(fan-out / fan-in) restoration the refresh path applies per shape — see
+        # _muon_shape_scale.
         torch._foreach_mul_(
-            directions, [gamma * max(1.0, u.shape[-2] / u.shape[-1]) ** 0.5 for u in updates]
+            directions, [gamma * _muon_shape_scale(u.shape[-2], u.shape[-1]) for u in updates]
         )
         torch._foreach_add_(params, directions, alpha=-lr)
 
@@ -771,17 +810,15 @@ class CPUOffloadAdamW(torch.optim.Optimizer):
         """Backfill any group key the saved state predates.
 
         torch.optim.Optimizer.load_state_dict replaces each live param_group wholesale with the
-        saved one (it carries over only "params"), so every key added to `defaults` after a
-        checkpoint was written simply disappears from the group on resume — and the next step()
-        raises KeyError on it. That is latent for every key here, not just the new ones; resuming a
-        checkpoint from before `ns_period`/`rownorm_gamma` existed is just the first time it would
-        have fired. Reapplying `defaults` for missing keys only (never overwriting a saved value)
-        makes resume forward-compatible the same way Config.__setstate__ does for the schema.
+        saved one (it carries over only "params"), so every key added to `defaults` (`lr`,
+        `weight_decay`, `betas`, `eps` here) after a checkpoint was written simply disappears from
+        the group on resume — and the next step() raises KeyError on it. Reapplying `defaults` for
+        missing keys only (never overwriting a saved value) makes resume forward-compatible the same
+        way Config.__setstate__ does for the schema. Unlike `MuonWithAuxAdam`, this class has no
+        A/B-over-resume knob analogous to `ns_period`/`rownorm_gamma`, so nothing needs forcing back
+        to the constructed value — see `_resume_param_groups`.
         """
-        super().load_state_dict(state_dict)
-        for group in self.param_groups:
-            for key, value in self.defaults.items():
-                group.setdefault(key, value)
+        _resume_param_groups(self, state_dict)
 
     @torch.no_grad()
     def step(self, closure=None):

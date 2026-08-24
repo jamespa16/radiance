@@ -713,7 +713,9 @@ def test_ns_period_below_one_raises():
 
 def test_step_counter_survives_a_checkpoint_round_trip():
     """The refresh phase lives on the param group, so a resumed run must not silently restart the
-    K-cycle (and a checkpoint written before the field existed must still load)."""
+    K-cycle (and a checkpoint written before the field existed must still load). `ns_period` is the
+    opposite: it is a config-editable A/B knob, so a resume must pick up *this run's* config value,
+    not whatever the checkpoint happened to save — see MuonWithAuxAdam.load_state_dict."""
     model, cfg = _model_and_cfg()
     cfg.train.muon_ns_period = 3
     optimizer = build_optimizer(model, cfg, "cpu")
@@ -722,16 +724,25 @@ def test_step_counter_survives_a_checkpoint_round_trip():
     optimizer.step()
 
     state = optimizer.state_dict()
-    fresh = build_optimizer(*_model_and_cfg(), "cpu")
+
+    fresh_model, fresh_cfg = _model_and_cfg()
+    fresh_cfg.train.muon_ns_period = 5
+    fresh = build_optimizer(fresh_model, fresh_cfg, "cpu")
     fresh.load_state_dict(state)
     muon_group = next(g for g in fresh.param_groups if g["algorithm"] == "muon")
     assert muon_group["step"] == 2
-    assert muon_group["ns_period"] == 3
+    assert muon_group["ns_period"] == 5
 
-    # A pre-existing checkpoint has no "step" key at all: resume at 0 (a refresh), never raise.
+    # A pre-existing checkpoint has no "step"/"ns_period" key at all: resume at step 0 (a refresh)
+    # and this run's config ns_period, never raise.
     for group in state["param_groups"]:
         group.pop("step", None)
         group.pop("ns_period", None)
-    legacy = build_optimizer(*_model_and_cfg(), "cpu")
+    legacy_model, legacy_cfg = _model_and_cfg()
+    legacy_cfg.train.muon_ns_period = 5
+    legacy = build_optimizer(legacy_model, legacy_cfg, "cpu")
     legacy.load_state_dict(state)
+    legacy_muon_group = next(g for g in legacy.param_groups if g["algorithm"] == "muon")
+    assert legacy_muon_group.get("step", 0) == 0
+    assert legacy_muon_group["ns_period"] == 5
     legacy.step()
