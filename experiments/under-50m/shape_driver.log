@@ -1,0 +1,21 @@
+[driver] === d256_L16_fm4 ===
+[driver] d256_L16_fm4 done in 477s :: [radiance] step   8000 val/loss 1.4499
+[driver] === d256_L24_fm3 ===
+[driver] d256_L24_fm3 done in 535s :: [radiance] step   8000 val/loss 1.4191
+[driver] === d320_L10_fm4 ===
+[driver] d320_L10_fm4 done in 453s :: [radiance] step   8000 val/loss 1.4395
+[driver] === d320_L14_fm3 ===
+[driver] d320_L14_fm3 done in 479s :: [radiance] step   8000 val/loss 1.4192
+[driver] === d384_L6_fm4 ===
+[driver] d384_L6_fm4 done in 412s :: [radiance] step   8000 val/loss 1.4539
+[driver] === d384_L9_fm3 ===
+[driver] d384_L9_fm3 done in 438s :: [radiance] step   8000 val/loss 1.4433
+[driver] === d448_L4_fm4 ===
+[driver] d448_L4_fm4 done in 399s :: [radiance] step   8000 val/loss 1.4640
+[driver] === d448_L6_fm3_seed43 ===
+[driver] d448_L6_fm3_seed43 done in 421s :: [radiance] step   8000 val/loss 1.4340
+[driver] === d448_L6_fm3 ===
+[driver] d448_L6_fm3 done in 422s :: [radiance] step   8000 val/loss 1.4363
+[driver] === d512_L4_fm3 ===
+[driver] d512_L4_fm3 done in 400s :: [radiance] step   8000 val/loss 1.4502
+[driver] ALL DONE

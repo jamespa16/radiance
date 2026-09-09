@@ -1,0 +1,120 @@
+[radiance] padding vocab 50,257 -> 50,304 (multiple of 128) for tensor-core-aligned lm_head matmuls
+[radiance] doc_attention_mask on, so compiling without CUDA graphs (mode=None instead of 'reduce-overhead').
+[radiance] optimizer=muon (muon_lr=0.02 over 136 tensors, adamw lr=0.01 over the rest)
+[radiance] step    100/8000 loss 3.6394 lm 3.3657 lr 6.312e-03 mem 5.84GB
+[radiance] step    200/8000 loss 2.8074 lm 2.5307 lr 1.256e-02 mem 5.84GB
+[radiance] step    300/8000 loss 2.6969 lm 2.4221 lr 1.881e-02 mem 5.84GB
+[radiance] step    400/8000 loss 2.5749 lm 2.3006 lr 2.000e-02 mem 5.84GB
+[radiance] step    500/8000 loss 2.3508 lm 2.0752 lr 1.998e-02 mem 5.84GB
+[radiance] step    600/8000 loss 2.2983 lm 2.0284 lr 1.994e-02 mem 5.84GB
+[radiance] step    700/8000 loss 2.2091 lm 1.9380 lr 1.989e-02 mem 5.84GB
+[radiance] step    800/8000 loss 2.1966 lm 1.9232 lr 1.983e-02 mem 5.84GB
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1] Graph break from `Tensor.item()`, consider setting:
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1]     torch._dynamo.config.capture_scalar_outputs = True
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1] or:
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1]     env TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS=1
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1] to include these operations in the captured graph.
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1] 
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1] Graph break: from user code at:
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1]   File "/home/james/dev/radiance/src/radiance/model/transformer.py", line 796, in torch_dynamo_resume_in_forward_at_757
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1]     x = _run_loop_body(
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1]     
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1]   File "/home/james/dev/radiance/src/radiance/model/transformer.py", line 59, in _run_loop_body
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1]     x, _, recorded = _maybe_checkpoint(block, x, cos, sin, ctx, v_first, enabled=grad_checkpoint)
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1]                      ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1]   File "/home/james/dev/radiance/src/radiance/model/transformer.py", line 32, in _maybe_checkpoint
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1]     return fn(*args)
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1]   File "/home/james/dev/radiance/src/radiance/model/block.py", line 64, in forward
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1]     x = x + self.ffn(self.ln2(x, variant), variant)
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1]             ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1]   File "/home/james/dev/radiance/src/radiance/model/ffn.py", line 291, in forward
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1]     capacity = _moe_capacity(self.cfg, n_tokens, assigned if full_capacity else None)
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1]   File "/home/james/dev/radiance/src/radiance/model/ffn.py", line 102, in _moe_capacity
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1]     return _moe_eval_capacity(assigned, n_tokens)
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1]   File "/home/james/dev/radiance/src/radiance/model/ffn.py", line 84, in _moe_eval_capacity
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1]     peak = max(1, int(assigned.sum(dim=0).max().item()))
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1]                       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1] 
+W0909 05:01:29.514000 51391 torch/_dynamo/variables/tensor.py:1759] [1/1] 
+[radiance] step    800 val/loss 1.9690
+[radiance] step    900/8000 loss 2.1715 lm 1.8982 lr 1.975e-02 mem 5.84GB
+[radiance] step   1000/8000 loss 2.0378 lm 1.7612 lr 1.965e-02 mem 5.84GB
+[radiance] step   1100/8000 loss 2.1283 lm 1.8570 lr 1.955e-02 mem 5.84GB
+[radiance] step   1200/8000 loss 2.1811 lm 1.9093 lr 1.942e-02 mem 5.84GB
+[radiance] step   1300/8000 loss 2.0754 lm 1.8005 lr 1.929e-02 mem 5.84GB
+[radiance] step   1400/8000 loss 2.0122 lm 1.7428 lr 1.914e-02 mem 5.84GB
+[radiance] step   1500/8000 loss 2.0045 lm 1.7341 lr 1.897e-02 mem 5.84GB
+[radiance] step   1600/8000 loss 2.0465 lm 1.7737 lr 1.879e-02 mem 5.84GB
+[radiance] step   1600 val/loss 1.7928
+[radiance] step   1700/8000 loss 2.0024 lm 1.7343 lr 1.860e-02 mem 5.84GB
+[radiance] step   1800/8000 loss 1.9699 lm 1.7001 lr 1.840e-02 mem 5.84GB
+[radiance] step   1900/8000 loss 2.0265 lm 1.7546 lr 1.818e-02 mem 5.84GB
+[radiance] step   2000/8000 loss 2.0768 lm 1.8089 lr 1.796e-02 mem 5.84GB
+[radiance] step   2100/8000 loss 1.9457 lm 1.6808 lr 1.772e-02 mem 5.84GB
+[radiance] step   2200/8000 loss 1.9742 lm 1.7058 lr 1.747e-02 mem 5.84GB
+[radiance] step   2300/8000 loss 1.9447 lm 1.6772 lr 1.721e-02 mem 5.84GB
+[radiance] step   2400/8000 loss 1.8852 lm 1.6193 lr 1.693e-02 mem 5.84GB
+[radiance] step   2400 val/loss 1.7159
+[radiance] step   2500/8000 loss 1.8510 lm 1.5814 lr 1.665e-02 mem 5.84GB
+[radiance] step   2600/8000 loss 1.9452 lm 1.6795 lr 1.636e-02 mem 5.84GB
+[radiance] step   2700/8000 loss 1.8927 lm 1.6259 lr 1.606e-02 mem 5.84GB
+[radiance] step   2800/8000 loss 1.9499 lm 1.6825 lr 1.575e-02 mem 5.84GB
+[radiance] step   2900/8000 loss 1.8271 lm 1.5642 lr 1.544e-02 mem 5.84GB
+[radiance] step   3000/8000 loss 1.9482 lm 1.6866 lr 1.511e-02 mem 5.84GB
+[radiance] step   3100/8000 loss 1.8553 lm 1.5892 lr 1.478e-02 mem 5.84GB
+[radiance] step   3200/8000 loss 1.8584 lm 1.5961 lr 1.444e-02 mem 5.84GB
+[radiance] step   3200 val/loss 1.6533
+[radiance] step   3300/8000 loss 1.8427 lm 1.5822 lr 1.410e-02 mem 5.84GB
+[radiance] step   3400/8000 loss 1.8282 lm 1.5635 lr 1.375e-02 mem 5.84GB
+[radiance] step   3500/8000 loss 1.8468 lm 1.5852 lr 1.340e-02 mem 5.84GB
+[radiance] step   3600/8000 loss 1.8582 lm 1.5964 lr 1.304e-02 mem 5.84GB
+[radiance] step   3700/8000 loss 1.8434 lm 1.5803 lr 1.268e-02 mem 5.84GB
+[radiance] step   3800/8000 loss 1.8342 lm 1.5722 lr 1.232e-02 mem 5.84GB
+[radiance] step   3900/8000 loss 1.8779 lm 1.6188 lr 1.196e-02 mem 5.84GB
+[radiance] step   4000/8000 loss 1.8047 lm 1.5400 lr 1.159e-02 mem 5.84GB
+[radiance] step   4000 val/loss 1.6035
+[radiance] step   4100/8000 loss 1.7764 lm 1.5155 lr 1.122e-02 mem 5.84GB
+[radiance] step   4200/8000 loss 1.8310 lm 1.5724 lr 1.085e-02 mem 5.84GB
+[radiance] step   4300/8000 loss 1.8303 lm 1.5672 lr 1.048e-02 mem 5.84GB
+[radiance] step   4400/8000 loss 1.8241 lm 1.5612 lr 1.012e-02 mem 5.84GB
+[radiance] step   4500/8000 loss 1.8545 lm 1.5944 lr 9.752e-03 mem 5.84GB
+[radiance] step   4600/8000 loss 1.7980 lm 1.5341 lr 9.389e-03 mem 5.84GB
+[radiance] step   4700/8000 loss 1.7366 lm 1.4735 lr 9.028e-03 mem 5.84GB
+[radiance] step   4800/8000 loss 1.8834 lm 1.6228 lr 8.671e-03 mem 5.84GB
+[radiance] step   4800 val/loss 1.5583
+[radiance] step   4900/8000 loss 1.7759 lm 1.5104 lr 8.317e-03 mem 5.84GB
+[radiance] step   5000/8000 loss 1.8193 lm 1.5555 lr 7.968e-03 mem 5.84GB
+[radiance] step   5100/8000 loss 1.7633 lm 1.5030 lr 7.624e-03 mem 5.84GB
+[radiance] step   5200/8000 loss 1.7313 lm 1.4661 lr 7.286e-03 mem 5.84GB
+[radiance] step   5300/8000 loss 1.6706 lm 1.4062 lr 6.953e-03 mem 5.84GB
+[radiance] step   5400/8000 loss 1.7084 lm 1.4481 lr 6.628e-03 mem 5.84GB
+[radiance] step   5500/8000 loss 1.7120 lm 1.4463 lr 6.310e-03 mem 5.84GB
+[radiance] step   5600/8000 loss 1.6652 lm 1.3992 lr 6.000e-03 mem 5.84GB
+[radiance] step   5600 val/loss 1.5162
+[radiance] step   5700/8000 loss 1.7966 lm 1.5355 lr 5.698e-03 mem 5.84GB
+[radiance] step   5800/8000 loss 1.6920 lm 1.4265 lr 5.405e-03 mem 5.84GB
+[radiance] step   5900/8000 loss 1.5907 lm 1.3252 lr 5.121e-03 mem 5.84GB
+[radiance] step   6000/8000 loss 1.7551 lm 1.4934 lr 4.848e-03 mem 5.84GB
+[radiance] step   6100/8000 loss 1.7276 lm 1.4620 lr 4.584e-03 mem 5.84GB
+[radiance] step   6200/8000 loss 1.6699 lm 1.4033 lr 4.331e-03 mem 5.84GB
+[radiance] step   6300/8000 loss 1.6949 lm 1.4333 lr 4.090e-03 mem 5.84GB
+[radiance] step   6400/8000 loss 1.7091 lm 1.4435 lr 3.860e-03 mem 5.84GB
+[radiance] step   6400 val/loss 1.4789
+[radiance] step   6500/8000 loss 1.6462 lm 1.3799 lr 3.642e-03 mem 5.84GB
+[radiance] step   6600/8000 loss 1.6601 lm 1.3985 lr 3.436e-03 mem 5.84GB
+[radiance] step   6700/8000 loss 1.6646 lm 1.3983 lr 3.243e-03 mem 5.84GB
+[radiance] step   6800/8000 loss 1.7876 lm 1.5207 lr 3.063e-03 mem 5.84GB
+[radiance] step   6900/8000 loss 1.7251 lm 1.4631 lr 2.896e-03 mem 5.84GB
+[radiance] step   7000/8000 loss 1.7370 lm 1.4706 lr 2.743e-03 mem 5.84GB
+[radiance] step   7100/8000 loss 1.5968 lm 1.3299 lr 2.603e-03 mem 5.84GB
+[radiance] step   7200/8000 loss 1.5219 lm 1.2588 lr 2.478e-03 mem 5.84GB
+[radiance] step   7200 val/loss 1.4517
+[radiance] step   7300/8000 loss 1.6608 lm 1.3935 lr 2.366e-03 mem 5.84GB
+[radiance] step   7400/8000 loss 1.6010 lm 1.3339 lr 2.270e-03 mem 5.84GB
+[radiance] step   7500/8000 loss 1.5804 lm 1.3175 lr 2.188e-03 mem 5.84GB
+[radiance] step   7600/8000 loss 1.7024 lm 1.4350 lr 2.120e-03 mem 5.84GB
+[radiance] step   7700/8000 loss 1.7067 lm 1.4392 lr 2.068e-03 mem 5.84GB
+[radiance] step   7800/8000 loss 1.6092 lm 1.3460 lr 2.030e-03 mem 5.84GB
+[radiance] step   7900/8000 loss 1.6630 lm 1.3951 lr 2.008e-03 mem 5.84GB
+[radiance] step   8000/8000 loss 1.6988 lm 1.4316 lr 2.000e-03 mem 5.84GB
+[radiance] step   8000 val/loss 1.4356

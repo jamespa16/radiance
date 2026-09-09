@@ -1,0 +1,11 @@
+[driver] === d256_L29_fm2.5 ===
+[driver] d256_L29_fm2.5 done in 565s :: [radiance] step   8000 val/loss 1.4211
+[driver] === d256_L37_fm2 ===
+[driver] d256_L37_fm2 done in 631s :: [radiance] step   8000 val/loss 1.4166
+[driver] === d256_L48_fm1.5 ===
+[driver] d256_L48_fm1.5 done in 709s :: [radiance] step   8000 val/loss 1.4172
+[driver] === d320_L17_fm2.5 ===
+[driver] d320_L17_fm2.5 done in 507s :: [radiance] step   8000 val/loss 1.4198
+[driver] === d320_L22_fm2 ===
+[driver] d320_L22_fm2 done in 547s :: [radiance] step   8000 val/loss 1.4163
+[driver] ALL DONE

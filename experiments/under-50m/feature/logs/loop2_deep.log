@@ -1,0 +1,93 @@
+[radiance] padding vocab 50,257 -> 50,304 (multiple of 128) for tensor-core-aligned lm_head matmuls
+[radiance] doc_attention_mask on, so compiling without CUDA graphs (mode=None instead of 'reduce-overhead').
+[radiance] optimizer=muon (muon_lr=0.02 over 133 tensors, adamw lr=0.01 over the rest)
+[radiance] step    100/8000 loss 3.2792 lm 3.2661 lr 6.312e-03 mem 9.53GB
+[radiance] step    200/8000 loss 2.5707 lm 2.5563 lr 1.256e-02 mem 9.53GB
+[radiance] step    300/8000 loss 2.3369 lm 2.3229 lr 1.881e-02 mem 9.53GB
+[radiance] step    400/8000 loss 2.1031 lm 2.0893 lr 2.000e-02 mem 9.53GB
+[radiance] step    500/8000 loss 2.2911 lm 2.2780 lr 1.998e-02 mem 9.53GB
+[radiance] step    600/8000 loss 1.9519 lm 1.9385 lr 1.994e-02 mem 9.53GB
+[radiance] step    700/8000 loss 1.8661 lm 1.8528 lr 1.989e-02 mem 9.53GB
+[radiance] step    800/8000 loss 1.8452 lm 1.8324 lr 1.983e-02 mem 9.53GB
+[radiance] step    800 val/loss 1.9260
+[radiance] step    900/8000 loss 1.7868 lm 1.7740 lr 1.975e-02 mem 9.53GB
+[radiance] step   1000/8000 loss 1.8463 lm 1.8341 lr 1.965e-02 mem 9.53GB
+[radiance] step   1100/8000 loss 1.8774 lm 1.8657 lr 1.955e-02 mem 9.53GB
+[radiance] step   1200/8000 loss 1.8246 lm 1.8133 lr 1.942e-02 mem 9.53GB
+[radiance] step   1300/8000 loss 1.8229 lm 1.8118 lr 1.929e-02 mem 9.53GB
+[radiance] step   1400/8000 loss 1.7106 lm 1.7000 lr 1.914e-02 mem 9.53GB
+[radiance] step   1500/8000 loss 1.7403 lm 1.7303 lr 1.897e-02 mem 9.53GB
+[radiance] step   1600/8000 loss 1.7026 lm 1.6930 lr 1.879e-02 mem 9.53GB
+[radiance] step   1600 val/loss 1.7625
+[radiance] step   1700/8000 loss 1.7095 lm 1.7002 lr 1.860e-02 mem 9.53GB
+[radiance] step   1800/8000 loss 1.7802 lm 1.7716 lr 1.840e-02 mem 9.53GB
+[radiance] step   1900/8000 loss 1.6374 lm 1.6292 lr 1.818e-02 mem 9.53GB
+[radiance] step   2000/8000 loss 1.6252 lm 1.6176 lr 1.796e-02 mem 9.53GB
+[radiance] step   2100/8000 loss 1.7066 lm 1.6995 lr 1.772e-02 mem 9.53GB
+[radiance] step   2200/8000 loss 1.7231 lm 1.7167 lr 1.747e-02 mem 9.53GB
+[radiance] step   2300/8000 loss 1.5777 lm 1.5716 lr 1.721e-02 mem 9.53GB
+[radiance] step   2400/8000 loss 1.7261 lm 1.7207 lr 1.693e-02 mem 9.53GB
+[radiance] step   2400 val/loss 1.6833
+[radiance] step   2500/8000 loss 1.6550 lm 1.6500 lr 1.665e-02 mem 9.53GB
+[radiance] step   2600/8000 loss 1.6151 lm 1.6106 lr 1.636e-02 mem 9.53GB
+[radiance] step   2700/8000 loss 1.5697 lm 1.5654 lr 1.606e-02 mem 9.53GB
+[radiance] step   2800/8000 loss 1.6823 lm 1.6783 lr 1.575e-02 mem 9.53GB
+[radiance] step   2900/8000 loss 1.5877 lm 1.5841 lr 1.544e-02 mem 9.53GB
+[radiance] step   3000/8000 loss 1.4901 lm 1.4868 lr 1.511e-02 mem 9.53GB
+[radiance] step   3100/8000 loss 1.5336 lm 1.5307 lr 1.478e-02 mem 9.53GB
+[radiance] step   3200/8000 loss 1.5895 lm 1.5865 lr 1.444e-02 mem 9.53GB
+[radiance] step   3200 val/loss 1.6252
+[radiance] step   3300/8000 loss 1.4937 lm 1.4909 lr 1.410e-02 mem 9.53GB
+[radiance] step   3400/8000 loss 1.4976 lm 1.4950 lr 1.375e-02 mem 9.53GB
+[radiance] step   3500/8000 loss 1.5357 lm 1.5331 lr 1.340e-02 mem 9.53GB
+[radiance] step   3600/8000 loss 1.5514 lm 1.5489 lr 1.304e-02 mem 9.53GB
+[radiance] step   3700/8000 loss 1.6105 lm 1.6081 lr 1.268e-02 mem 9.53GB
+[radiance] step   3800/8000 loss 1.4793 lm 1.4767 lr 1.232e-02 mem 9.53GB
+[radiance] step   3900/8000 loss 1.5146 lm 1.5121 lr 1.196e-02 mem 9.53GB
+[radiance] step   4000/8000 loss 1.4958 lm 1.4933 lr 1.159e-02 mem 9.53GB
+[radiance] step   4000 val/loss 1.5732
+[radiance] step   4100/8000 loss 1.5638 lm 1.5613 lr 1.122e-02 mem 9.53GB
+[radiance] step   4200/8000 loss 1.4953 lm 1.4928 lr 1.085e-02 mem 9.53GB
+[radiance] step   4300/8000 loss 1.4873 lm 1.4848 lr 1.048e-02 mem 9.53GB
+[radiance] step   4400/8000 loss 1.4353 lm 1.4329 lr 1.012e-02 mem 9.53GB
+[radiance] step   4500/8000 loss 1.4888 lm 1.4863 lr 9.752e-03 mem 9.53GB
+[radiance] step   4600/8000 loss 1.5656 lm 1.5630 lr 9.389e-03 mem 9.53GB
+[radiance] step   4700/8000 loss 1.3978 lm 1.3950 lr 9.028e-03 mem 9.53GB
+[radiance] step   4800/8000 loss 1.5286 lm 1.5260 lr 8.671e-03 mem 9.53GB
+[radiance] step   4800 val/loss 1.5272
+[radiance] step   4900/8000 loss 1.4926 lm 1.4898 lr 8.317e-03 mem 9.53GB
+[radiance] step   5000/8000 loss 1.4383 lm 1.4353 lr 7.968e-03 mem 9.53GB
+[radiance] step   5100/8000 loss 1.4714 lm 1.4685 lr 7.624e-03 mem 9.53GB
+[radiance] step   5200/8000 loss 1.4835 lm 1.4807 lr 7.286e-03 mem 9.53GB
+[radiance] step   5300/8000 loss 1.3683 lm 1.3651 lr 6.953e-03 mem 9.53GB
+[radiance] step   5400/8000 loss 1.4843 lm 1.4812 lr 6.628e-03 mem 9.53GB
+[radiance] step   5500/8000 loss 1.3786 lm 1.3752 lr 6.310e-03 mem 9.53GB
+[radiance] step   5600/8000 loss 1.4677 lm 1.4644 lr 6.000e-03 mem 9.53GB
+[radiance] step   5600 val/loss 1.4854
+[radiance] step   5700/8000 loss 1.4081 lm 1.4046 lr 5.698e-03 mem 9.53GB
+[radiance] step   5800/8000 loss 1.3535 lm 1.3499 lr 5.405e-03 mem 9.53GB
+[radiance] step   5900/8000 loss 1.4353 lm 1.4317 lr 5.121e-03 mem 9.53GB
+[radiance] step   6000/8000 loss 1.4070 lm 1.4034 lr 4.848e-03 mem 9.53GB
+[radiance] step   6100/8000 loss 1.4650 lm 1.4614 lr 4.584e-03 mem 9.53GB
+[radiance] step   6200/8000 loss 1.3750 lm 1.3710 lr 4.331e-03 mem 9.53GB
+[radiance] step   6300/8000 loss 1.3643 lm 1.3604 lr 4.090e-03 mem 9.53GB
+[radiance] step   6400/8000 loss 1.3906 lm 1.3867 lr 3.860e-03 mem 9.53GB
+[radiance] step   6400 val/loss 1.4470
+[radiance] step   6500/8000 loss 1.3969 lm 1.3927 lr 3.642e-03 mem 9.53GB
+[radiance] step   6600/8000 loss 1.4617 lm 1.4574 lr 3.436e-03 mem 9.53GB
+[radiance] step   6700/8000 loss 1.4290 lm 1.4247 lr 3.243e-03 mem 9.53GB
+[radiance] step   6800/8000 loss 1.3417 lm 1.3372 lr 3.063e-03 mem 9.53GB
+[radiance] step   6900/8000 loss 1.3266 lm 1.3220 lr 2.896e-03 mem 9.53GB
+[radiance] step   7000/8000 loss 1.3014 lm 1.2963 lr 2.743e-03 mem 9.53GB
+[radiance] step   7100/8000 loss 1.3351 lm 1.3301 lr 2.603e-03 mem 9.53GB
+[radiance] step   7200/8000 loss 1.3702 lm 1.3654 lr 2.478e-03 mem 9.53GB
+[radiance] step   7200 val/loss 1.4179
+[radiance] step   7300/8000 loss 1.4520 lm 1.4472 lr 2.366e-03 mem 9.53GB
+[radiance] step   7400/8000 loss 1.3939 lm 1.3888 lr 2.270e-03 mem 9.53GB
+[radiance] step   7500/8000 loss 1.2729 lm 1.2674 lr 2.188e-03 mem 9.53GB
+[radiance] step   7600/8000 loss 1.4370 lm 1.4319 lr 2.120e-03 mem 9.53GB
+[radiance] step   7700/8000 loss 1.3437 lm 1.3383 lr 2.068e-03 mem 9.53GB
+[radiance] step   7800/8000 loss 1.3603 lm 1.3548 lr 2.030e-03 mem 9.53GB
+[radiance] step   7900/8000 loss 1.3553 lm 1.3499 lr 2.008e-03 mem 9.53GB
+[radiance] step   8000/8000 loss 1.2798 lm 1.2744 lr 2.000e-03 mem 9.53GB
+[radiance] step   8000 val/loss 1.4044

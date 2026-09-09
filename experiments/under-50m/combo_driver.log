@@ -1,0 +1,9 @@
+[driver] === ts16k_diff_loop2 ===
+[driver] ts16k_diff_loop2 done in 1286s :: [radiance] step   8000 val/loss 1.4068
+[driver] === ts16k_diff ===
+[driver] ts16k_diff done in 716s :: [radiance] step   8000 val/loss 1.4101
+[driver] === ts16k_loop2 ===
+[driver] ts16k_loop2 done in 1091s :: [radiance] step   8000 val/loss 1.4124
+[driver] === ts32k_d320_L27 ===
+[driver] ts32k_d320_L27 done in 756s :: [radiance] step   8000 val/loss 1.4224
+[driver] ALL DONE

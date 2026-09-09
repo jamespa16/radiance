@@ -1,0 +1,47 @@
+run_name: d320_L22_fm2
+
+data:
+  dataset: roneneldan/TinyStories
+  text_column: text
+  tokenizer: gpt2
+  seq_len: 512
+  num_workers: 4
+  cache_dir: .cache/radiance/tokenized
+
+model:
+  d_model: 320
+  head_dim: 64
+  n_layers: 22
+  loop_count: 1
+  ffn_mult: 2.0
+  ffn_depth: 2
+  dropout: 0.0
+  max_seq_len: 512
+
+train:
+  # Effective batch 32 x 512 = 16384 tokens/step, pinned so an arm that uses less memory is not
+  # silently handed a bigger batch (docs/results.md caution 1). Micro-batch 16 keeps the widest
+  # and deepest arms on the same setting as the cheapest.
+  batch_size: 16
+  grad_accum_steps: 2
+  auto_batch_size: false
+  lr: 0.01
+  muon_lr: 0.02
+  weight_decay: 0.01
+  warmup_ratio: 0.04
+  max_steps: 8000
+  grad_clip: 1.0
+  log_every: 100
+  eval_every: 800
+  eval_max_batches: 50
+  # Must divide max_steps: train.py saves only on `step % save_every == 0` and has no
+  # end-of-training save, so a save_every larger than max_steps silently produces no checkpoint
+  # at all -- and the vocab arms have to be scored from a checkpoint by bits_per_char.py.
+  save_every: 8000
+  output_dir: experiments/under-50m/shape2/ckpt/d320_L22_fm2
+  seed: 42
+  compile: true
+  dtype: bf16
+
+wandb:
+  mode: disabled

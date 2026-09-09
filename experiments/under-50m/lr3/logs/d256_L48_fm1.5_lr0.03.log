@@ -1,0 +1,28 @@
+[radiance] padding vocab 50,257 -> 50,304 (multiple of 128) for tensor-core-aligned lm_head matmuls
+[radiance] doc_attention_mask on, so compiling without CUDA graphs (mode=None instead of 'reduce-overhead').
+[radiance] optimizer=muon (muon_lr=0.02 over 288 tensors, adamw lr=0.03 over the rest)
+[radiance] step    100/1500 loss 3.1176 lm 3.1034 lr 1.997e-02 mem 8.66GB
+[radiance] step    150 val/loss 2.6923
+[radiance] step    200/1500 loss 2.4701 lm 2.4552 lr 1.958e-02 mem 8.66GB
+[radiance] step    300/1500 loss 2.1911 lm 2.1762 lr 1.879e-02 mem 8.66GB
+[radiance] step    300 val/loss 2.2525
+[radiance] step    400/1500 loss 2.1691 lm 2.1546 lr 1.764e-02 mem 8.66GB
+[radiance] step    450 val/loss 2.0816
+[radiance] step    500/1500 loss 1.9939 lm 1.9790 lr 1.616e-02 mem 8.66GB
+[radiance] step    600/1500 loss 1.9361 lm 1.9216 lr 1.444e-02 mem 8.66GB
+[radiance] step    600 val/loss 1.9819
+[radiance] step    700/1500 loss 1.8685 lm 1.8540 lr 1.256e-02 mem 8.66GB
+[radiance] step    750 val/loss 1.8964
+[radiance] step    800/1500 loss 1.8705 lm 1.8562 lr 1.061e-02 mem 8.66GB
+[radiance] step    900/1500 loss 1.8034 lm 1.7892 lr 8.671e-03 mem 8.66GB
+[radiance] step    900 val/loss 1.8263
+[radiance] step   1000/1500 loss 1.8303 lm 1.8165 lr 6.844e-03 mem 8.66GB
+[radiance] step   1050 val/loss 1.7676
+[radiance] step   1100/1500 loss 1.7255 lm 1.7116 lr 5.215e-03 mem 8.66GB
+[radiance] step   1200/1500 loss 1.7309 lm 1.7171 lr 3.860e-03 mem 8.66GB
+[radiance] step   1200 val/loss 1.7216
+[radiance] step   1300/1500 loss 1.6264 lm 1.6124 lr 2.843e-03 mem 8.66GB
+[radiance] step   1350 val/loss 1.6877
+[radiance] step   1400/1500 loss 1.6963 lm 1.6828 lr 2.213e-03 mem 8.66GB
+[radiance] step   1500/1500 loss 1.6691 lm 1.6557 lr 2.000e-03 mem 8.66GB
+[radiance] step   1500 val/loss 1.6663
