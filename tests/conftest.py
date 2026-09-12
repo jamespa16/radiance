@@ -65,3 +65,22 @@ def _deterministic():
     """Every test starts from the same RNG state, so `build_model`-style helpers that construct two
     models and compare them get identical initialisations without each test re-seeding by hand."""
     torch.manual_seed(0)
+
+
+@pytest.fixture(autouse=True)
+def _restore_float32_matmul_precision():
+    """Undo any process-global fp32 matmul precision change a test leaves behind.
+
+    `train()` sets `torch.set_float32_matmul_precision("high")` to get TF32 tensor cores, and that
+    is global to the process — so a test that runs a real training loop (`test_dpo_train_e2e.py`,
+    `test_sft_train_e2e.py`) silently put every *later* test into TF32. `test_dpo_train_e2e.py`
+    sorts before `test_nvfp4.py`, which is why the fp32 rotation cases of
+    `test_triton_matches_reference_bit_exactly` failed under the full suite and passed when that
+    file was run on its own — the confusing shape this took before it was tracked down.
+    """
+    prev_global = torch.get_float32_matmul_precision()
+    prev_backend = torch.backends.cuda.matmul.fp32_precision
+    yield
+    torch.set_float32_matmul_precision(prev_global)
+    # Setting the global rewrites the backend override as a side effect, so restore it after.
+    torch.backends.cuda.matmul.fp32_precision = prev_backend

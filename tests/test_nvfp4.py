@@ -296,6 +296,37 @@ def test_triton_matches_reference_bit_exactly(shape, dtype, axis, rotate):
 
 
 @requires_nvfp4
+@pytest.mark.parametrize("precision", ["highest", "high", "medium"])
+def test_reference_rotation_ignores_global_matmul_precision(precision):
+    """The reference must define one answer regardless of ambient global state.
+
+    `torch.set_float32_matmul_precision` is process-wide and `train()` sets it to `"high"`, so any
+    caller downstream of a training run inherits TF32. TF32 keeps fp32's exponent but only 10
+    mantissa bits — enough to move a rotated value across an e2m1 bin boundary, which flipped the
+    nibble for ~0.2% of elements and broke `test_triton_matches_reference_bit_exactly` above for
+    exactly the `axis=0, rotate=True, float32` cases. `ref_quantize_colblock` pins the precision
+    around its rotation einsum; this asserts it and that the ambient setting is left alone.
+    """
+    x = torch.randn(1024, 512, device="cuda", dtype=torch.float32)
+    gs = nvfp4.global_scale_of(x)
+    r = nvfp4.hadamard_matrix(nvfp4.BLOCK, device="cuda")
+
+    torch.set_float32_matmul_precision("highest")
+    baseline = nvfp4.quantize_reference(x, 0, global_scale=gs, hadamard=r)
+
+    torch.set_float32_matmul_precision(precision)
+    got = nvfp4.quantize_reference(x, 0, global_scale=gs, hadamard=r)
+
+    assert torch.get_float32_matmul_precision() == precision, "ambient precision was not restored"
+    torch.testing.assert_close(
+        got.packed.view(torch.uint8), baseline.packed.view(torch.uint8), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        got.scale.view(torch.uint8), baseline.scale.view(torch.uint8), rtol=0, atol=0
+    )
+
+
+@requires_nvfp4
 @pytest.mark.parametrize("exponent", [-4, -2, 0, 2, 4])
 def test_triton_matches_reference_across_magnitudes(exponent):
     """Same assertion, swept over five orders of magnitude of input scale. The e4m3 block scale
