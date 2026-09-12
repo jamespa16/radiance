@@ -96,6 +96,23 @@ Bearer <key>` on every `/v1/*` route; omitted, those routes are unauthenticated 
 above needs no flags). `--rate-limit` caps requests/minute per key (or per client IP when no key is configured); `0`
 (default) disables it. Entry point: `radiance.serve:main` — `radiance-serve` console script after install.
 
+## Exporting a checkpoint to safetensors
+
+```bash
+uv run radiance-export --checkpoint checkpoints/tinystories/step_1000.pt --output export/tinystories
+```
+
+Writes `model.safetensors` + `config.json` (plain JSON `Config`, step, vocab size, parameter count) so a checkpoint
+can be read without pickle or `radiance` on the path. The tied `lm_head.weight` is stored once and recorded in
+`shared_tensors`; `--dtype bf16|fp16|fp32` casts floats on the way out, `--tokenizer` also saves the HF tokenizer.
+Optimizer/scheduler/scaler state is not exported — an export is a model, not a resume point.
+
+**An export directory is accepted anywhere a `.pt` checkpoint is**: `radiance-generate`, `radiance-serve`,
+`radiance-eval`, `dpo.reference_checkpoint` and `train.init_from` all load through
+`radiance.export.read_checkpoint`, which dispatches on the path. The one exception is `train.resume_from`, which
+refuses an export by name — there are no optimizer moments in one to resume from. Entry point:
+`radiance.export:main`; see [docs/train.md](docs/train.md).
+
 ## Running standard benchmarks
 
 ```bash
@@ -187,6 +204,7 @@ only the model package imports. `model/` and `nvfp4/` are packages whose `__init
   `losses.py`, batch sizing in `batching.py`, checkpoint save/load in `checkpointing.py`, evaluation in
   `evaluation.py`.
 - **`generate.py`** — checkpoint loading and KV-cached autoregressive sampling.
+- **`export.py`** — checkpoint -> safetensors + `config.json` export (`radiance-export`) and its inverse `load_export`.
 - **`eval_harness.py`** — an lm-evaluation-harness `LM` backend (`RadianceLM`) plus the `radiance-eval` CLI; runs
   standard benchmarks in-process against a loaded checkpoint. `eval` dependency group, not core.
 

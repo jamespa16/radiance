@@ -8,6 +8,7 @@ dependencies = [
     "transformers>=4.40",
     "datasets>=2.19",
     "wandb>=0.17",
+    "safetensors>=0.4",
     "pyyaml>=6.0",
     "tqdm>=4.66",
     "numpy>=1.26",
@@ -31,6 +32,7 @@ radiance-sweep = "radiance.sweep:main"
 radiance-serve = "radiance.serve:main"
 radiance-eval = "radiance.eval_harness:main"
 radiance-size = "radiance.size:main"
+radiance-export = "radiance.export:main"
 
 [build-system]
 requires = ["setuptools>=68"]

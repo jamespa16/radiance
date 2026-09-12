@@ -6,6 +6,7 @@ import torch
 from torch.optim.lr_scheduler import LambdaLR
 
 from radiance.config import Config, ModelConfig
+from radiance.export import is_export, read_checkpoint
 from radiance.model import DenseTransformer, checkpoint_vocab_size
 def save_checkpoint(
     path: Path,
@@ -64,6 +65,16 @@ def find_resume_checkpoint(cfg: Config) -> Path | None:
         path = Path(cfg.train.resume_from)
         if not path.exists():
             raise FileNotFoundError(f"train.resume_from={cfg.train.resume_from!r} does not exist")
+        if is_export(path):
+            # A radiance-export directory holds weights only — no optimizer moments, no scheduler,
+            # no step. "Resuming" from one would restart AdamW from zero momentum at warmup LR,
+            # which is the visible loss spike save_checkpoint exists to prevent, so this is a
+            # mistake worth naming rather than a mode worth supporting.
+            raise ValueError(
+                f"train.resume_from={cfg.train.resume_from!r} is a safetensors export, which "
+                "carries no optimizer/scheduler state to resume from. Use train.init_from to seed "
+                "a fresh run from its weights, or point resume_from at the run's .pt checkpoint."
+            )
         return path
     candidates = sorted(
         Path(cfg.train.output_dir).glob("step_*.pt"),
@@ -90,11 +101,15 @@ def load_pretrained_weights(raw_model: DenseTransformer, path: str, cfg: Config,
     *new* run (e.g. SFT) from a previously trained model's weights, so the caller builds a fresh
     optimizer/scheduler from its own cfg.train afterward rather than restoring saved ones.
 
+    `path` may be a `.pt` checkpoint or a `radiance-export` directory: weights are all this needs,
+    which is exactly all an export has. The destination model is already constructed here, so
+    load_state_dict's copy_ keeps *this* run's dtype regardless of what the export was written in.
+
     Checks the checkpoint's saved model shape against this run's cfg.model before touching
     load_state_dict, since a mismatch there would otherwise surface as an opaque tensor-shape
     RuntimeError deep inside torch rather than a clear message naming the field that disagrees.
     """
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    ckpt = read_checkpoint(path, map_location=device)
     source_cfg = ckpt["config"].model
     source_vocab = checkpoint_vocab_size(ckpt)
     mismatches = []

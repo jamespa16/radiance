@@ -223,7 +223,12 @@ class RadianceLM(TemplateLM):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate a radiance checkpoint with lm-evaluation-harness.")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to a .pt checkpoint from radiance.train")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        required=True,
+        help="Path to a .pt checkpoint from radiance.train, or a radiance-export directory",
+    )
     parser.add_argument(
         "--tasks", type=str, required=True, help="Comma-separated lm-eval task names, e.g. hellaswag,piqa,arc_easy"
     )
