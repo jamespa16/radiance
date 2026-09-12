@@ -1,17 +1,46 @@
 # Radiance V1 — the shipping model. A ~375M-parameter dense transformer trained on fineweb for
-# ~9B tokens (~43h on one RTX 5090), at every architecture setting this repo has an actual
+# ~9B tokens (~47h on one RTX 5090), at every architecture setting this repo has an actual
 # measurement for and no setting it doesn't.
 #
 # Sized empirically, not estimated: every number in the table below is a real fwd+bwd+opt.step on
 # this card, one process per arm (docs/results.md's NVFP4 section records a multi-arm sweep in one
 # process reporting a 3.8 GB gap between two *identical* configs — the peak column was allocator
 # noise). Those are synthetic-data figures; the chosen shape was then confirmed end-to-end through
-# `radiance-train` on real streaming fineweb, by differencing a 100-step and a 40-step run to
-# cancel startup and compile: **2.183 s/step, 60.0k tok/s** — slightly *faster* than the synthetic
-# bench, so the streaming data pipeline is not a bottleneck at this rate. That is the number the
-# ~43h below is derived from. `hours@20tpp` is the wall-clock to reach Chinchilla-optimal 20 tokens/active-param;
+# `radiance-train` on real streaming fineweb, by differencing run lengths to cancel startup and
+# compile.
+#
+# END-TO-END THROUGHPUT, re-measured 2026-09-12: **2.42 s/step, 54.2k tok/s**, from two warm
+# differenced pairs (60-vs-20 steps: 2.460; 100-vs-60: 2.377). This supersedes the 2.183 s/step /
+# 60.0k tok/s originally recorded here, which does **not** reproduce on this machine. It is not a
+# code regression: the v1 commit itself (d786716) re-measured at 2.495 s/step, so the shift is
+# environmental (now driver 595.84 / CUDA 13.2). Both timed runs of each pair were warm — the first
+# attempt compared a cold-compile run against a warm one and reported a phantom 3.15 s/step, which
+# is caution 4 in docs/results.md.
+#
+# That gives the ~47h below: 68,688 steps x 2.42s = 46.2h of stepping, plus ~0.75h of eval and
+# checkpointing (137 cycles at eval_every/save_every 500, measured at 19.7s per cycle — the table
+# below excludes these, so do not read its hours columns as end-to-end). Observed peak was 17.7 GB,
+# under the 18.9 GB in the table. **If 48h is a hard wall rather than a target this lands inside it
+# with ~1h to spare, which a single restart would eat** — drop tokens_per_param to 22 for ~43h, or
+# switch lr_schedule to "wsd" so the run can be cut short without invalidating the schedule.
+#
+# `hours@20tpp` is the wall-clock to reach Chinchilla-optimal 20 tokens/active-param;
 # `tok/param@48h` is what each shape actually gets trained to inside a 48-hour budget, which is the
 # comparison that decides this file.
+#
+# TWO CAVEATS ON THE TABLE, both found 2026-09-12 and neither yet re-measured:
+#   1. Its tok/s column predates the environment shift above and so is uniformly optimistic by
+#      ~10% (this config's 57.6k against the 54.2k now measured end-to-end).
+#   2. **The arms do not share grad_accum**, which no other comparison in this repo does: only this
+#      config was measured at ga 16, every larger shape at ga 4 — while the ga note under
+#      grad_accum_steps below prices ga 4 -> 16 at +12% on this very shape. The larger shapes are
+#      therefore charged for a setting they were never given, and the case against them is weaker
+#      than this table reads. Re-benchmarked at matched batch 4 x ga 16 (eager/synthetic, so read
+#      as ratios not absolutes), 505M reaches ~15.4 tok/param@48h rather than 13.8, and the
+#      compute-optimal shape at this budget is ~420M (d_model 1088, n_layers 22) at ~20.1, not this
+#      config's ~24.2. That was still judged not worth taking: docs/results.md's under-50M study
+#      measured shape itself as a plateau, and 375M errs toward overtraining deliberately, which
+#      buys quality at fixed inference cost.
 #
 #   shape                              total    active   tok/s   peak GB  hours@20tpp  tok/param@48h
 #   dense 1024x22, batch 8 x ga 16      375M      375M   57.6k     18.9      36.2          26.5   <- this config
@@ -57,7 +86,7 @@ data:
   streaming: true # required: fineweb is far too large to tokenize/cache to disk up front
   shuffle_buffer_size: 10000
   eval_split_size: 2000 # fineweb has no validation split — carve a deterministic held-out slice
-  disk_cache_max_gb: 100 # a 43h run restarted at hour 30 should not re-stream from scratch
+  disk_cache_max_gb: 100 # a 47h run restarted at hour 30 should not re-stream from scratch
   disk_cache_shard_size: 100
   prefetch_factor: 4
 
@@ -121,10 +150,11 @@ train:
   # wsd_decay_ratio of the run, so the run can be cut short or extended without invalidating the
   # schedule — which cosine cannot do, since its shape depends on max_steps.
 
-  tokens_per_param: 24 # -> ~9.0B tokens, ~68,700 steps, ~42h at the measured 60.0k tok/s. Slightly
-  # past Chinchilla-optimal 20, which is the right side to err on for a model meant to be served:
+  tokens_per_param: 24 # -> ~9.0B tokens, 68,688 steps, ~47h at the measured 54.2k tok/s (46.2h of
+  # stepping + ~0.75h of eval/checkpointing; see the header). Slightly past Chinchilla-optimal 20,
+  # which is the right side to err on for a model meant to be served:
   # it buys quality at fixed inference cost. max_steps is derived from num_active_parameters() and
-  # printed at run start. Drop to 12 for a ~22h run; the schedule rescales with it.
+  # printed at run start. Drop to 12 for a ~24h run, or to 22 for ~43h; the schedule rescales with it.
   # NOTE: runs with different tokens_per_param are NOT comparable at the same step number — warmup
   # and cosine both scale with max_steps. See docs/results.md's loop-vs-depth methodology findings.
 
@@ -137,7 +167,7 @@ train:
   # the AdamW moments for the tensors Muon doesn't own). Note the flip side of that rotation: there
   # are no intermediate checkpoints to fall back on or to compare, only the newest.
   output_dir: checkpoints/v1
-  resume_from: auto # a 43-hour run will be interrupted. This restores optimizer moments and the
+  resume_from: auto # a 47-hour run will be interrupted. This restores optimizer moments and the
   # LR schedule, not just the weights.
 
   seed: 42
