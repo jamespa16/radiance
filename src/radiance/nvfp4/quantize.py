@@ -7,6 +7,7 @@ consumes these primitives lives in `linear.py`.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 
 import torch
@@ -232,6 +233,29 @@ def ref_quantize_rowblock(
     return pack_nibbles(code.reshape(m, k)), scale_e4m3.squeeze(-1)
 
 
+@contextlib.contextmanager
+def ieee_fp32_matmul():
+    """Force full-precision fp32 matmul for the duration of the block.
+
+    `torch.set_float32_matmul_precision` is process-global, and `train()` sets it to `"high"` to
+    get TF32 tensor cores. TF32 keeps fp32's exponent but only 10 mantissa bits, which is enough
+    to move a value across an e2m1 bin boundary - so a rotation computed under it lands on a
+    different nibble for ~0.2% of elements. The reference is the *definition* of the format and
+    must not depend on ambient global state, so it pins the precision itself.
+
+    Restores both the global setting and the CUDA backend override, since setting the global
+    rewrites the backend's value as a side effect.
+    """
+    prev_global = torch.get_float32_matmul_precision()
+    prev_backend = torch.backends.cuda.matmul.fp32_precision
+    torch.set_float32_matmul_precision("highest")
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(prev_global)
+        torch.backends.cuda.matmul.fp32_precision = prev_backend
+
+
 def ref_quantize_colblock(
     x: torch.Tensor,
     global_scale: torch.Tensor,
@@ -259,7 +283,8 @@ def ref_quantize_colblock(
     m, k = x.shape
     xb = x.reshape(m // BLOCK, BLOCK, k).float()
     if hadamard is not None:
-        xb = torch.einsum("ij,bjk->bik", hadamard.t().float(), xb)
+        with ieee_fp32_matmul():
+            xb = torch.einsum("ij,bjk->bik", hadamard.t().float(), xb)
     scale_e4m3, divisor = _block_scale(xb.abs().amax(1, keepdim=True), global_scale)
     q = (xb / (divisor * global_scale)).clamp(-FP4_MAX, FP4_MAX)
     code = encode_e2m1(q.abs(), sign=q < 0, u=None if u is None else u.reshape(m // BLOCK, BLOCK, k))

@@ -74,6 +74,18 @@ it close enough" assertion passes all four:
   a 1-ULP disagreement, nearest is not.)
 - `tl.dot` defaults to tf32, which the Hadamard rotation cannot tolerate — `input_precision="ieee"`.
 
+The *reference* had the mirror image of that last one, and it is the more insidious of the two because it is
+action-at-a-distance. `ref_quantize_colblock` applies the rotation with `torch.einsum`, whose fp32 precision is
+governed by the process-global `torch.set_float32_matmul_precision` — which `train()` sets to `"high"`. So merely
+having run a training loop earlier *in the same process* silently dropped the reference's rotation to tf32 and
+flipped ~0.2% of its nibbles, while the Triton side stayed at ieee and was correct. It surfaced as
+`test_triton_matches_reference_bit_exactly` failing for the `axis=0, rotate=True, float32` cases under the full
+suite and passing when `tests/test_nvfp4.py` ran alone. Two fixes, because either alone leaves a trap:
+`ref_quantize_colblock` now pins the precision itself via `ieee_fp32_matmul()` (the reference is the *definition*
+of the format and must not depend on ambient global state — a caller outside the test suite would have hit this
+too), and an autouse fixture in `tests/conftest.py` restores the setting after every test so no future `train()`
+call can poison a later one. `test_reference_rotation_ignores_global_matmul_precision` pins the invariant.
+
 Exact ties are common rather than rare here, which is why these mattered: bf16 inputs have 8 mantissa bits and the
 divisor is derived from one of them.
 
