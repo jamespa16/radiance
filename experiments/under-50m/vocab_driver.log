@@ -1,0 +1,7 @@
+[driver] === ts16k_d320_L30 ===
+[driver] ts16k_d320_L30 done in 768s :: [radiance] step   8000 val/loss 1.4143
+[driver] === ts8k_d320_L32 ===
+[driver] ts8k_d320_L32 done in 787s :: [radiance] step   8000 val/loss 1.4162
+[driver] === ts8k_d384_L22 ===
+[driver] ts8k_d384_L22 done in 586s :: [radiance] step   8000 val/loss 1.4135
+[driver] ALL DONE

@@ -347,6 +347,135 @@ above, and it scales linearly — a 3-count range measured 78.2s, almost exactly
 range, especially with `grad_checkpoint`, spends minutes before the first loss line appears. That is compilation, not
 a hang; warm steps stay ~0.05s throughout. Keep the range narrow, or set `train.compile: false`, while iterating.
 
+## Under a total parameter cap, three results on this page invert
+
+Everything above holds *active* parameters fixed, or lets parameter count float entirely — the
+loop-vs-depth arms span 31.8M to 79.1M and the winner is the largest one on the page. Asking
+instead for the best model under a hard **50M total** cap changes which answers are correct, and
+does so for reasons that are visible in the arithmetic rather than mysterious. Full study, harness
+and working notes in [experiments/under-50m/](../experiments/under-50m/); shipped as
+`configs/tinystories_50m.yaml`.
+
+TinyStories, `d_model` 256-512, effective batch 32 pinned, `dropout: 0.0`, **`dtype: bf16`** (not
+the `fp32` the tables above use — these numbers carry their own baselines and must not be read
+against them), each shape LR-swept separately over {3e-3, 1e-2, 3e-2, 1e-1}.
+
+**Noise floor 0.0021 (stdev), 0.0042 (range), from five runs of one config at a pinned seed.** It
+is GPU nondeterminism, not seed choice — five *identical* runs, differing only in `run_name`. A
+repeat at a different seed measured 0.0023 from n=2 and understated it; n=2 on a 0.002 stdev is
+close to uninformative. Rank two single runs only when they differ by ~0.006 or more.
+
+### 1. MoE inverts: the page's largest win becomes its largest loss
+
+`use_moe` is recorded above as the largest architecture effect measured here, +0.0488 at matched
+active parameters. Under a total cap it is the largest *negative* effect. `val/loss` @8000 against
+a five-run dense base mean of 1.4137 (`d320_L22_fm2`, 47.77M):
+
+| arm | @8000 | vs base | total / active |
+|---|---|---|---|
+| `moe_d256_L14` | 1.4356 | +0.0219 | 45.82M / 25.30M |
+| `moe_d320_L8` | 1.4424 | +0.0287 | 45.30M / 28.05M |
+
+Both results are correct. The earlier A/B matches active parameters and lets *total* grow 1.7x,
+which is precisely the freedom a total cap removes: `use_moe: true` on the base shape costs 192M,
+4x the budget, so the experts must be bought back out of depth and width. Every MoE configuration
+that fits under 50M lands at 25-28M active against the dense arms' 47.8M, and the capacity gained
+does not repay the compute given up. **The MoE result is constraint-dependent, and the constraint
+it was measured under is not the one a parameter budget imposes.**
+
+### 2. The loop pays — but only against a parameter budget, not a FLOP budget
+
+Both halves are visible in one table, and they do not conflict with
+[the loop-vs-depth result](#the-loop-is-dominated--depth-and-moe-are-the-frontier):
+
+| arm | @8000 | vs base | executed blocks |
+|---|---|---|---|
+| `loop_w448` (d448, L8, `loop_count: 3`) | 1.4154 | +0.0017 | 22 |
+| `loop_w512` (d512, L6, `loop_count: 4`) | 1.4127 | −0.0010 | 21 |
+| `loop2_deep` (base + `loop_count: 2`) | **1.4044** | **−0.0093** | 43 |
+
+At **equal compute** — the first two arms execute ~22 blocks like the dense base, spending what
+weight-sharing saves on reaching `d448`/`d512` where the base can only afford `d320` — the loop is
+neutral. That is the loop-vs-depth verdict reproduced: sharing does not buy enough extra width to
+pay for itself. At **equal parameters with compute unconstrained**, 43 executed blocks for +0.11M
+parameters is the best arm measured. A FLOP budget prices the loop out; a parameter budget does not
+charge for what the loop spends.
+
+### 3. The tokenizer is the largest lever, and `val/loss` cannot see it
+
+A 16k byte-level BPE trained on TinyStories **compresses the corpus better than gpt2's 50k**
+(0.2400 tokens/char vs 0.2460): gpt2 spends most of its vocabulary on code, other languages and
+rare words absent from three-year-old-level English, and the tied embedding pays for every row —
+16.10M of the budget at `d_model: 320` against 5.24M. The freed 10.9M buys `n_layers` 22 -> 30 at
+no cost in sequence length.
+
+Scored in **bits/char** on 4000 held-out stories, with the freed budget spent so every arm still
+fills the cap:
+
+| arm | `val/loss` | bits/char |
+|---|---|---|
+| gpt2 `d320_L22` | 1.4137 | 0.5043 |
+| `ts8k_d320_L32` | 1.4162 | 0.5006 |
+| `ts32k_d320_L27` | 1.4224 | 0.4993 |
+| **`ts16k_d320_L30`** | 1.4143 | **0.4967** |
+
+**Read the two columns against each other.** `val/loss` puts gpt2 (1.4137) ahead of `ts16k`
+(1.4143); bits/char puts `ts16k` ahead by 0.0076, roughly 10x the noise floor in those units
+(0.00075). Judged the way every other table on this page is judged, the largest effect in the study
+looks like nothing. Cross-entropy is per *token*, and a smaller vocabulary cuts each story into
+more, individually more predictable tokens — so it falls for reasons unrelated to model quality.
+**Any comparison across tokenizers must divide by a unit the tokenizer cannot change.**
+`experiments/under-50m/bits_per_char.py` does this; two bugs found while building it are recorded
+there, including one where scoring in a different attention regime than training reversed the
+ranking of four arms that shared a tokenizer.
+
+The optimum is **interior**: 16k beats 8k and 32k, and all three beat 50k. A vocabulary can be
+shrunk past the point where the freed parameters repay the lost compression.
+
+### The combination, and the iso-compute controls that reversed its reading
+
+One epoch (25000 steps), 48.55M parameters, against the same budget spent the obvious way:
+
+| config | `val/loss` | bits/char |
+|---|---|---|
+| gpt2 `d320_L22` dense | 1.3151 | 0.4696 |
+| `ts16k` + `use_diff_attn` + `loop_count: 2` | **1.3033** | **0.4574** |
+
+−0.0122 bits/char at fixed steps, ~16x noise, and the margin *grew* with training length (−0.0104
+at 8000 steps). The three effects stack rather than overlapping. Taken alone this table says to
+ship all three.
+
+**It is wrong to take it alone.** The combination costs 2.4x the wall clock, and given that same
+compute the plain dense control just runs more steps:
+
+| config | steps | wall clock | bits/char |
+|---|---|---|---|
+| `ts16k` + `use_diff_attn` + `loop_count: 2` | 25000 | 3940s | 0.4574 |
+| gpt2 `d320_L22` dense | 59000 | 3908s | 0.4545 |
+| `ts16k_d320_L30` dense | 40000 | *2904s* | 0.4535 |
+| **`ts16k_d320_L30` dense (shipped)** | 54000 | 3916s | **0.4491** |
+
+Two conclusions, and they point in opposite directions:
+
+1. **`loop_count: 2` and `use_diff_attn` lose at equal compute.** This is exactly the check [the
+   differential-attention section](#differential-attention--the-first-architecture-win) flags as
+   unrun — "a 1.3-1.4x step-time cost can plausibly erase a fixed-step win at equal wall-clock". It
+   does erase it. Both remain wins when *parameters* are the binding constraint and compute is
+   genuinely free — an inference-memory or download-size budget — and that is a narrower situation
+   than the fixed-step table suggests.
+2. **The tokenizer wins in both currencies.** `ts16k` dense beats the gpt2 dense control while using
+   **26% less compute**, because a better-compressing vocabulary is free by construction: it moves
+   10.9M parameters out of the embedding *and* shortens sequences slightly. It is the only
+   ingredient here that should be carried into a compute-bound setting without re-measuring.
+
+`configs/tinystories_50m.yaml` therefore ships the tokenizer and a plain dense stack, and documents
+the other two as deliberately omitted. Given the control's own 3916s it reaches **0.4491**, **0.0054 ahead** of the gpt2 control at matched wall clock — about 7x noise, and the best model this study produced under the cap.
+
+Other arms measured and rejected under the cap: MQA (+0.0136), `mtp_heads: 2` paid for out of depth
+(+0.0176), and every wide-shallow shape. **Shape itself is a plateau** — everything from `n_layers`
+14 to 48 at `d256`-`d320` sits inside the noise floor, so the shape decision is nearly free once
+you are deep and narrow, and the 0.031 available between L16 and L24 is the whole of it.
+
 ## Cautions when running an A/B
 
 1. **Pin `batch_size` and set `auto_batch_size: false`.** Otherwise a change that reduces memory (sparsity,

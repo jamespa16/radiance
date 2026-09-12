@@ -107,6 +107,22 @@ in-process (batched forward passes against the loaded model, not through `radian
 [docs/eval.md](docs/eval.md) for why). `lm-eval` is a separate `eval` dependency group (`uv run --group eval ...`),
 not a core dependency. Entry point: `radiance.eval_harness:main` — `radiance-eval` console script after install.
 
+## Sizing a model without training it
+
+```bash
+uv run radiance-size --config configs/v1.yaml
+uv run radiance-size --set model.d_model=384 model.n_layers=9 --vocab-size 8192
+```
+
+Builds the model on the `meta` device (shapes, no storage — no data, no GPU, no allocation) and prints
+`total` / `active` / `embed` / `blocks`. `--set` takes `dotted.key=value` overrides parsed as YAML, applied on top
+of `--config` or of the defaults, so a shape sweep is a shell loop rather than a pile of throwaway YAML.
+
+**Read `embed` first when working to a parameter budget.** The tied embedding is `vocab_size * d_model` — 12.9M
+with the gpt2 tokenizer at `d_model: 256`, 25.8M at 512 — so it is a large fixed tax that grows with width while
+the block stack grows with width *squared*. `--vocab-size` prices a smaller tokenizer against it. Entry point:
+`radiance.size:main`; `tests/test_size.py` pins the meta-device counts against a real build.
+
 ## Running tests
 
 ```bash

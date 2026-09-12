@@ -1,0 +1,19 @@
+[driver] === base ===
+[driver] base done in 546s :: [radiance] step   8000 val/loss 1.4122
+[driver] === diff_attn ===
+[driver] diff_attn done in 663s :: [radiance] step   8000 val/loss 1.4086
+[driver] === loop2_deep ===
+[driver] loop2_deep done in 905s :: [radiance] step   8000 val/loss 1.4044
+[driver] === loop_w448 ===
+[driver] loop_w448 done in 750s :: [radiance] step   8000 val/loss 1.4154
+[driver] === loop_w512 ===
+[driver] loop_w512 done in 816s :: [radiance] step   8000 val/loss 1.4127
+[driver] === moe_d256_L14 ===
+[driver] moe_d256_L14 done in 520s :: [radiance] step   8000 val/loss 1.4356
+[driver] === moe_d320_L8 ===
+[driver] moe_d320_L8 done in 445s :: [radiance] step   8000 val/loss 1.4424
+[driver] === mqa_L24 ===
+[driver] mqa_L24 done in 668s :: [radiance] step   8000 val/loss 1.4273
+[driver] === mtp2_L21 ===
+[driver] mtp2_L21 done in 951s :: [radiance] step   8000 val/loss 1.4313
+[driver] ALL DONE

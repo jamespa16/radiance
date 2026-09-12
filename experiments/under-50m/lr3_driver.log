@@ -1,0 +1,37 @@
+[driver] === d192_L46_fm3_lr0.003 ===
+[driver] d192_L46_fm3_lr0.003 done in 233s :: [radiance] step   1500 val/loss 1.6943
+[driver] === d192_L46_fm3_lr0.01 ===
+[driver] d192_L46_fm3_lr0.01 done in 154s :: [radiance] step   1500 val/loss 1.6851
+[driver] === d192_L46_fm3_lr0.03 ===
+[driver] d192_L46_fm3_lr0.03 done in 153s :: [radiance] step   1500 val/loss 1.6910
+[driver] === d256_L29_fm2.5_lr0.003 ===
+[driver] d256_L29_fm2.5_lr0.003 done in 173s :: [radiance] step   1500 val/loss 1.6772
+[driver] === d256_L29_fm2.5_lr0.01 ===
+[driver] d256_L29_fm2.5_lr0.01 done in 123s :: [radiance] step   1500 val/loss 1.6725
+[driver] === d256_L29_fm2.5_lr0.03 ===
+[driver] d256_L29_fm2.5_lr0.03 done in 124s :: [radiance] step   1500 val/loss 1.6768
+[driver] === d256_L37_fm2_lr0.003 ===
+[driver] d256_L37_fm2_lr0.003 done in 201s :: [radiance] step   1500 val/loss 1.6728
+[driver] === d256_L37_fm2_lr0.01 ===
+[driver] d256_L37_fm2_lr0.01 done in 138s :: [radiance] step   1500 val/loss 1.6633
+[driver] === d256_L37_fm2_lr0.03 ===
+[driver] d256_L37_fm2_lr0.03 done in 138s :: [radiance] step   1500 val/loss 1.6702
+[driver] === d256_L48_fm1.5_lr0.003 ===
+[driver] d256_L48_fm1.5_lr0.003 done in 239s :: [radiance] step   1500 val/loss 1.6756
+[driver] === d256_L48_fm1.5_lr0.01 ===
+[driver] d256_L48_fm1.5_lr0.01 done in 156s :: [radiance] step   1500 val/loss 1.6577
+[driver] === d256_L48_fm1.5_lr0.03 ===
+[driver] d256_L48_fm1.5_lr0.03 done in 155s :: [radiance] step   1500 val/loss 1.6663
+[driver] === d320_L17_fm2.5_lr0.003 ===
+[driver] d320_L17_fm2.5_lr0.003 done in 137s :: [radiance] step   1500 val/loss 1.6728
+[driver] === d320_L17_fm2.5_lr0.01 ===
+[driver] d320_L17_fm2.5_lr0.01 done in 110s :: [radiance] step   1500 val/loss 1.6671
+[driver] === d320_L17_fm2.5_lr0.03 ===
+[driver] d320_L17_fm2.5_lr0.03 done in 109s :: [radiance] step   1500 val/loss 1.6720
+[driver] === d320_L22_fm2_lr0.003 ===
+[driver] d320_L22_fm2_lr0.003 done in 156s :: [radiance] step   1500 val/loss 1.6694
+[driver] === d320_L22_fm2_lr0.01 ===
+[driver] d320_L22_fm2_lr0.01 done in 117s :: [radiance] step   1500 val/loss 1.6590
+[driver] === d320_L22_fm2_lr0.03 ===
+[driver] d320_L22_fm2_lr0.03 done in 118s :: [radiance] step   1500 val/loss 1.6728
+[driver] ALL DONE

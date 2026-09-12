@@ -30,6 +30,7 @@ radiance-generate = "radiance.generate:main"
 radiance-sweep = "radiance.sweep:main"
 radiance-serve = "radiance.serve:main"
 radiance-eval = "radiance.eval_harness:main"
+radiance-size = "radiance.size:main"
 
 [build-system]
 requires = ["setuptools>=68"]

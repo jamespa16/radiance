@@ -1,0 +1,19 @@
+[driver] === d256_L24_fm3_lr0.003 ===
+[driver] d256_L24_fm3_lr0.003 done in 161s :: [radiance] step   1500 val/loss 1.6787
+[driver] === d256_L24_fm3_lr0.01 ===
+[driver] d256_L24_fm3_lr0.01 done in 117s :: [radiance] step   1500 val/loss 1.6706
+[driver] === d256_L24_fm3_lr0.03 ===
+[driver] d256_L24_fm3_lr0.03 done in 119s :: [radiance] step   1500 val/loss 1.6827
+[driver] === d384_L6_fm4_lr0.003 ===
+[driver] d384_L6_fm4_lr0.003 done in 88s :: [radiance] step   1500 val/loss 1.6942
+[driver] === d384_L6_fm4_lr0.01 ===
+[driver] d384_L6_fm4_lr0.01 done in 88s :: [radiance] step   1500 val/loss 1.6956
+[driver] === d384_L6_fm4_lr0.03 ===
+[driver] d384_L6_fm4_lr0.03 done in 88s :: [radiance] step   1500 val/loss 1.6835
+[driver] === d512_L4_fm3_lr0.003 ===
+[driver] d512_L4_fm3_lr0.003 done in 96s :: [radiance] step   1500 val/loss 1.6966
+[driver] === d512_L4_fm3_lr0.01 ===
+[driver] d512_L4_fm3_lr0.01 done in 86s :: [radiance] step   1500 val/loss 1.6865
+[driver] === d512_L4_fm3_lr0.03 ===
+[driver] d512_L4_fm3_lr0.03 done in 87s :: [radiance] step   1500 val/loss 1.6960
+[driver] ALL DONE

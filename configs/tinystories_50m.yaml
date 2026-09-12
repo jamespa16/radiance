@@ -1,0 +1,84 @@
+# Best TinyStories model measured under a 50M *total* parameter cap.
+#
+# 48.43M parameters. Full study — including every arm that lost, two measurement bugs, and the
+# iso-compute controls that changed the recommendation — in experiments/under-50m/README.md;
+# summary in docs/results.md.
+#
+# The one change that carries this config, and the only one that survived every test:
+#
+#   `tokenizer` is a 16k BPE trained on TinyStories itself, not gpt2. gpt2's 50k vocabulary spends
+#   most of its rows on code, other languages and rare words that never occur in this corpus, and
+#   the tied embedding pays for every one: 16.10M of the budget at d_model 320, against 5.24M here.
+#   The freed 10.9M buys n_layers 22 -> 30. It also *compresses better* than gpt2 on this corpus
+#   (0.2400 tokens/char vs 0.2460), so it is free in compute as well as a third cheaper in
+#   parameters. Build it with:
+#
+#     uv run python experiments/under-50m/train_tokenizer.py --vocab-size 16384 \
+#         --out .cache/radiance/tok/ts16k
+#
+#   16k specifically: 8k and 32k were both measured and both are worse, so the optimum is interior
+#   — a vocabulary can be shrunk past the point where the freed parameters repay lost compression.
+#
+# Measured against the same budget spent the obvious way (gpt2 tokenizer, d320/L22 dense), at
+# matched wall clock rather than matched steps:
+#
+#   gpt2  d320_L22 dense, 59000 steps, 3908s -> 0.4545 bits/char
+#   this  d320_L30 dense, 40000 steps, 2904s -> 0.4535 bits/char   (better, on 26% less compute)
+#
+# WHAT IS DELIBERATELY *NOT* HERE. `loop_count: 2` (-0.0093 val/loss) and `use_diff_attn` (-0.0051)
+# both won at fixed steps and near-zero parameter cost, and both were in an earlier version of this
+# config. They are gone because at equal *wall clock* they lose: they cost 2.4x the step time, and
+# the plain dense control simply runs more steps and comes out ahead. Add them back only if
+# parameters are the binding constraint and compute is genuinely free — an inference-memory or
+# download-size budget, not a training budget. This is the fixed-compute check docs/results.md's
+# differential-attention section flags as unrun; it has now been run, and it reverses the reading.
+#
+# Shape (d320 / L30 / ffn_mult 2.0) is deliberately unremarkable: everything from n_layers 14 to 48
+# at d256-d320 measured inside the noise floor, so the shape decision is nearly free once you are
+# deep and narrow. What does *not* work under this cap is MoE (every configuration that fits halves
+# active parameters and loses 0.022-0.029), MQA, mtp_heads: 2, and every wide-shallow shape.
+
+run_name: tinystories-50m
+
+data:
+  dataset: roneneldan/TinyStories
+  text_column: text
+  tokenizer: .cache/radiance/tok/ts16k
+  seq_len: 512
+  num_workers: 4
+  cache_dir: .cache/radiance/tokenized
+
+model:
+  d_model: 320
+  head_dim: 64
+  n_layers: 30
+  loop_count: 1
+  ffn_mult: 2.0
+  ffn_depth: 2
+  dropout: 0.0  # doc_attention_mask uses flex_attention, which has no dropout
+  max_seq_len: 512
+
+train:
+  # Effective batch 32 x 512 = 16384 tokens/step. Pinned rather than left to auto_batch_size so
+  # the number above is reproducible: a machine with more VRAM would otherwise train this on a
+  # different effective batch and not match (docs/results.md caution 1).
+  batch_size: 16
+  grad_accum_steps: 2
+  auto_batch_size: false
+  lr: 1.0e-2  # swept per shape at 1500 steps; every ffn_mult 2-3 shape measured preferred 1e-2
+  muon_lr: 0.02
+  weight_decay: 0.01
+  warmup_ratio: 0.04
+  max_steps: 54000  # ~2 epochs; still improving at 40000, see the experiment README
+  grad_clip: 1.0
+  log_every: 100
+  eval_every: 6000
+  eval_max_batches: 50
+  save_every: 54000  # train.py has no end-of-training save, so this must divide max_steps
+  output_dir: checkpoints/tinystories_50m
+  seed: 42
+  compile: true
+  dtype: bf16
+
+wandb:
+  mode: online

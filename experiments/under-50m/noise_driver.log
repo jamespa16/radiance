@@ -1,0 +1,7 @@
+[driver] === base_r1 ===
+[driver] base_r1 done in 546s :: [radiance] step   8000 val/loss 1.4124
+[driver] === base_r2 ===
+[driver] base_r2 done in 547s :: [radiance] step   8000 val/loss 1.4157
+[driver] === base_r3 ===
+[driver] base_r3 done in 546s :: [radiance] step   8000 val/loss 1.4121
+[driver] ALL DONE

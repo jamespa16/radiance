@@ -1,0 +1,5 @@
+[driver] === control_gpt2_d320_L22 ===
+[driver] control_gpt2_d320_L22 done in 1668s :: [radiance] step  25000 val/loss 1.3151
+[driver] === final_ts16k_diff_loop2 ===
+[driver] final_ts16k_diff_loop2 done in 3940s :: [radiance] step  25000 val/loss 1.3033
+[driver] ALL DONE

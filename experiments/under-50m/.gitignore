@@ -1,0 +1,3 @@
+# Checkpoints from the sweep arms: 24GB, and reproducible from the configs beside them.
+# The configs and logs are the record worth keeping; the weights are not.
+ckpt/

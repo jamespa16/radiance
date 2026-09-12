@@ -1,0 +1,3 @@
+[driver] === ts16k_dense_40k ===
+[driver] ts16k_dense_40k done in 2904s :: [radiance] step  40000 val/loss 1.2911
+[driver] ALL DONE
