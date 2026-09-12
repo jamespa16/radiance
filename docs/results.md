@@ -330,6 +330,55 @@ else — it takes a genuinely different step on K-1 of every K steps. Running th
 cautions below, and note the interaction with effective batch size: the section above makes Newton-Schulz cheaper
 per token by spending more tokens per step, so measure the two together rather than stacking their speedups.
 
+**Measured together, 2026-09-12, and the two do not stack — grad accumulation has already taken the win.** On
+`configs/v1.yaml`'s shape (375M, batch 8, eager, one K per process), the optimizer speedup reproduces but is
+almost entirely amortised away at that config's `grad_accum_steps: 16`:
+
+| | optimizer step | full step (ga 16) | optimizer share |
+|---|---|---|---|
+| K=1 | 102.3 ms | 3810 ms | 2.7% |
+| K=3 | 46.2 ms | 3758 ms | 1.2% |
+
+2.21x on the optimizer alone (consistent with the 2.33x above) is worth **~1.4% end-to-end**, or ~2.6% against the
+real compiled step. `grad_accum: 16` and `muon_ns_period` are competing levers on the same flat Newton-Schulz cost,
+not additive ones: raising effective batch divides that cost by 16 before K ever sees it. **Do not take K>1 on a
+high-`grad_accum` config** — it buys ~1-3% wall-clock in exchange for a genuinely different optimization step whose
+quality is still unmeasured. The 1.32x figure above belongs to a `grad_accum: 1` setting and must not be carried
+across.
+
+### V1 end-to-end throughput, re-measured — the recorded figure does not reproduce
+
+`configs/v1.yaml` was shipped against **2.183 s/step, 60.0k tok/s**, measured end-to-end through `radiance-train`
+on streaming fineweb. Re-measured 2026-09-12 on the same card, it is **2.42 s/step, 54.2k tok/s** — ~10% slower.
+Two warm differenced pairs, each cancelling startup and compile over 40 steps:
+
+| pair | s/step | tok/s |
+|---|---|---|
+| 60 vs 20 steps | 2.460 | 53.3k |
+| 100 vs 60 steps | 2.377 | 55.1k |
+| **v1's own commit (d786716), 60 vs 20** | **2.495** | **52.5k** |
+
+**It is not a code regression.** The third row re-runs the identical measurement at the commit that shipped the
+config and lands in the same place, so nothing merged since d786716 (`muon_ns_period`, the under-50M study,
+`radiance-export`) is responsible. The shift is environmental — this machine is now on driver 595.84 / CUDA 13.2.
+No further diagnosis was done.
+
+Consequences for the run: 68,688 steps x 2.42s = 46.2h of stepping, plus ~0.75h of eval and checkpointing (137
+cycles at `eval_every`/`save_every` 500, measured at 19.7s per cycle by differencing a run with both disabled),
+so **~47h rather than the ~43h the config claimed**. Observed peak was 17.7 GB against the 18.9 GB recorded, and
+the checkpoint is 3.0 GB as documented.
+
+**Two methodology notes, both instances of cautions already on this page.** The first attempt compared a
+cold-compile 60-step run against a warm 20-step one and produced a phantom **3.15 s/step** — caution 4, and it
+survives differencing precisely because differencing assumes the constant term is shared. And the shape table in
+`configs/v1.yaml` is the one comparison in this repo whose arms do **not** share `grad_accum`: only the shipped
+375M shape was measured at ga 16, every larger shape at ga 4, while this page prices ga 4 -> 16 at +12% on that
+same shape. Re-benchmarked at matched batch 4 x ga 16 (eager/synthetic, ratios only), the 505M arm reaches ~15.4
+tok/param@48h rather than the 13.8 recorded, and the compute-optimal shape at this budget is ~420M
+(`d_model: 1088`, `n_layers: 22`) at ~20.1 rather than 375M's ~24.2. Still not worth taking — [shape is a
+plateau](#the-combination-and-the-iso-compute-controls-that-reversed-its-reading) and overtraining is deliberate — but the
+table argues the case more strongly than its numbers support.
+
 ## Startup compile cost
 
 Measured on the first forward/backward with `mode=None` (`d_model: 256`, `n_layers: 4`, `loop_count: 6`, batch 8 x
