@@ -5,6 +5,7 @@ from collections.abc import Sized
 import torch
 
 from radiance.config import Config
+from radiance.export import read_checkpoint
 
 from .transformer import DenseTransformer
 
@@ -20,8 +21,14 @@ def cast_params_to_native_bf16(model: "DenseTransformer") -> None:
     which is what lets optim.py's state allocators (already dtype-matched to the parameter, see
     _new_state_like) fall out for free.
     """
+    cast_params(model, torch.bfloat16)
+
+
+def cast_params(model: "DenseTransformer", dtype: torch.dtype) -> None:
+    """The dtype-general form of the above, for load paths whose storage dtype comes from the
+    weights on disk rather than from `train.native_bf16` (see `_storage_dtype`)."""
     for p in model.parameters():
-        p.data = p.data.to(torch.bfloat16)
+        p.data = p.data.to(dtype)
 
 
 def checkpoint_vocab_size(ckpt: dict) -> int:
@@ -34,10 +41,34 @@ def checkpoint_vocab_size(ckpt: dict) -> int:
     return ckpt["model"]["token_emb.weight"].shape[0]
 
 
+def _storage_dtype(ckpt: dict) -> torch.dtype | None:
+    """The dtype a loaded model's parameters should be allocated in, or None for the default.
+
+    `train.native_bf16` is the answer for a `.pt`, whose weights are always exactly what training
+    held. An *export* can disagree with it: `radiance-export --dtype bf16` halves an fp32
+    checkpoint on the way out, and that run's `native_bf16` is False, so trusting the config alone
+    would build an fp32 model and let `load_state_dict`'s `copy_` silently upcast the export right
+    back to the size it was exported to avoid. The weights themselves are the authority, and on a
+    `.pt` they agree with the config, so this is not a second rule — it is the same one, read from
+    the tensor rather than the flag.
+
+    Only half precisions are honoured. fp32 is the default allocation already, and an fp8/fp4
+    state dict is *mixed* (nvfp4 quantises the linears and nothing else), so casting every
+    parameter to the embedding's dtype would be wrong rather than merely redundant.
+    """
+    if ckpt["config"].train.native_bf16:
+        return torch.bfloat16
+    dtype = ckpt["model"]["token_emb.weight"].dtype
+    return dtype if dtype in (torch.bfloat16, torch.float16) else None
+
+
 def load_transformer_from_checkpoint(
     path: str, device: str, eos_id: int | None = None
 ) -> tuple["DenseTransformer", "Config"]:
-    """Reconstruct a DenseTransformer + its embedded Config from a train.py checkpoint .pt file.
+    """Reconstruct a DenseTransformer + its embedded Config from a train.py checkpoint.
+
+    `path` is either a `.pt` checkpoint or a `radiance-export` directory — `read_checkpoint`
+    dispatches, so generate/serve/eval accept an export wherever they accept a checkpoint.
 
     Extracted from generate.load_checkpoint (which now calls this) so dpo_data.py's DPO
     reference-logprob precompute (dpo_data.py:153) can reuse the same reconstruction logic without
@@ -48,17 +79,18 @@ def load_transformer_from_checkpoint(
     eos_id defaults to None, preserving generate.load_checkpoint's exact prior behavior (doc
     masking off during generation, since a single prompt is one document anyway regardless).
     """
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    ckpt = read_checkpoint(path, map_location=device)
     cfg = ckpt["config"]
     vocab_size = checkpoint_vocab_size(ckpt)
     model = DenseTransformer(cfg.model, vocab_size=vocab_size, eos_id=eos_id)
-    if cfg.train.native_bf16:
-        # Match training's storage dtype before load_state_dict, not after: load_state_dict's
+    storage_dtype = _storage_dtype(ckpt)
+    if storage_dtype is not None:
+        # Match the saved storage dtype before load_state_dict, not after: load_state_dict's
         # copy_ preserves the *destination* tensor's dtype, so building this model at the default
         # fp32 first would silently upcast a bf16-trained checkpoint back to fp32 on load — twice
         # the VRAM a native_bf16 run was saved specifically to avoid, right where generate/serve
         # cares about it most (inference has no optimizer state to dwarf the parameter memory).
-        cast_params_to_native_bf16(model)
+        cast_params(model, storage_dtype)
     model.load_state_dict(ckpt["model"])
     model.to(device)
     model.eval()
@@ -72,7 +104,7 @@ def checkpoint_param_bytes(path: str) -> int:
     keeps this a pure host-memory read, so it's safe to call while another model already occupies the
     GPU whose free memory a caller is trying to reserve against.
     """
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    ckpt = read_checkpoint(path, map_location="cpu")
     return sum(t.numel() * t.element_size() for t in ckpt["model"].values())
 
 

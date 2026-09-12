@@ -160,6 +160,27 @@ Two details are handled by the exporter rather than the caller:
   (MoE's counters do not survive a cast to bf16). Omitted, the export inherits the checkpoint's own dtype, and the
   recorded `dtype` reads `mixed` when the state dict genuinely isn't uniform (`fp4_linear`).
 
+### Importing one back
+
+An export directory is accepted **anywhere a `.pt` checkpoint is**. Every weight-loading path in the codebase goes
+through `export.read_checkpoint(path)`, which dispatches on whether the path is a `.pt` or an export directory (or
+the `model.safetensors` inside one) and returns the same checkpoint-shaped dict either way — so
+`radiance-generate`, `radiance-serve`, `radiance-eval`, `dpo.reference_checkpoint` and `train.init_from` all gained
+this from one dispatch rather than a branch each. Verified end-to-end: greedy generation from an export of
+`checkpoints/v1/3hhlx7bn/step_2500.pt` emits the same tokens as the `.pt`, and a run seeded with
+`train.init_from: <export dir>` starts at the checkpoint's loss rather than from scratch.
+
+`train.resume_from` is the exception and **rejects an export by name**. An export has no optimizer moments, so
+"resuming" from one would restart AdamW from zero momentum at warmup LR — the visible loss spike `save_checkpoint`
+exists to prevent. The error points at `train.init_from`, which is what seeds a fresh run from weights.
+
+One subtlety on the way back in: `--dtype bf16` on a checkpoint whose run was *not* `native_bf16` produces weights
+that disagree with their own config. `model/load.py`'s `_storage_dtype` therefore reads the storage dtype off
+`token_emb.weight` when the config doesn't already say bf16, because otherwise `load_state_dict`'s `copy_` would
+upcast the export straight back to the size it was exported to avoid. On a `.pt` the two always agree, so this is
+the same rule read from the tensor instead of the flag — not a second one. Only half precisions are honoured: an
+nvfp4 state dict is genuinely mixed, and casting every parameter to the embedding's dtype would be wrong.
+
 Optimizer moments, scheduler and scaler state are deliberately *not* exported: they are several times the size of
 the weights, mean nothing outside `optim.py`'s parameter groups, and an export is not a resume point — keep the
 `.pt` for that. `--tokenizer` additionally saves the config's HF tokenizer into the directory (opt-in, because it

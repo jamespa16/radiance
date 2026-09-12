@@ -105,8 +105,13 @@ uv run radiance-export --checkpoint checkpoints/tinystories/step_1000.pt --outpu
 Writes `model.safetensors` + `config.json` (plain JSON `Config`, step, vocab size, parameter count) so a checkpoint
 can be read without pickle or `radiance` on the path. The tied `lm_head.weight` is stored once and recorded in
 `shared_tensors`; `--dtype bf16|fp16|fp32` casts floats on the way out, `--tokenizer` also saves the HF tokenizer.
-Optimizer/scheduler/scaler state is not exported — an export is a model, not a resume point. `load_export` is the
-inverse. Entry point: `radiance.export:main`; see [docs/train.md](docs/train.md).
+Optimizer/scheduler/scaler state is not exported — an export is a model, not a resume point.
+
+**An export directory is accepted anywhere a `.pt` checkpoint is**: `radiance-generate`, `radiance-serve`,
+`radiance-eval`, `dpo.reference_checkpoint` and `train.init_from` all load through
+`radiance.export.read_checkpoint`, which dispatches on the path. The one exception is `train.resume_from`, which
+refuses an export by name — there are no optimizer moments in one to resume from. Entry point:
+`radiance.export:main`; see [docs/train.md](docs/train.md).
 
 ## Running standard benchmarks
 

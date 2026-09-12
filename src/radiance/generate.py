@@ -236,7 +236,12 @@ def generate(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to a .pt checkpoint from radiance.train")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        required=True,
+        help="Path to a .pt checkpoint from radiance.train, or a radiance-export directory",
+    )
     parser.add_argument("--prompt", type=str, default="Once upon a time")
     parser.add_argument("--max-new-tokens", type=int, default=200)
     parser.add_argument("--temperature", type=float, default=0.8, help="0 for greedy decoding")

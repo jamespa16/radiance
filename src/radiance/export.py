@@ -15,6 +15,11 @@ Deliberately not exported: optimizer moments, scheduler and scaler state. They a
 the size of the weights, mean nothing outside this codebase's parameter groups, and an export is
 not a resume point — keep the `.pt` for that.
 
+Reading one back is not a separate tool: `read_checkpoint` dispatches on the path, so an export
+directory is accepted anywhere a `.pt` is — `radiance-generate`, `radiance-serve`, `radiance-eval`,
+`dpo.reference_checkpoint`, `train.init_from`. `train.resume_from` is the one exception and refuses
+an export by name, since there are no optimizer moments in one to resume from.
+
 Two things need care, and both are handled here rather than left to the caller:
 
 **Weight tying.** `token_emb.weight` and `lm_head.weight` are the same tensor (transformer.py:266),
@@ -31,6 +36,7 @@ Usage:
 
     radiance-export --checkpoint checkpoints/tinystories/step_1000.pt --output export/tinystories
     radiance-export --checkpoint ... --output ... --dtype bf16 --tokenizer
+    radiance-generate --checkpoint export/tinystories --prompt "Once upon a time"
 """
 
 from __future__ import annotations
@@ -39,7 +45,7 @@ import argparse
 import json
 from dataclasses import asdict, fields
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -53,7 +59,9 @@ from radiance.config import (
     TrainConfig,
     WandbConfig,
 )
-from radiance.model import DenseTransformer, cast_params_to_native_bf16, checkpoint_vocab_size
+
+if TYPE_CHECKING:  # model/ imports this module (see read_checkpoint), so the import is deferred
+    from radiance.model import DenseTransformer
 
 WEIGHTS_NAME = "model.safetensors"
 CONFIG_NAME = "config.json"
@@ -170,8 +178,12 @@ def export_checkpoint(
     `map_location="cpu"` throughout: an export is a file-format conversion, and there is no reason
     for it to contend for a GPU that a training run is probably using.
     """
+    # Deferred: the model package imports this module for read_checkpoint, so nothing here may
+    # import it at module scope. Only the two functions that genuinely need a model do.
+    from radiance.model import checkpoint_vocab_size
+
     output_dir = Path(output_dir)
-    ckpt = torch.load(str(checkpoint), map_location="cpu", weights_only=False)
+    ckpt = read_checkpoint(checkpoint, map_location="cpu")
     cfg: Config = ckpt["config"]
     state: dict[str, torch.Tensor] = ckpt["model"]
 
@@ -218,37 +230,79 @@ def export_checkpoint(
     return summary
 
 
-def load_export(output_dir: str | Path, device: str = "cpu") -> tuple[DenseTransformer, Config]:
-    """Rebuild a `DenseTransformer` + `Config` from an export directory — the inverse of
-    `export_checkpoint`, and what makes the export verifiable rather than merely written.
+def is_export(path: str | Path) -> bool:
+    """Whether `path` names an export directory (as opposed to a `.pt` checkpoint).
 
-    Mirrors `model.load_transformer_from_checkpoint`, including its `native_bf16` ordering
-    subtlety: the model's storage dtype is set *before* `load_state_dict`, because `copy_` keeps
-    the destination's dtype and would otherwise upcast a bf16 export back to fp32.
+    Accepts the directory itself or the `model.safetensors` inside it, because both are things a
+    person plausibly types after `ls`. Both files must be present: a directory holding only
+    weights is not loadable (there is no config to rebuild the model from), and saying so at the
+    dispatch point gives a better error than a FileNotFoundError from inside the loader.
     """
-    output_dir = Path(output_dir)
-    with open(output_dir / CONFIG_NAME) as f:
-        meta = json.load(f)
-    cfg = _config_from_json(meta["config"])
+    path = Path(path)
+    if path.is_file() and path.name == WEIGHTS_NAME:
+        path = path.parent
+    return path.is_dir() and (path / CONFIG_NAME).is_file() and (path / WEIGHTS_NAME).is_file()
 
-    state = load_file(str(output_dir / WEIGHTS_NAME), device=device)
-    # Re-tie before load_state_dict so it can stay strict: the alias was dropped at write time,
-    # and a strict load would otherwise report lm_head.weight as a missing key.
+
+def read_export(path: str | Path, map_location: str = "cpu") -> dict[str, Any]:
+    """Read an export directory into the same dict shape `save_checkpoint` writes.
+
+    Returning a checkpoint-shaped dict rather than a model is what lets every existing consumer
+    (`load_transformer_from_checkpoint`, `load_pretrained_weights`, `checkpoint_param_bytes`)
+    accept an export by changing which loader they call and nothing else — the alternative, an
+    export-specific branch at each site, would have four places to keep in step with the schema.
+
+    The tie dropped at export time is restored here, as the *same tensor* under both names, so the
+    dict is indistinguishable from a freshly-loaded `.pt` — including for `checkpoint_param_bytes`,
+    which sums over the state dict and would otherwise price an export differently from the
+    checkpoint it came from.
+    """
+    path = Path(path)
+    if path.is_file() and path.name == WEIGHTS_NAME:
+        path = path.parent
+    with open(path / CONFIG_NAME) as f:
+        meta = json.load(f)
+    state = load_file(str(path / WEIGHTS_NAME), device=map_location)
     for alias, source in meta.get("shared_tensors", {}).items():
         state[alias] = state[source]
+    return {"model": state, "config": _config_from_json(meta["config"]), "step": meta.get("step")}
 
-    model = DenseTransformer(cfg.model, vocab_size=meta["vocab_size"])
-    if cfg.train.native_bf16:
-        cast_params_to_native_bf16(model)
-    model.load_state_dict(state)
-    model.to(device)
-    model.eval()
-    return model, cfg
+
+def read_checkpoint(path: str | Path, map_location: str = "cpu") -> dict[str, Any]:
+    """Load either a `.pt` checkpoint or an export directory, as a checkpoint-shaped dict.
+
+    The single entry point every weight-loading path in the codebase goes through, so "anywhere a
+    checkpoint is accepted, an export is accepted too" is one dispatch rather than a property each
+    call site has to remember to preserve. What comes back from an export has no `optimizer`,
+    `scheduler` or `scaler` key — an export carries weights only — which is why `train.resume_from`
+    rejects one outright (checkpointing.find_resume_checkpoint) instead of resuming from a
+    checkpoint with silently missing moments.
+    """
+    if is_export(path):
+        return read_export(path, map_location=map_location)
+    return torch.load(str(path), map_location=map_location, weights_only=False)
+
+
+def load_export(output_dir: str | Path, device: str = "cpu") -> tuple["DenseTransformer", Config]:
+    """Rebuild a `DenseTransformer` + `Config` from an export directory — the inverse of
+    `export_checkpoint`.
+
+    Thin by design: `load_transformer_from_checkpoint` accepts an export directory anywhere it
+    accepts a `.pt`, so this is a named shortcut for readers who think in terms of the export
+    rather than a second reconstruction path that could drift from it.
+    """
+    from radiance.model import load_transformer_from_checkpoint
+
+    return load_transformer_from_checkpoint(str(output_dir), device)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Export a checkpoint's weights to safetensors.")
-    parser.add_argument("--checkpoint", required=True, help="path to a radiance-train .pt checkpoint")
+    parser.add_argument(
+        "--checkpoint",
+        required=True,
+        help="path to a radiance-train .pt checkpoint (or an existing export, to re-export it)",
+    )
     parser.add_argument("--output", required=True, help="directory to write model.safetensors + config.json into")
     parser.add_argument(
         "--dtype",

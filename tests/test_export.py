@@ -181,3 +181,139 @@ def test_optimizer_state_is_not_exported(tmp_path, tiny_cfg):
 def test_missing_checkpoint_fails_loudly(tmp_path):
     with pytest.raises(FileNotFoundError):
         export_checkpoint(tmp_path / "nope.pt", tmp_path / "export")
+
+
+# --- Importing an export back into the pipeline -------------------------------------------------
+# An export nothing can read is a write-only format. These pin the other half: every path that
+# takes a checkpoint takes an export directory too, and the one path that can't says so.
+
+
+def test_load_transformer_from_checkpoint_accepts_an_export(tmp_path, tiny_cfg, tiny_ids):
+    """The single loader behind generate, serve, eval and DPO's reference model. If it takes an
+    export, all four do — which is why the dispatch lives there and not at each CLI."""
+    cfg = tiny_cfg()
+    path, model = _write_checkpoint(tmp_path, cfg)
+    export_checkpoint(path, tmp_path / "export")
+
+    from radiance.model import load_transformer_from_checkpoint
+
+    loaded, loaded_cfg = load_transformer_from_checkpoint(str(tmp_path / "export"), "cpu")
+
+    ids = tiny_ids()
+    model.eval()
+    with torch.no_grad():
+        assert torch.equal(model(ids).logits, loaded(ids).logits)
+    assert loaded_cfg.model == cfg.model
+
+
+def test_export_is_found_by_directory_or_by_weights_file(tmp_path, tiny_cfg):
+    cfg = tiny_cfg()
+    path, _ = _write_checkpoint(tmp_path, cfg)
+    export_checkpoint(path, tmp_path / "export")
+
+    from radiance.export import is_export
+
+    assert is_export(tmp_path / "export")
+    assert is_export(tmp_path / "export" / WEIGHTS_NAME)  # what you get from tab-completion
+    assert not is_export(path)  # a .pt is a checkpoint, not an export
+    assert not is_export(tmp_path / "nowhere")
+    # Weights without a config cannot rebuild a model; failing the check here gives a better error
+    # than a FileNotFoundError from inside the loader.
+    (tmp_path / "export" / CONFIG_NAME).unlink()
+    assert not is_export(tmp_path / "export")
+
+
+def test_init_from_seeds_a_run_from_an_export(tmp_path, tiny_cfg, tiny_ids):
+    """train.init_from needs weights and nothing else — exactly what an export has."""
+    from radiance.checkpointing import load_pretrained_weights
+
+    cfg = tiny_cfg()
+    path, source = _write_checkpoint(tmp_path, cfg)
+    export_checkpoint(path, tmp_path / "export")
+
+    fresh = DenseTransformer(cfg.model, vocab_size=TINY_VOCAB)
+    load_pretrained_weights(fresh, str(tmp_path / "export"), cfg, TINY_VOCAB, "cpu")
+
+    fresh.eval()
+    source.eval()
+    ids = tiny_ids()
+    with torch.no_grad():
+        assert torch.equal(source(ids).logits, fresh(ids).logits)
+
+
+def test_init_from_an_export_still_checks_the_model_shape(tmp_path, tiny_cfg):
+    """The shape-mismatch guard exists so a wrong checkpoint names the field that disagrees rather
+    than surfacing as a tensor-shape RuntimeError from inside torch. It must not be bypassed by
+    coming in through the export path."""
+    from radiance.checkpointing import load_pretrained_weights
+
+    path, _ = _write_checkpoint(tmp_path, tiny_cfg())
+    export_checkpoint(path, tmp_path / "export")
+
+    other = tiny_cfg(use_diff_attn=True)
+    with pytest.raises(ValueError, match="use_diff_attn"):
+        load_pretrained_weights(
+            DenseTransformer(other.model, vocab_size=TINY_VOCAB),
+            str(tmp_path / "export"),
+            other,
+            TINY_VOCAB,
+            "cpu",
+        )
+
+
+def test_resume_from_an_export_is_rejected_by_name(tmp_path, tiny_cfg):
+    """An export has no optimizer moments, so "resuming" from one restarts AdamW from zero
+    momentum at warmup LR — the exact loss spike save_checkpoint exists to prevent. Silently
+    allowing it would be far worse than refusing."""
+    from radiance.checkpointing import find_resume_checkpoint
+
+    cfg = tiny_cfg()
+    path, _ = _write_checkpoint(tmp_path, cfg)
+    export_checkpoint(path, tmp_path / "export")
+
+    cfg.train.resume_from = str(tmp_path / "export")
+    with pytest.raises(ValueError, match="init_from"):
+        find_resume_checkpoint(cfg)
+
+
+def test_half_precision_export_is_not_silently_upcast_on_load(tmp_path, tiny_cfg):
+    """`--dtype bf16` on a checkpoint whose run was *not* native_bf16: the config says fp32, the
+    weights say bf16. Trusting the config would build an fp32 model and let load_state_dict's
+    copy_ upcast the export straight back to the size it was exported to avoid."""
+    cfg = tiny_cfg()
+    assert not cfg.train.native_bf16
+    path, _ = _write_checkpoint(tmp_path, cfg)
+    export_checkpoint(path, tmp_path / "export", dtype=torch.bfloat16)
+
+    loaded, _ = load_export(tmp_path / "export")
+
+    assert loaded.token_emb.weight.dtype == torch.bfloat16
+
+
+def test_param_bytes_agree_between_a_checkpoint_and_its_export(tmp_path, tiny_cfg):
+    """serve/batching size VRAM off this before deciding to load a model, so an export must price
+    the same as the checkpoint it came from — which is only true because read_export restores the
+    dropped tie instead of leaving the state dict one tensor short."""
+    from radiance.model import checkpoint_param_bytes
+
+    cfg = tiny_cfg()
+    path, _ = _write_checkpoint(tmp_path, cfg)
+    export_checkpoint(path, tmp_path / "export")
+
+    assert checkpoint_param_bytes(str(tmp_path / "export")) == checkpoint_param_bytes(str(path))
+
+
+def test_an_export_can_be_re_exported(tmp_path, tiny_cfg):
+    """read_checkpoint is what export_checkpoint reads with too, so `--dtype` on an existing
+    export works without a special case — and the result must still round-trip."""
+    cfg = tiny_cfg()
+    path, _ = _write_checkpoint(tmp_path, cfg)
+    export_checkpoint(path, tmp_path / "fp32")
+
+    summary = export_checkpoint(tmp_path / "fp32", tmp_path / "bf16", dtype=torch.bfloat16)
+
+    assert summary["dtype"] == "bfloat16"
+    assert summary["step"] == 7
+    assert summary["shared_tensors"] == {"lm_head.weight": "token_emb.weight"}
+    loaded, _ = load_export(tmp_path / "bf16")
+    assert loaded.lm_head.weight is loaded.token_emb.weight
