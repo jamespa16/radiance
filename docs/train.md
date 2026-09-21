@@ -125,8 +125,12 @@ every config whose `lr` was tuned against cosine.
 ## Checkpoints and resume
 
 `save_checkpoint` writes the optimizer state, LR-scheduler state and `GradScaler` state alongside the
-weights/step/config. Only one checkpoint per run is kept — each `save_every` save deletes the previous `step_*.pt`
-before writing the new one — so an output directory holds at most one `.pt` file.
+weights/step/config, plus `train_batches_drawn` (the data position, below). Only one checkpoint per run is kept, but
+the previous one is deleted only *after* the new one is complete: `save_checkpoint` writes `step_N.pt.tmp`, fsyncs it
+and renames it into place, then `prune_checkpoints` removes the older `step_*.pt` and any stale `.tmp`. Pruning first,
+as this used to, meant a save killed mid-write (OOM kill, power loss, full disk) left no checkpoint at all, and
+`resume_from: "auto"` then quietly restarted the run from step 0. The cost is a second checkpoint's worth of disk
+during each save.
 
 `cfg.train.resume_from` (opt-in, default `null`) restores all saved state. Set it to a checkpoint path, or to the
 literal `"auto"` to pick the single `step_*.pt` in `output_dir`, so an interrupted run can be relaunched with its
@@ -134,10 +138,19 @@ config unchanged. Without the optimizer moments a "resumed" run restarts AdamW f
 shows up as a loss spike. An explicit `resume_from` path that doesn't exist raises rather than silently starting from
 scratch; `"auto"` against an empty `output_dir` is just a fresh run.
 
-What is *not* restored is the DataLoader position and RNG state, which trade off against each other: `train()`
-re-seeds off the resumed step so the loader draws a different shuffle order rather than replaying batches already
-trained on. A resumed run is therefore statistically equivalent to an uninterrupted one, not bit-identical — with
-`dropout: 0.0` it is bit-identical (verified: same weights, same AdamW moments, same LR sequence).
+**The data position is restored only on the streaming disk-cache path** (`data.streaming` + `data.disk_cache_max_gb`,
+single dataset — V1's path). `train()` counts every batch it draws and the checkpoint records the total; on resume,
+`StreamingPackedDataset.set_resume_position` has each worker skip its share (the DataLoader hands batch *i* to worker
+*i* mod `num_workers`). Before this, a resume replayed the cache from the start, and since the cache holds everything
+trained so far, a restart at hour 30 would have spent the rest of the run re-training on the first 30 hours' data.
+The skip is exact per worker except for the shuffle buffer: it applies before shuffling, so up to
+`shuffle_buffer_size` blocks per worker can repeat, and the same number are skipped without being trained on.
+Every other streaming loader prints a warning on resume, because it restarts from the beginning of its stream.
+
+RNG state is not restored. It trades off against data freshness: `train()` re-seeds off the resumed step, so a
+map-style loader draws a different shuffle order rather than replaying batches already trained on. A resumed run is
+therefore statistically equivalent to an uninterrupted one, not bit-identical — with `dropout: 0.0` the weights,
+AdamW moments and LR sequence are bit-identical (verified).
 
 ## Exporting to safetensors
 

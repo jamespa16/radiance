@@ -39,7 +39,21 @@ on-disk cache (`StreamingPackedDataset`) so repeated short runs against the same
 re-tokenize. Each DataLoader worker keeps its own manifest + shard files under `cache_dir`, replaying cached blocks
 before continuing the live stream and flushing newly-packed blocks in `data.disk_cache_shard_size`-block shards
 (default 100 — keep this well below a typical short run's block count, or nothing ever gets cached), evicting the
-oldest shard first once the per-worker, per-split budget is exceeded.
+oldest shard first once the per-worker, per-split budget is exceeded. A resumed run skips the blocks it already
+trained on instead of replaying them from the start; see [train.md](train.md#checkpoints-and-resume).
+
+Two bugs here each duplicated or dropped data silently, so they're worth knowing about before you change this code:
+
+- **Never skip the raw stream with `raw.skip()`.** Inside a DataLoader worker, HF `datasets` re-shards an
+  `IterableDataset` across workers itself and *divides* any pending `skip(n)` by `num_workers`. `n_raw_consumed` is
+  already a per-worker count, so `raw.skip(n_raw_consumed)` skipped only 1/`num_workers` of it, and every reuse of
+  the cache re-tokenized and re-trained on most of what the cache held. The skip is now `itertools.islice` over the
+  fully sharded per-worker stream. (The same re-sharding stacks on the explicit `raw.shard()`, so each of `N` workers
+  reads 1/`N`² of the corpus's files and the run as a whole reaches only 1/`N` of them — plenty for fineweb, but a
+  small corpus runs out sooner than you'd expect. Left as-is: changing it re-maps every existing cache.)
+- **Flush only between tokenize batches.** `raw_consumed_since_flush` counts a whole tokenize batch at once, so a
+  flush partway through one recorded raw examples whose blocks were never cached; the next run resumed the raw stream
+  past them. The sub-block token tail left in `token_buffer` at a flush is still lost (under one block per flush).
 
 Caveats. The cache directory can't be shared between two concurrently-running training processes (a lockfile makes
 this fail fast rather than corrupt). Once a worker's raw partition is fully consumed once, later epochs (including

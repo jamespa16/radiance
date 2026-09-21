@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import logging
 import math
@@ -279,6 +280,32 @@ class StreamingPackedDataset(torch.utils.data.IterableDataset):
         self._lock = _CacheLock(self.cache_dir / ".lock")
         self._lock.acquire()
 
+        # Batches a previous run already drew from this loader; see set_resume_position.
+        self.resume_batches = 0
+
+    def set_resume_position(self, batches_drawn: int) -> None:
+        """Skip the blocks a resumed run already trained on. Call before iter(loader).
+
+        Without this a resume replays the stream from its start: source() yields every cached
+        block before the live stream, and the cache holds everything trained so far whenever
+        disk_cache_max_gb covers the run — so a restart at hour 30 would spend the rest of the run
+        re-training on the first 30 hours of data.
+
+        The DataLoader hands task i to worker i % num_workers, each task being batch_size blocks,
+        so a worker's share of `batches_drawn` is recoverable from its id alone. Blocks prefetched
+        but never drawn are not counted, so they are (correctly) trained on after the resume.
+
+        The skip is applied to the *pre-shuffle* source order, so it is exact only up to the
+        shuffle buffer: up to shuffle_buffer_size blocks per worker that the previous run trained
+        on can recur, and as many it never drew are passed over. The buffer's RNG is re-seeded on
+        resume, so the previous run's shuffle cannot be replayed to do better.
+        """
+        self.resume_batches = batches_drawn
+
+    def _resume_skip_blocks(self, worker_id: int, num_workers: int) -> int:
+        batches = self.resume_batches // num_workers + (worker_id < self.resume_batches % num_workers)
+        return batches * self.cfg.train.batch_size
+
     def __del__(self):
         self._lock.release()
 
@@ -334,11 +361,23 @@ class StreamingPackedDataset(torch.utils.data.IterableDataset):
             yield from shuffle_buf
             shuffle_buf.clear()
 
+        skip = self._resume_skip_blocks(worker_id, num_workers)
+        # Once only: under persistent_workers this copy is re-iterated for every later epoch.
+        self.resume_batches = 0
+        if skip:
+            logger.info("[radiance] streaming resume: worker %d skipping %d already-trained blocks", worker_id, skip)
+
         def source():
+            nonlocal skip
             for shard in manifest["shards"]:
+                # Whole shards are skipped from the manifest's count without loading them.
+                if skip >= shard["n_blocks"]:
+                    skip -= shard["n_blocks"]
+                    continue
                 blocks = torch.load(self.cache_dir / shard["file"])
-                for block in blocks:
+                for block in blocks[skip:]:
                     yield {"input_ids": block}
+                skip = 0
 
             if self.carve_eval_from_train:
                 raw = load_dataset(self.dataset_id, split="train", streaming=True)
@@ -350,7 +389,12 @@ class StreamingPackedDataset(torch.utils.data.IterableDataset):
                 raw = load_dataset(self.dataset_id, split=self.split, streaming=True)
             if num_workers > 1:
                 raw = raw.shard(num_shards=num_workers, index=worker_id)
-            raw = raw.skip(manifest["n_raw_consumed"])
+            # Skip what the cache already holds by counting examples off *this worker's* stream,
+            # not with raw.skip(). Inside a DataLoader worker, HF re-shards an IterableDataset
+            # across the workers itself and divides any pending skip(n) among them — so
+            # raw.skip(n_raw_consumed), already a per-worker count, skipped only 1/num_workers of
+            # it, and every cache reuse re-tokenized and re-trained on most of what was cached.
+            raw = itertools.islice(raw, manifest["n_raw_consumed"], None)
 
             seq_len = self.cfg.data.seq_len
             eos_id = self.tokenizer.eos_token_id
@@ -369,18 +413,29 @@ class StreamingPackedDataset(torch.utils.data.IterableDataset):
             tokenize_batch_size = 8
 
             def drain_blocks():
-                nonlocal token_buffer, block_buffer, raw_consumed_since_flush, n_yielded
+                nonlocal token_buffer, block_buffer, raw_consumed_since_flush, n_yielded, skip
                 while len(token_buffer) >= seq_len:
                     block = token_buffer[:seq_len]
                     token_buffer = token_buffer[seq_len:]
                     block_buffer.append(block)
                     n_yielded += 1
-                    yield {"input_ids": block}
+                    # A skip that outruns the cache (evicted shards, a deleted cache, or blocks
+                    # yielded after the last flush) continues here. Skipped blocks are still
+                    # flushed like any other, so the manifest stays a prefix of the stream.
+                    if skip:
+                        skip -= 1
+                    else:
+                        yield {"input_ids": block}
 
-                    if len(block_buffer) >= self.cfg.data.disk_cache_shard_size:
-                        manifest["n_raw_consumed"] += raw_consumed_since_flush
-                        self._flush(manifest, manifest_path, block_buffer, worker_id, budget)
-                        block_buffer, raw_consumed_since_flush = [], 0
+                # Flush only here, once this tokenize batch is fully drained. raw_consumed_since_flush
+                # already counts the whole batch, so a flush partway through it recorded raw examples
+                # whose blocks were never cached — the next run resumed the raw stream past them, and
+                # those blocks were silently dropped. What is still lost is the sub-block token tail
+                # left in token_buffer, under one block per flush.
+                if len(block_buffer) >= self.cfg.data.disk_cache_shard_size:
+                    manifest["n_raw_consumed"] += raw_consumed_since_flush
+                    self._flush(manifest, manifest_path, block_buffer, worker_id, budget)
+                    block_buffer, raw_consumed_since_flush = [], 0
 
             raw_batch = []
             for example in raw:

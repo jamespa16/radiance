@@ -17,7 +17,7 @@ from radiance.config import (
     resolve_device,
     resolve_dtype,
 )
-from radiance.data import build_dataloaders, build_tokenizer
+from radiance.data import StreamingPackedDataset, build_dataloaders, build_tokenizer
 from radiance.dpo_data import build_dpo_dataloaders
 from radiance.sft_data import build_sft_dataloaders
 from radiance.model import DenseTransformer, cast_params_to_native_bf16, padded_vocab_size
@@ -29,7 +29,7 @@ from .batching import (
     estimate_batch_size,
     split_micro_batch,
 )
-from .checkpointing import find_resume_checkpoint, load_pretrained_weights, save_checkpoint
+from .checkpointing import find_resume_checkpoint, load_pretrained_weights, prune_checkpoints, save_checkpoint
 from .evaluation import evaluate
 from .losses import (
     build_dpo_loss_fn,
@@ -163,6 +163,34 @@ _ACCUM_METRICS = (
     "dpo_reward_accuracy",
     "dpo_margin",
 )
+
+
+def _restore_data_position(train_loader, ckpt: dict, cfg: Config) -> None:
+    """Point a resumed run's train loader past the data the checkpoint already trained on.
+
+    Only the streaming disk-cache loader can seek. A map-style loader needs nothing — train()
+    re-seeds its shuffle off the step — but a plain streaming loader restarts its stream from the
+    beginning with a fixed seed, so it replays already-trained data. Say so rather than let it pass
+    silently: that is the failure this function exists to prevent on the path that can prevent it.
+    """
+    batches_drawn = ckpt.get("train_batches_drawn")
+    if isinstance(train_loader.dataset, StreamingPackedDataset):
+        if batches_drawn is None:
+            print(
+                "[radiance] WARNING: this checkpoint predates train_batches_drawn, so the data "
+                "position is unknown; the stream restarts from its beginning and replays data "
+                "this run has already trained on."
+            )
+            return
+        train_loader.dataset.set_resume_position(batches_drawn)
+        print(f"[radiance] resuming data stream after {batches_drawn:,} batches")
+    elif cfg.data.streaming:
+        print(
+            "[radiance] WARNING: only the single-dataset streaming disk-cache loader "
+            "(data.streaming + data.disk_cache_max_gb, no dataset_mix) can resume its data "
+            "position. This loader restarts from the beginning of its stream and will replay "
+            "data this run has already trained on."
+        )
 
 
 def train(cfg: Config) -> None:
@@ -324,6 +352,10 @@ def train(cfg: Config) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     step = 0
+    # The data position: batches pulled from train_loader over the whole run, across resumes.
+    # Counts draws rather than optimizer steps, so a micro-batch drawn and then lost to an OOM
+    # retry is still counted — it left the stream, and a resume should not hand it out again.
+    train_batches_drawn = 0
     if resume_path is not None:
         ckpt = torch.load(resume_path, map_location=device, weights_only=False)
         raw_model.load_state_dict(ckpt["model"])
@@ -345,6 +377,8 @@ def train(cfg: Config) -> None:
         scheduler.load_state_dict(ckpt["scheduler"])
         scaler.load_state_dict(ckpt["scaler"])
         step = ckpt["step"]
+        _restore_data_position(train_loader, ckpt, cfg)
+        train_batches_drawn = ckpt.get("train_batches_drawn") or 0
         # Re-seed off the resumed step before the train iterator is created below. The DataLoader's
         # shuffle order is drawn from the global RNG at iteration time, so without this a resumed
         # run replays exactly the batches the original run already trained on — measurably slower
@@ -397,6 +431,7 @@ def train(cfg: Config) -> None:
                     except StopIteration:
                         data_iter = iter(train_loader)
                         batch = next(data_iter)
+                    train_batches_drawn += 1
 
                     # Which columns a batch carries and how a chunk's loss is built are the only
                     # things that differ between pretrain/SFT and DPO; everything the accumulation
@@ -501,12 +536,16 @@ def train(cfg: Config) -> None:
                     wandb.log({"val/loss": val_loss}, step=step)
 
                 if step % cfg.train.save_every == 0:
-                    # Keep only the latest checkpoint — remove previous ones before saving.
-                    for old_ckpt in output_dir.glob("step_*.pt"):
-                        old_ckpt.unlink()
+                    # Keep only the latest checkpoint — but prune only after the new one is fully
+                    # written. Pruning first meant a save that died mid-write (OOM kill, power
+                    # loss, full disk) left no checkpoint at all, and resume_from: auto then
+                    # silently restarted the run from step 0.
+                    ckpt_path = output_dir / f"step_{step}.pt"
                     save_checkpoint(
-                        output_dir / f"step_{step}.pt", raw_model, optimizer, scheduler, scaler, step, cfg
+                        ckpt_path, raw_model, optimizer, scheduler, scaler, step, cfg,
+                        train_batches_drawn=train_batches_drawn,
                     )
+                    prune_checkpoints(output_dir, keep=ckpt_path)
             except torch.cuda.OutOfMemoryError:
                 # An OOM anywhere at or after scaler.unscale_() below leaves this optimizer marked
                 # as already-unscaled for the current scaler generation, so the retry's own

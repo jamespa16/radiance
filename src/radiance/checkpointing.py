@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import torch
@@ -16,38 +17,65 @@ def save_checkpoint(
     scaler: torch.amp.GradScaler,
     step: int,
     cfg: Config,
+    train_batches_drawn: int = 0,
 ) -> None:
-    """Write a resumable checkpoint.
+    """Write a resumable checkpoint, atomically.
 
     Everything needed to continue the run goes in, not just the weights: without the optimizer's
     moment buffers a resumed run restarts AdamW from zero momentum, which shows up as a visible
     loss spike, and without the scheduler/step the LR trajectory restarts from warmup. `config` is
     the full Config object (pickled), which is what generate.py reads back.
 
-    Not captured: the DataLoader's position, and RNG state. Those two trade off against each other,
-    and the resolution here favours data freshness — train() re-seeds off the resumed step, so the
-    loader draws a *different* shuffle order rather than replaying batches the run already trained
-    on (which is what restoring RNG state verbatim would cause). The cost is that dropout draws a
-    different mask stream, so a resumed run is statistically equivalent to an uninterrupted one
-    rather than bit-identical. With dropout disabled, resume reproduces an uninterrupted run
-    exactly — model weights, AdamW moments, and LR schedule all match to the bit.
+    `train_batches_drawn` is the data position: how many batches the run has pulled from its
+    train loader. A streaming disk-cache loader skips that many on resume (see
+    StreamingPackedDataset.set_resume_position); no other loader can seek, so for them it is
+    recorded but unused.
+
+    Not captured: RNG state. It trades off against data freshness, and the resolution here favours
+    freshness — train() re-seeds off the resumed step, so a map-style loader draws a *different*
+    shuffle order rather than replaying batches the run already trained on (which is what restoring
+    RNG state verbatim would cause). The cost is that dropout draws a different mask stream, so a
+    resumed run is statistically equivalent to an uninterrupted one rather than bit-identical.
+    With dropout disabled, model weights, AdamW moments, and LR schedule all match to the bit.
+
+    Written to a temp file, fsynced, then renamed over `path`, so an interrupted save (OOM kill,
+    power loss, full disk) leaves either the complete new file or nothing at `path` — never a
+    truncated checkpoint that resume_from: auto would pick up and fail to load. The temp name
+    ends in .tmp, so find_resume_checkpoint's step_*.pt glob never matches it.
     """
-    torch.save(
-        {
-            "model": raw_model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            # Which algorithm produced that state. Muon's per-param state is a single momentum
-            # buffer where AdamW's is two moments, so loading one into the other silently produces
-            # a wrong (or shape-mismatched) resume — see train()'s resume block, which resets
-            # optimizer state with a warning rather than crashing when these disagree.
-            "optimizer_type": cfg.train.optimizer,
-            "scheduler": scheduler.state_dict(),
-            "scaler": scaler.state_dict(),
-            "step": step,
-            "config": cfg,
-        },
-        path,
-    )
+    tmp_path = path.with_name(path.name + ".tmp")
+    with open(tmp_path, "wb") as f:
+        torch.save(
+            {
+                "model": raw_model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                # Which algorithm produced that state. Muon's per-param state is a single momentum
+                # buffer where AdamW's is two moments, so loading one into the other silently produces
+                # a wrong (or shape-mismatched) resume — see train()'s resume block, which resets
+                # optimizer state with a warning rather than crashing when these disagree.
+                "optimizer_type": cfg.train.optimizer,
+                "scheduler": scheduler.state_dict(),
+                "scaler": scaler.state_dict(),
+                "step": step,
+                "train_batches_drawn": train_batches_drawn,
+                "config": cfg,
+            },
+            f,
+        )
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
+
+
+def prune_checkpoints(output_dir: Path, keep: Path) -> None:
+    """Delete every step_*.pt in output_dir except `keep`, plus any .tmp a crashed save left.
+
+    Called only after `keep` has been written, so there is never a moment with no complete
+    checkpoint on disk; the cost is a second checkpoint's worth of disk space during the save.
+    """
+    for old in [*output_dir.glob("step_*.pt"), *output_dir.glob("step_*.pt.tmp")]:
+        if old != keep:
+            old.unlink(missing_ok=True)
 
 
 def find_resume_checkpoint(cfg: Config) -> Path | None:
