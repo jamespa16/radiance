@@ -1,0 +1,9 @@
+[driver] === d_cos_m0.25 ===
+[driver] d_cos_m0.25 done in 114s :: [radiance] step   4000 val/loss 1.6196 ± 0.0410 bpb 0.5570
+[driver] === d_wsd20_m0.25 ===
+[driver] d_wsd20_m0.25 done in 115s :: [radiance] step   4000 val/loss 1.6095 ± 0.0409 bpb 0.5535
+[driver] === e_wsd10_m0.5 ===
+[driver] e_wsd10_m0.5 done in 114s :: [radiance] step   4000 val/loss 1.6181 ± 0.0409 bpb 0.5564
+[driver] === e_wsd30_m0.5 ===
+[driver] e_wsd30_m0.5 done in 114s :: [radiance] step   4000 val/loss 1.5998 ± 0.0411 bpb 0.5501
+[driver] ALL DONE
