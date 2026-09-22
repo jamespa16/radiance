@@ -1,0 +1,50 @@
+[radiance] doc_attention_mask on, so compiling without CUDA graphs (mode=None instead of 'reduce-overhead').
+[radiance] optimizer=muon (muon_lr=0.02 over 48 tensors, adamw lr=0.01 over the rest)
+[radiance] step    100/4000 loss 3.0738 lm 3.0610 lr 1.262e-02 mem 2.33GB
+[radiance] step    200/4000 loss 2.6506 lm 2.6374 lr 2.000e-02 mem 2.33GB 638.7k tok/s
+[radiance] step    300/4000 loss 2.3036 lm 2.2903 lr 2.000e-02 mem 2.33GB 634.6k tok/s
+[radiance] step    400/4000 loss 2.2203 lm 2.2070 lr 2.000e-02 mem 2.33GB 573.1k tok/s
+[radiance] step    500/4000 loss 2.0908 lm 2.0776 lr 2.000e-02 mem 2.33GB 636.9k tok/s
+[radiance] step    500 val/loss 2.1607 ± 0.0400 bpb 0.7430
+[radiance] step    600/4000 loss 2.1714 lm 2.1585 lr 2.000e-02 mem 2.33GB 630.4k tok/s
+[radiance] step    700/4000 loss 2.0819 lm 2.0693 lr 2.000e-02 mem 2.33GB 630.0k tok/s
+[radiance] step    800/4000 loss 1.9831 lm 1.9704 lr 2.000e-02 mem 2.33GB 631.4k tok/s
+[radiance] step    900/4000 loss 1.9723 lm 1.9601 lr 2.000e-02 mem 2.33GB 634.4k tok/s
+[radiance] step   1000/4000 loss 2.0592 lm 2.0474 lr 2.000e-02 mem 2.33GB 631.7k tok/s
+[radiance] step   1000 val/loss 1.9771 ± 0.0391 bpb 0.6799
+[radiance] step   1100/4000 loss 1.9354 lm 1.9238 lr 2.000e-02 mem 2.33GB 635.4k tok/s
+[radiance] step   1200/4000 loss 2.0251 lm 2.0140 lr 2.000e-02 mem 2.33GB 632.6k tok/s
+[radiance] step   1300/4000 loss 1.8424 lm 1.8311 lr 2.000e-02 mem 2.33GB 632.7k tok/s
+[radiance] step   1400/4000 loss 1.9521 lm 1.9416 lr 2.000e-02 mem 2.33GB 633.3k tok/s
+[radiance] step   1500/4000 loss 1.7703 lm 1.7597 lr 2.000e-02 mem 2.33GB 628.2k tok/s
+[radiance] step   1500 val/loss 1.8904 ± 0.0404 bpb 0.6501
+[radiance] step   1600/4000 loss 1.8312 lm 1.8212 lr 2.000e-02 mem 2.33GB 566.2k tok/s
+[radiance] step   1700/4000 loss 1.8890 lm 1.8796 lr 2.000e-02 mem 2.33GB 636.4k tok/s
+[radiance] step   1800/4000 loss 1.7989 lm 1.7899 lr 2.000e-02 mem 2.33GB 636.8k tok/s
+[radiance] step   1900/4000 loss 1.7463 lm 1.7373 lr 2.000e-02 mem 2.33GB 635.0k tok/s
+[radiance] step   2000/4000 loss 1.7995 lm 1.7912 lr 2.000e-02 mem 2.33GB 638.5k tok/s
+[radiance] step   2000 val/loss 1.8412 ± 0.0404 bpb 0.6332
+[radiance] step   2100/4000 loss 1.7166 lm 1.7086 lr 2.000e-02 mem 2.33GB 636.3k tok/s
+[radiance] step   2200/4000 loss 1.7723 lm 1.7645 lr 2.000e-02 mem 2.33GB 637.7k tok/s
+[radiance] step   2300/4000 loss 1.8758 lm 1.8688 lr 2.000e-02 mem 2.33GB 637.5k tok/s
+[radiance] step   2400/4000 loss 1.8289 lm 1.8223 lr 2.000e-02 mem 2.33GB 639.0k tok/s
+[radiance] step   2500/4000 loss 1.7604 lm 1.7543 lr 2.000e-02 mem 2.33GB 638.7k tok/s
+[radiance] step   2500 val/loss 1.8058 ± 0.0403 bpb 0.6210
+[radiance] step   2600/4000 loss 1.7972 lm 1.7912 lr 2.000e-02 mem 2.33GB 638.6k tok/s
+[radiance] step   2700/4000 loss 1.7107 lm 1.7052 lr 2.000e-02 mem 2.33GB 638.3k tok/s
+[radiance] step   2800/4000 loss 1.8499 lm 1.8448 lr 2.000e-02 mem 2.33GB 637.9k tok/s
+[radiance] step   2900/4000 loss 1.7373 lm 1.7325 lr 2.000e-02 mem 2.33GB 638.4k tok/s
+[radiance] step   3000/4000 loss 1.7098 lm 1.7051 lr 2.000e-02 mem 2.33GB 639.2k tok/s
+[radiance] step   3000 val/loss 1.7826 ± 0.0405 bpb 0.6130
+[radiance] step   3100/4000 loss 1.6737 lm 1.6695 lr 2.000e-02 mem 2.33GB 635.0k tok/s
+[radiance] step   3200/4000 loss 1.7359 lm 1.7318 lr 2.000e-02 mem 2.33GB 635.2k tok/s
+[radiance] step   3300/4000 loss 1.6419 lm 1.6380 lr 2.000e-02 mem 2.33GB 636.1k tok/s
+[radiance] step   3400/4000 loss 1.7092 lm 1.7057 lr 2.000e-02 mem 2.33GB 635.5k tok/s
+[radiance] step   3500/4000 loss 1.7705 lm 1.7671 lr 2.000e-02 mem 2.33GB 636.0k tok/s
+[radiance] step   3500 val/loss 1.7624 ± 0.0410 bpb 0.6061
+[radiance] step   3600/4000 loss 1.7190 lm 1.7157 lr 2.000e-02 mem 2.33GB 635.7k tok/s
+[radiance] step   3700/4000 loss 1.6972 lm 1.6944 lr 1.100e-02 mem 2.33GB 635.8k tok/s
+[radiance] step   3800/4000 loss 1.6407 lm 1.6384 lr 7.272e-03 mem 2.33GB 635.0k tok/s
+[radiance] step   3900/4000 loss 1.6130 lm 1.6110 lr 4.412e-03 mem 2.33GB 636.2k tok/s
+[radiance] step   4000/4000 loss 1.6077 lm 1.6059 lr 2.000e-03 mem 2.33GB 635.0k tok/s
+[radiance] step   4000 val/loss 1.6304 ± 0.0409 bpb 0.5607
