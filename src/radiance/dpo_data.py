@@ -1,18 +1,28 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 from pathlib import Path
 
 import torch
-from datasets import DatasetDict, load_dataset, load_from_disk
+from datasets import DatasetDict, load_from_disk
 from torch.utils.data import DataLoader
 from transformers import PreTrainedTokenizerBase
 
 from radiance.config import Config, doc_mask_is_inert_for_dpo, resolve_device, resolve_dtype
 from radiance.model import load_transformer_from_checkpoint, sequence_logprob_sum
 
-from .data import pin_memory_for, split_off_eval
-from .sft_data import tokenize_sft_example
+from .data import pin_memory_for
+from .sft_data import (
+    RLAIF_MANIFEST_NAME,
+    RLAIF_PROMPT_IDS_VERSION,
+    load_chat_dataset,
+    select_splits,
+    split_key_extras,
+    tokenize_chat_prompt,
+    tokenize_sft_example,
+)
 
 # DPO (preference post-training): different packing strategy from SFT's above, deliberately.
 # SFT packs many chat examples per fixed-seq_len block, relying on
@@ -33,6 +43,33 @@ from .sft_data import tokenize_sft_example
 # never attend to padding regardless of whether document-boundary masking is active. Whether the
 # reference-logprob precompute pass below sets eos_id on its model is therefore a free choice,
 # not a correctness requirement.
+
+_HH_TURN = re.compile(r"\n\n(Human|Assistant):[ ]?")
+
+
+def parse_hh_transcript(text: str) -> list[dict]:
+    """An Anthropic/hh-rlhf-style transcript string ("\\n\\nHuman: ...\\n\\nAssistant: ...") ->
+    [{"role", "content"}, ...] turns.
+
+    hh-rlhf (and datasets derived from it) ship chosen/rejected as whole transcripts that share
+    every turn but the last assistant one. Parsed into turns, the shared turns tokenize identically
+    on both sides (tokenize_sft_example works turn by turn), and attention is causal, so their
+    log-probabilities are equal under any model. _tokenize_dpo_row drops the shared assistant turns
+    from the loss mask: they would cancel in the summed DPO log-ratio, but not in the per-token
+    means IPO and sft_weight divide by, where they would leak in. Text before the first marker, if
+    any, is a user turn.
+    """
+    parts = _HH_TURN.split(text)
+    if len(parts) < 3:
+        raise ValueError(
+            "expected an hh-rlhf-style transcript with '\\n\\nHuman:'/'\\n\\nAssistant:' turn markers; "
+            f"got {text[:80]!r}. For plain completion strings, set dpo.prompt_column."
+        )
+    messages = [{"role": "user", "content": parts[0]}] if parts[0].strip() else []
+    for role, content in zip(parts[1::2], parts[2::2]):
+        messages.append({"role": "user" if role == "Human" else "assistant", "content": content})
+    return messages
+
 
 def _format_dpo_pair(example: dict, cfg: Config) -> tuple[list[dict], list[dict]]:
     """Normalize one dataset row to (chosen_messages, rejected_messages).
@@ -55,7 +92,38 @@ def _format_dpo_pair(example: dict, cfg: Config) -> tuple[list[dict], list[dict]
         chosen = prompt_turns + [{"role": "assistant", "content": example[cfg.dpo.chosen_column]}]
         rejected = prompt_turns + [{"role": "assistant", "content": example[cfg.dpo.rejected_column]}]
         return chosen, rejected
-    return example[cfg.dpo.chosen_column], example[cfg.dpo.rejected_column]
+    chosen, rejected = example[cfg.dpo.chosen_column], example[cfg.dpo.rejected_column]
+    # A string here, with no prompt_column, can only be a whole transcript (a message list is the
+    # other shape); before this it crashed iterating characters as turns, so no working config
+    # took this branch.
+    if isinstance(chosen, str):
+        chosen = parse_hh_transcript(chosen)
+    if isinstance(rejected, str):
+        rejected = parse_hh_transcript(rejected)
+    return chosen, rejected
+
+
+def _sampled_token_ids(example: dict, cfg: Config) -> tuple[list[int], list[int]] | None:
+    """(chosen, rejected) completion token ids, when the row carries them — radiance-rlaif writes
+    them beside the text as `<column>_token_ids` — else None. Only with prompt_column set: that is
+    the shape rlaif writes, and the only one whose prompt can be rebuilt as it was sampled."""
+    if cfg.dpo.prompt_column is None:
+        return None
+    chosen = example.get(f"{cfg.dpo.chosen_column}_token_ids")
+    rejected = example.get(f"{cfg.dpo.rejected_column}_token_ids")
+    if chosen is None or rejected is None:
+        return None
+    return chosen, rejected
+
+
+def _shared_turn_count(chosen: list[dict], rejected: list[dict]) -> int:
+    """How many leading turns the two sides have in common, never counting either side's last turn
+    (that one is the response being compared, even if a degenerate pair repeats it)."""
+    limit = min(len(chosen), len(rejected)) - 1
+    n = 0
+    while n < limit and chosen[n] == rejected[n]:
+        n += 1
+    return n
 
 
 def _tokenize_dpo_row(
@@ -72,14 +140,41 @@ def _tokenize_dpo_row(
     is identical to SFT's single-completion case, just called twice against a shared prompt prefix.
     """
     chosen_msgs, rejected_msgs = _format_dpo_pair(example, cfg)
-    chosen_ids, chosen_mask = tokenize_sft_example(
-        chosen_msgs, tokenizer, cfg.dpo.user_prefix, cfg.dpo.assistant_prefix
-    )
-    rejected_ids, rejected_mask = tokenize_sft_example(
-        rejected_msgs, tokenizer, cfg.dpo.user_prefix, cfg.dpo.assistant_prefix
-    )
+    sampled_ids = _sampled_token_ids(example, cfg)
+    if sampled_ids is not None:
+        # radiance-rlaif pairs: the prompt is rebuilt exactly as it was sampled after
+        # (tokenize_chat_prompt), and each side is the policy's own ids, plus the EOS every side
+        # gets. Re-tokenizing the completion text instead could merge differently at the prompt
+        # boundary and score a sequence the policy never produced.
+        prompt_ids, prompt_mask = tokenize_chat_prompt(
+            chosen_msgs[:-1], tokenizer, cfg.dpo.user_prefix, cfg.dpo.assistant_prefix
+        )
+        eos_id = tokenizer.eos_token_id
+        chosen_ids = prompt_ids + list(sampled_ids[0]) + [eos_id]
+        rejected_ids = prompt_ids + list(sampled_ids[1]) + [eos_id]
+        chosen_mask = prompt_mask + [1] * (len(chosen_ids) - len(prompt_ids))
+        rejected_mask = prompt_mask + [1] * (len(rejected_ids) - len(prompt_ids))
+    else:
+        chosen_ids, chosen_mask = tokenize_sft_example(
+            chosen_msgs, tokenizer, cfg.dpo.user_prefix, cfg.dpo.assistant_prefix
+        )
+        rejected_ids, rejected_mask = tokenize_sft_example(
+            rejected_msgs, tokenizer, cfg.dpo.user_prefix, cfg.dpo.assistant_prefix
+        )
     if len(chosen_ids) > seq_len or len(rejected_ids) > seq_len:
         return None
+    n_shared = _shared_turn_count(chosen_msgs, rejected_msgs)
+    if n_shared and sampled_ids is None:
+        # Turns both sides share (a multi-turn conversation's earlier exchanges) are not part of
+        # the preference. Their log-probs cancel in the summed log-ratio, but IPO and sft_weight
+        # divide each side by its own token count, and with chosen and rejected of different
+        # lengths the shared part no longer cancels there — so score only the turns that differ.
+        # tokenize_sft_example tokenizes turn by turn, so the shared turns are a common id prefix.
+        shared_len = len(
+            tokenize_sft_example(chosen_msgs[:n_shared], tokenizer, cfg.dpo.user_prefix, cfg.dpo.assistant_prefix)[0]
+        ) - 1  # its trailing EOS is not part of the conversation
+        chosen_mask[:shared_len] = [0] * shared_len
+        rejected_mask[:shared_len] = [0] * shared_len
 
     eos_id = tokenizer.eos_token_id
 
@@ -97,8 +192,32 @@ def _tokenize_dpo_row(
     }
 
 
+def _filter_score_margin(dataset, cfg: Config):
+    """Drop pairs whose judged score margin is below dpo.min_score_margin (no-op when unset).
+
+    A separate pass ahead of tokenization, rather than one more reason inside its batch_fn, so the
+    two drop counts are reported separately — a margin filter that removes 40% of the data and a
+    seq_len that removes 40% call for different fixes.
+    """
+    dpo = cfg.dpo
+    if dpo.min_score_margin is None:
+        return dataset
+    n_before = len(dataset)
+    kept = dataset.filter(
+        lambda ex: ex[dpo.score_chosen_column] - ex[dpo.score_rejected_column] >= dpo.min_score_margin,
+        num_proc=cfg.data.num_workers or None,
+    )
+    print(
+        f"[radiance] dpo data prep: dropped {n_before - len(kept)}/{n_before} pairs with score margin "
+        f"< min_score_margin={dpo.min_score_margin}",
+        flush=True,
+    )
+    return kept
+
+
 def _tokenize_and_filter_dpo(dataset, tokenizer: PreTrainedTokenizerBase, cfg: Config):
     seq_len = cfg.dpo.seq_len or cfg.data.seq_len
+    dataset = _filter_score_margin(dataset, cfg)
     n_before = len(dataset)
 
     def batch_fn(batch):
@@ -150,7 +269,7 @@ def _add_reference_logprobs(
     function, which is what keeps DPO training at exactly one resident model's VRAM cost.
     """
     ref_model, ref_cfg = load_transformer_from_checkpoint(
-        cfg.dpo.reference_checkpoint, device, eos_id=tokenizer.eos_token_id
+        cfg.resolved_reference_checkpoint, device, eos_id=tokenizer.eos_token_id
     )
     # The checkpoint was trained with whatever tokenizer its own saved config names. If that
     # differs from this run's data.tokenizer, its vocab ids don't correspond to this run's packed
@@ -162,7 +281,7 @@ def _add_reference_logprobs(
     # in hand, rather than letting a mismatched reference surface as a plausible-looking loss.
     if ref_cfg.data.tokenizer != cfg.data.tokenizer:
         raise ValueError(
-            f"dpo.reference_checkpoint {cfg.dpo.reference_checkpoint!r} was trained with "
+            f"dpo.reference_checkpoint {cfg.resolved_reference_checkpoint!r} was trained with "
             f"data.tokenizer={ref_cfg.data.tokenizer!r}, but this run uses "
             f"data.tokenizer={cfg.data.tokenizer!r}: a mismatched vocabulary, so the reference "
             "log-probabilities would be meaningless. Point dpo.reference_checkpoint at a "
@@ -257,7 +376,24 @@ def _add_reference_logprobs(
     return DatasetDict(result)
 
 
-def _dpo_cache_path(cfg: Config) -> Path:
+def current_reference_identity(cfg: Config) -> str | None:
+    """The resolved reference checkpoint's identity (path+mtime+size) — what the `ref-*` cache
+    level digests — or None when the file is absent.
+
+    train() records it in every checkpoint and passes a resumed run's recorded value back in as
+    `pinned_reference` below, which pins the run to the reference its log-probs were computed
+    against: dpo.reference_checkpoint defaults to train.init_from, a policy path a chained RLAIF
+    round may well rewrite while an earlier stage is still resumable, and an unpinned resume would
+    see a new mtime, miss the cache, and silently recompute the reference half-way through.
+    """
+    try:
+        stat = Path(cfg.resolved_reference_checkpoint).stat()
+    except FileNotFoundError:
+        return None
+    return f"{cfg.resolved_reference_checkpoint}|{stat.st_mtime}|{stat.st_size}"
+
+
+def _dpo_cache_path(cfg: Config, pinned_reference: str | None = None) -> Path:
     """Where the packed DPO dataset (reference log-prob columns included) is cached on disk.
 
     Under `cache_dir`, keyed on every field this pipeline derives from, in two levels rather
@@ -276,6 +412,9 @@ def _dpo_cache_path(cfg: Config) -> Path:
     nothing to load and no checkpoint to rebuild from, and with several it is not knowable which
     reference model's log-probs a given cache holds — reusing the wrong one corrupts the DPO
     loss silently — so both raise.
+
+    `pinned_reference` (a resumed run's recorded current_reference_identity) replaces the stat,
+    so a resume finds the cache its first half trained on even if the file has changed since.
     """
     seq_len = cfg.dpo.seq_len or cfg.data.seq_len
     base_key = "|".join(
@@ -290,14 +429,30 @@ def _dpo_cache_path(cfg: Config) -> Path:
             cfg.dpo.user_prefix,
             cfg.dpo.assistant_prefix,
             str(cfg.dpo.eval_split_size),
+            *split_key_extras(cfg.dpo),
+            # Leaving shared turns out of the loss mask (_tokenize_dpo_row) changes cached masks
+            # only for multi-turn message-list/transcript data, and matters only to the objectives
+            # that divide by a token count (IPO, sft_weight): under the summed ones the shared
+            # turns' log-probs cancel, so a cache built before the change is still exact for them.
+            # Keyed on exactly that, so no existing cache is rebuilt for a result it already holds.
+            *(
+                ["shared-turns-unscored"]
+                if cfg.dpo.prompt_column is None and (cfg.dpo.loss_type == "ipo" or cfg.dpo.sft_weight)
+                else []
+            ),
+            # Only when set, for the same keep-old-keys-stable reason as split_key_extras.
+            *(
+                [f"min_score_margin={cfg.dpo.min_score_margin}|{cfg.dpo.score_chosen_column}"
+                 f"|{cfg.dpo.score_rejected_column}"]
+                if cfg.dpo.min_score_margin is not None
+                else []
+            ),
         ]
     )
     base_dir = Path(cfg.dpo.cache_dir) / hashlib.sha256(base_key.encode()).hexdigest()[:16]
 
-    ref_path = Path(cfg.dpo.reference_checkpoint)
-    try:
-        ref_stat = ref_path.stat()
-    except FileNotFoundError:
+    ref_key = pinned_reference or current_reference_identity(cfg)
+    if ref_key is None:
         candidates = (
             sorted(d for d in base_dir.iterdir() if d.is_dir() and d.name.startswith("ref-"))
             if base_dir.is_dir()
@@ -305,7 +460,7 @@ def _dpo_cache_path(cfg: Config) -> Path:
         )
         if not candidates:
             raise ValueError(
-                f"dpo.reference_checkpoint {cfg.dpo.reference_checkpoint!r} does not exist, and "
+                f"dpo.reference_checkpoint {cfg.resolved_reference_checkpoint!r} does not exist, and "
                 f"no cached DPO dataset for this dataset/config was found under "
                 f"{cfg.dpo.cache_dir!r}: the reference log-probabilities are computed from that "
                 "checkpoint, so there is nothing to load and nothing to rebuild it from. Restore "
@@ -313,7 +468,7 @@ def _dpo_cache_path(cfg: Config) -> Path:
             )
         if len(candidates) > 1:
             raise ValueError(
-                f"dpo.reference_checkpoint {cfg.dpo.reference_checkpoint!r} does not exist, and "
+                f"dpo.reference_checkpoint {cfg.resolved_reference_checkpoint!r} does not exist, and "
                 f"{len(candidates)} cached DPO datasets built against different reference "
                 f"checkpoints were found under {base_dir}: it is not possible to tell which "
                 "reference model the reference log-probabilities were computed against, and "
@@ -322,11 +477,10 @@ def _dpo_cache_path(cfg: Config) -> Path:
                 f"cache, or delete the ones you no longer need ({', '.join(c.name for c in candidates)})."
             )
         return candidates[0]
-    ref_key = f"{cfg.dpo.reference_checkpoint}|{ref_stat.st_mtime}|{ref_stat.st_size}"
     return base_dir / ("ref-" + hashlib.sha256(ref_key.encode()).hexdigest()[:16])
 
 
-def dpo_cache_exists(cfg: Config) -> bool:
+def dpo_cache_exists(cfg: Config, pinned_reference: str | None = None) -> bool:
     """Whether _load_or_build_dpo_packed will hit the disk cache rather than rebuild it.
 
     Lets a caller (train.py's batch-size estimate) know, before touching any GPU memory, whether a
@@ -337,25 +491,80 @@ def dpo_cache_exists(cfg: Config) -> bool:
     if not cfg.dpo.cache_dir:
         return False
     try:
-        return _dpo_cache_path(cfg).exists()
+        return _dpo_cache_path(cfg, pinned_reference).exists()
     except ValueError:
         return False
 
 
-def _load_or_build_dpo_packed(cfg: Config, tokenizer: PreTrainedTokenizerBase):
-    cache_path = _dpo_cache_path(cfg)
+def check_rlaif_manifest(cfg: Config) -> None:
+    """Refuse to train radiance-rlaif pairs under a turn template, or with a tokenizer, other than
+    the ones they were sampled with (recorded in the pair directory's manifest). The pairs are
+    on-policy only as exact continuations of the prompt the policy saw; rebuilt under other turn
+    markers they are off-policy text, and their token ids mean nothing under another vocabulary —
+    both silently. Likewise pairs sampled after an older tokenize_chat_prompt's prompt ids. A
+    dataset without a manifest is not radiance-rlaif output."""
+    manifest_path = Path(cfg.dpo.dataset) / RLAIF_MANIFEST_NAME
+    if not manifest_path.is_file():
+        return
+    manifest = json.loads(manifest_path.read_text())
+    sampled_tokenizer = manifest.get("tokenizer")
+    if sampled_tokenizer is not None and sampled_tokenizer != cfg.data.tokenizer:
+        raise ValueError(
+            f"dpo.dataset {cfg.dpo.dataset!r} holds radiance-rlaif pairs whose token ids are "
+            f"{sampled_tokenizer!r} ids, but this config's data.tokenizer is {cfg.data.tokenizer!r}."
+        )
+    # A recorded tokenizer means the pairs carry sampled token ids, which are continuations of the
+    # exact prompt ids they were sampled after — and rebuilt on today's prompt ids they would not be.
+    version = manifest.get("prompt_ids_version", 1)
+    if sampled_tokenizer is not None and version != RLAIF_PROMPT_IDS_VERSION:
+        raise ValueError(
+            f"dpo.dataset {cfg.dpo.dataset!r} holds radiance-rlaif pairs sampled after version-"
+            f"{version} prompt ids, but this radiance builds version-{RLAIF_PROMPT_IDS_VERSION} ones "
+            "(see sft_data.RLAIF_PROMPT_IDS_VERSION), so their sampled ids no longer follow the "
+            "prompt they would be trained after. Re-run radiance-rlaif pairs to regenerate them."
+        )
+    template = manifest.get("turn_template")
+    if template is None:  # written before the template was recorded
+        return
+    configured = {"user_prefix": cfg.dpo.user_prefix, "assistant_prefix": cfg.dpo.assistant_prefix}
+    if configured != template:
+        raise ValueError(
+            f"dpo.dataset {cfg.dpo.dataset!r} holds radiance-rlaif pairs sampled under the turn "
+            f"template {template}, but this config trains them under {configured}. Set "
+            "dpo.user_prefix/assistant_prefix to the sampled template, or the pairs are no longer "
+            "the policy's own completions."
+        )
+
+
+def _load_or_build_dpo_packed(
+    cfg: Config, tokenizer: PreTrainedTokenizerBase, pinned_reference: str | None = None
+):
+    check_rlaif_manifest(cfg)
+    cache_path = _dpo_cache_path(cfg, pinned_reference)
     if cfg.dpo.cache_dir and cache_path.exists():
         packed = load_from_disk(str(cache_path))
         packed.set_format(type="torch")
         return packed
+    if pinned_reference is not None and pinned_reference != current_reference_identity(cfg):
+        raise ValueError(
+            f"this run computed its DPO reference log-probs against {pinned_reference!r} "
+            f"(path|mtime|size), but dpo.reference_checkpoint {cfg.resolved_reference_checkpoint!r} "
+            "has changed since (it defaults to train.init_from — was that policy path rewritten?) "
+            "and no cache of the original log-probs survives to resume from. Recomputing them "
+            "against the new file would switch the run's reference half-way through. Restore the "
+            "original checkpoint at that path, or start a fresh run (new train.output_dir)."
+        )
 
-    raw = load_dataset(cfg.dpo.dataset)
-    train_split = raw["train"]
-    val_split = raw.get("validation")
-    if val_split is None:
-        val_split = raw.get("test")
-    if val_split is None:
-        train_split, val_split = split_off_eval(train_split, cfg.dpo.eval_split_size)
+    raw = load_chat_dataset(cfg.dpo.dataset, cfg.dpo.subset)
+    train_split, val_split = select_splits(
+        raw,
+        cfg.dpo.dataset,
+        cfg.dpo.train_split,
+        cfg.dpo.eval_split,
+        ("validation", "test"),
+        cfg.dpo.eval_split_size,
+        cfg.dpo.max_examples,
+    )
 
     packed = DatasetDict({"train": _tokenize_and_filter_dpo(train_split, tokenizer, cfg)})
     if val_split is not None:
@@ -376,14 +585,19 @@ def _load_or_build_dpo_packed(cfg: Config, tokenizer: PreTrainedTokenizerBase):
     return packed
 
 
-def build_dpo_dataloaders(cfg: Config, tokenizer: PreTrainedTokenizerBase) -> tuple[DataLoader, DataLoader | None]:
+def build_dpo_dataloaders(
+    cfg: Config, tokenizer: PreTrainedTokenizerBase, pinned_reference: str | None = None
+) -> tuple[DataLoader, DataLoader | None]:
     """DPO analogue of build_sft_dataloaders: same (train_loader, val_loader) contract, but each
     batch carries chosen/rejected input_ids+loss_mask plus their cached reference log-probs (see
-    module docstring above)."""
+    module docstring above). `pinned_reference`: a resumed run's recorded reference identity,
+    which pins it to its original reference (see current_reference_identity)."""
     if not cfg.dpo.dataset:
         raise ValueError("dpo.enabled requires dpo.dataset to be set.")
-    if not cfg.dpo.reference_checkpoint:
-        raise ValueError("dpo.enabled requires dpo.reference_checkpoint to be set.")
+    if not cfg.resolved_reference_checkpoint:
+        raise ValueError(
+            "dpo.enabled requires dpo.reference_checkpoint (or train.init_from, which it defaults to) to be set."
+        )
 
     def collate(batch):
         cols = [
@@ -405,7 +619,7 @@ def build_dpo_dataloaders(cfg: Config, tokenizer: PreTrainedTokenizerBase) -> tu
         pin_memory=pin_memory_for(cfg),
     )
 
-    packed = _load_or_build_dpo_packed(cfg, tokenizer)
+    packed = _load_or_build_dpo_packed(cfg, tokenizer, pinned_reference)
     train_ds = packed["train"]
     val_ds = packed.get("validation")
 

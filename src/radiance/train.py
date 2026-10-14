@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import argparse
 import math
-import random
 import time
 from pathlib import Path
 
-import numpy as np
 import torch
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -14,9 +12,10 @@ import wandb
 from radiance import nvfp4
 from radiance.config import (
     Config,
-    load_config,
+    load_config_with_overrides,
     resolve_device,
     resolve_dtype,
+    set_seed,
 )
 from radiance.data import (
     EpochPermutationSampler,
@@ -25,7 +24,7 @@ from radiance.data import (
     build_tokenizer,
     token_byte_lengths,
 )
-from radiance.dpo_data import build_dpo_dataloaders
+from radiance.dpo_data import build_dpo_dataloaders, current_reference_identity
 from radiance.sft_data import build_sft_dataloaders
 from radiance.model import DenseTransformer, cast_params_to_native_bf16, padded_vocab_size
 from radiance.optim import build_optimizer, migrate_optimizer_to_cpu_offload
@@ -44,21 +43,17 @@ from .checkpointing import (
     save_checkpoint,
 )
 from .evaluation import evaluate_detailed
+from .hud import TrainingHUD, hud_wanted
 from .losses import (
     build_dpo_loss_fn,
     build_loss_fn,
     chunk_loss_and_metrics,
+    dpo_loss_variant_configured,
+    dpo_model_config,
+    note_dpo_dropout,
     note_dpo_z_loss_omitted,
-    resolve_dpo_doc_mask,
     validate_post_training_config,
 )
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
 def build_lr_scheduler(optimizer: torch.optim.Optimizer, cfg: Config) -> LambdaLR:
     warmup_steps = cfg.train.warmup_steps
     max_steps = cfg.train.max_steps
@@ -309,7 +304,8 @@ def _restore_data_position(train_loader, ckpt: dict, cfg: Config) -> None:
         )
 
 
-def train(cfg: Config) -> None:
+def train(cfg: Config, hud: bool | None = None) -> None:
+    """`hud`: the live terminal display (radiance.hud). None means on exactly when stdout is a TTY."""
     set_seed(cfg.train.seed)
     # TF32 matmuls run at full tensor-core throughput on Ampere/Hopper/Blackwell with a
     # small precision tradeoff; PyTorch defaults this off, so opt in explicitly.
@@ -329,17 +325,18 @@ def train(cfg: Config) -> None:
             f"[radiance] padding vocab {len(tokenizer):,} -> {vocab_size:,} "
             f"(multiple of {cfg.model.vocab_pad_multiple}) for tensor-core-aligned lm_head matmuls"
         )
+    # Before the model is built, so an unsupported combination fails before a model is allocated.
     validate_post_training_config(cfg)
-    # Both before the model is built: validation so an unsupported combination fails before a
-    # model is allocated, and the doc-mask resolution because DenseTransformer reads cfg.model by
-    # reference and resolve_compile_mode's CUDA-graph decision asks the *built* model whether it
-    # will build BlockMasks.
-    resolve_dpo_doc_mask(cfg)
     note_dpo_z_loss_omitted(cfg)
+    note_dpo_dropout(cfg)
 
     # eos_id is what recovers packed document boundaries for doc_attention_mask (see
-    # model.document_ids) — data.py joins documents with exactly this token.
-    raw_model = DenseTransformer(cfg.model, vocab_size=vocab_size, eos_id=tokenizer.eos_token_id).to(device)
+    # model.document_ids) — data.py joins documents with exactly this token. dpo_model_config is
+    # cfg.model unless DPO's packing makes the doc mask a no-op; resolve_compile_mode's CUDA-graph
+    # decision then asks the *built* model whether it will build BlockMasks.
+    raw_model = DenseTransformer(
+        dpo_model_config(cfg), vocab_size=vocab_size, eos_id=tokenizer.eos_token_id
+    ).to(device)
     if cfg.train.native_bf16:
         cast_params_to_native_bf16(raw_model)
         print("[radiance] train.native_bf16: parameters, gradients and optimizer moments stored in bf16")
@@ -352,12 +349,24 @@ def train(cfg: Config) -> None:
         load_pretrained_weights(raw_model, cfg.train.init_from, cfg, vocab_size, device)
         print(f"[radiance] initialized model weights from {cfg.train.init_from} (fresh optimizer/scheduler/step)")
 
+    # DPO: the reference model this run's log-probs come from, pinned at its first start. A resume
+    # reuses the recorded identity (mmap read — no weights paged in) rather than re-statting the
+    # path, which defaults to train.init_from and may have been rewritten since; see
+    # dpo_data.current_reference_identity. None on a checkpoint that predates the field.
+    dpo_reference = None
+    if cfg.dpo.enabled:
+        if resume_path is not None:
+            dpo_reference = torch.load(
+                resume_path, map_location="cpu", weights_only=False, mmap=True
+            ).get("dpo_reference")
+        dpo_reference = dpo_reference or current_reference_identity(cfg)
+
     if cfg.train.auto_batch_size:
         if device_type == "cuda":
             if cfg.train.target_effective_batch_size is None:
                 cfg.train.target_effective_batch_size = cfg.train.effective_batch_size
             cfg.train.batch_size, cfg.train.grad_accum_steps = estimate_batch_size(
-                raw_model, cfg, device, device_type, reserve_bytes=dpo_reference_reserve_bytes(cfg)
+                raw_model, cfg, device, device_type, reserve_bytes=dpo_reference_reserve_bytes(cfg, dpo_reference)
             )
         else:
             print(
@@ -380,15 +389,19 @@ def train(cfg: Config) -> None:
     compile_mode = resolve_compile_mode(raw_model, cfg, device_type)
     model = torch.compile(raw_model, mode=compile_mode) if cfg.train.compile else raw_model
     loss_fn = build_dpo_loss_fn(cfg) if cfg.dpo.enabled else build_loss_fn(cfg)
+    # val/loss is plain DPO whatever variant trains (see build_dpo_loss_fn); the same function
+    # object when no variant is configured, so a default run compiles the loss once, as before.
+    eval_loss_fn = (
+        build_dpo_loss_fn(cfg, plain=True) if cfg.dpo.enabled and dpo_loss_variant_configured(cfg) else loss_fn
+    )
 
     # batch_size must be finalized (auto_batch_size, if any, already ran) before the DataLoader is built.
     if cfg.dpo.enabled:
-        build_loader_fn = build_dpo_dataloaders
+        train_loader, val_loader = build_dpo_dataloaders(cfg, tokenizer, dpo_reference)
     elif cfg.sft.enabled:
-        build_loader_fn = build_sft_dataloaders
+        train_loader, val_loader = build_sft_dataloaders(cfg, tokenizer)
     else:
-        build_loader_fn = build_dataloaders
-    train_loader, val_loader = build_loader_fn(cfg, tokenizer)
+        train_loader, val_loader = build_dataloaders(cfg, tokenizer)
 
     if cfg.train.tokens_per_param is not None:
         # Same per-row unit `estimate_batch_size` uses above: respects any active sft.seq_len /
@@ -545,221 +558,240 @@ def train(cfg: Config) -> None:
     # memory (see the OOM handler below), it stays there for the rest of the run.
     cpu_offload_active = False
 
-    while step < cfg.train.max_steps and not give_up:
-        will_log = (step + 1) % cfg.train.log_every == 0
-        step_done = False
+    display = TrainingHUD(
+        cfg,
+        enabled=hud_wanted(hud),
+        start_step=step,
+        device=device,
+        compile_mode=compile_mode,
+        num_parameters=raw_model.num_parameters(),
+        num_active_parameters=raw_model.num_active_parameters(),
+        tokens_per_step=cfg.train.effective_batch_size * cfg.resolved_row_tokens,
+    )
+    with display:
+        while step < cfg.train.max_steps and not give_up:
+            will_log = (step + 1) % cfg.train.log_every == 0
+            step_done = False
 
-        while not step_done and not give_up:
-            if will_log:
-                accums = {name: torch.zeros((), device=device) for name in metric_names}
-
-            try:
-                # set_to_none=False when compiled: keeps .grad buffers stable/preallocated (see the
-                # warmup above) rather than freeing them back to None, which would reintroduce the
-                # CUDA-graph-pool allocation bug on the next step's first backward.
-                optimizer.zero_grad(set_to_none=not cfg.train.compile)
-                for _ in range(grad_accum_steps):
-                    try:
-                        batch = next(data_iter)
-                    except StopIteration:
-                        data_iter = iter(train_loader)
-                        batch = next(data_iter)
-                    train_batches_drawn += 1
-
-                    # Which columns a batch carries and how a chunk's loss is built are the only
-                    # things that differ between pretrain/SFT and DPO; everything the accumulation
-                    # contract actually consists of — the chunk_weight normalization, the autocast
-                    # block, the scaled backward, the weighted accumulation, and the enclosing
-                    # try/OOM handling — lives here once, so a change to any of it cannot apply to
-                    # one mode and silently miss the other.
-                    # chunk_weight reconstructs exactly the loss one un-split
-                    # micro_loss / grad_accum_steps backward would have produced, however many
-                    # (possibly uneven) chunks the micro-batch got split into — see
-                    # chunk_reduction_units for why the weight is each chunk's share of the
-                    # reduction's denominator rather than its share of the rows. Summed per
-                    # micro-batch rather than against cfg.train.batch_size so the weights are a
-                    # true partition of 1/grad_accum_steps whatever the batch actually holds.
-                    units = chunk_reduction_units(batch, cfg.dpo.enabled, cfg.sft.enabled, micro_chunk_size)
-                    total_units = max(sum(units), 1)  # clamp mirrors _nll_and_logz's
-                    for chunk, chunk_units in zip(
-                        split_micro_batch(batch, cfg.dpo.enabled, cfg.sft.enabled, device, micro_chunk_size), units
-                    ):
-                        chunk_weight = chunk_units / total_units / grad_accum_steps
-                        with torch.autocast(
-                            device_type=device_type, dtype=dtype, enabled=dtype != torch.float32
-                        ):
-                            chunk_loss, metrics = chunk_loss_and_metrics(
-                                model, raw_model, cfg, loss_fn, chunk
-                            )
-
-                        scaler.scale(chunk_loss * chunk_weight).backward()
-
-                        if will_log:
-                            for name, value in metrics.items():
-                                if name in accums:
-                                    accums[name] += value.detach() * chunk_weight
-
-                scaler.unscale_(optimizer)
-                # The pre-clip norm: logged, since a run whose norm sits at grad_clip is being
-                # clipped every step and its effective LR is not the one configured.
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
-                # Loss-free MoE load balancing (cfg.model.moe_balance). Deliberately here rather
-                # than inside forward: it mutates a buffer by an explicit rule with no gradient, so
-                # keeping it outside the compiled region avoids a graph break on every micro-batch.
-                # No-op unless MoE and bias balancing are both on.
-                raw_model.update_expert_bias()
-                # Re-quantize every FP4Linear's weight cache against the weights that just moved,
-                # and advance the stochastic-rounding seed. Here for the same reason as the line
-                # above — it writes buffers with no gradient, so keeping it out of the compiled
-                # region avoids a graph break, and a validity check inside forward() would be a
-                # Python branch dynamo guards on and recompiles for every step.
-                #
-                # Once per *optimizer* step is also the correct semantics rather than merely the
-                # cheap one: every micro-batch of an accumulated step must be differentiated
-                # against the same weights. Omitting this call fails silently — the forward would
-                # keep using step-0 weights while the fp32 masters trained on, so the loss still
-                # falls and then plateaus. No-op unless model.fp4_linear.
-                nvfp4.refresh_fp4_weights(raw_model)
-                step += 1
-                step_done = True
-                meter.step()
-                final_step = step == cfg.train.max_steps
-
+            while not step_done and not give_up:
                 if will_log:
-                    # Also to stdout: W&B was previously the only place a loss ever appeared, so a
-                    # run with wandb.mode=disabled (sweeps, CI, quick A/Bs) produced no visible
-                    # signal at all. Cheap — accum_* are already being .item()'d for the log below.
-                    # reserved VRAM on the line too: a run whose memory climbs step over step is
-                    # the signature of a torch.compile re-record (see compile_mode below), and it
-                    # is otherwise invisible until the run dies of an OOM hundreds of steps later.
-                    mem = (
-                        f" mem {torch.cuda.memory_reserved(device) / 1e9:.2f}GB"
-                        if device_type == "cuda"
-                        else ""
-                    )
-                    perf = meter.read()
-                    tok_s = f" {perf['perf/tokens_per_sec'] / 1e3:.1f}k tok/s" if perf else ""
-                    print(
-                        f"[radiance] step {step:>6}/{cfg.train.max_steps} "
-                        f"loss {accums['loss'].item():.4f} lm {accums['lm_loss'].item():.4f} "
-                        f"lr {scheduler.get_last_lr()[0]:.3e}{mem}{tok_s}",
-                        flush=True,
-                    )
-                    wandb.log(
-                        {
-                            **{f"train/{name}": v.item() for name, v in accums.items()},
-                            **(
-                                {"train/expert_bias_spread": raw_model.expert_bias_spread()}
-                                if cfg.model.use_moe
-                                else {}
-                            ),
-                            "train/grad_norm": grad_norm.item(),
-                            "train/lr": scheduler.get_last_lr()[0],
-                            **{f"train/{k}": v for k, v in _group_lrs(optimizer).items()},
-                            "train/micro_chunk_size": micro_chunk_size,
-                            **perf,
-                        },
-                        step=step,
-                    )
+                    accums = {name: torch.zeros((), device=device) for name in metric_names}
 
-                # Both also fire on the final step: max_steps is rarely a multiple of eval_every
-                # or save_every (V1's 68,688 is not), and without this the last partial interval
-                # was trained, never evaluated, and never saved — for a --decay-from branch, that
-                # would be the annealed model itself.
-                if val_loader is not None and (step % cfg.train.eval_every == 0 or final_step):
-                    started = time.perf_counter()
-                    result = evaluate_detailed(
-                        model,
-                        val_loader,
-                        device,
-                        device_type,
-                        dtype,
-                        cfg.train.eval_max_batches,
-                        loss_fn,
-                        sft=cfg.sft.enabled,
-                        dpo=cfg.dpo.enabled,
-                        dpo_beta=cfg.dpo.beta if cfg.dpo.enabled else None,
-                        micro_chunk_size=micro_chunk_size,
-                        token_bytes=token_bytes,
-                    )
-                    extra = ""
-                    if result.loss_stderr is not None:
-                        extra += f" ± {result.loss_stderr:.4f}"
-                    if result.bits_per_byte is not None:
-                        extra += f" bpb {result.bits_per_byte:.4f}"
-                    print(f"[radiance] step {step:>6} val/loss {result.loss:.4f}{extra}", flush=True)
-                    wandb.log(
-                        {
-                            "val/loss": result.loss,
-                            **({"val/loss_stderr": result.loss_stderr} if result.loss_stderr is not None else {}),
-                            **({"val/bits_per_byte": result.bits_per_byte} if result.bits_per_byte is not None else {}),
-                        },
-                        step=step,
-                    )
-                    meter.exclude(time.perf_counter() - started)
+                try:
+                    # set_to_none=False when compiled: keeps .grad buffers stable/preallocated (see the
+                    # warmup above) rather than freeing them back to None, which would reintroduce the
+                    # CUDA-graph-pool allocation bug on the next step's first backward.
+                    optimizer.zero_grad(set_to_none=not cfg.train.compile)
+                    for _ in range(grad_accum_steps):
+                        try:
+                            batch = next(data_iter)
+                        except StopIteration:
+                            data_iter = iter(train_loader)
+                            batch = next(data_iter)
+                        train_batches_drawn += 1
 
-                if step % cfg.train.save_every == 0 or final_step:
-                    started = time.perf_counter()
-                    # Keep only the latest checkpoint (plus any train.keep_every multiples) — but
-                    # prune only after the new one is fully written. Pruning first meant a save
-                    # that died mid-write (OOM kill, power loss, full disk) left no checkpoint at
-                    # all, and resume_from: auto then silently restarted the run from step 0.
-                    ckpt_path = output_dir / f"step_{step}.pt"
-                    save_checkpoint(
-                        ckpt_path, raw_model, optimizer, scheduler, scaler, step, cfg,
-                        train_batches_drawn=train_batches_drawn,
-                    )
-                    prune_checkpoints(output_dir, keep=ckpt_path, keep_every=cfg.train.keep_every)
-                    meter.exclude(time.perf_counter() - started)
-            except torch.cuda.OutOfMemoryError:
-                # An OOM anywhere at or after scaler.unscale_() below leaves this optimizer marked
-                # as already-unscaled for the current scaler generation, so the retry's own
-                # unscale_ would raise "unscale_() has already been called on this optimizer since
-                # the last update()" — an uncaught crash exactly when the backoff is supposed to be
-                # saving the run. update(get_scale()) resets that per-optimizer bookkeeping without
-                # disturbing the scale factor (a bare update() would treat the aborted step as a
-                # successful one and grow it). No-op unless dtype is fp16, since bf16/fp32 run with
-                # the scaler disabled.
-                if scaler.is_enabled():
-                    scaler.update(scaler.get_scale())
-                if cfg.train.auto_batch_size and micro_chunk_size > 1:
-                    torch.cuda.empty_cache()
-                    micro_chunk_size = max(1, micro_chunk_size // 2)
-                    print(
-                        f"[radiance] CUDA OOM at step {step}, backing off micro_chunk_size to "
-                        f"{micro_chunk_size} and retrying."
-                    )
-                    wandb.log({"train/oom_backoff": micro_chunk_size}, step=step)
-                elif cfg.train.auto_batch_size and not cpu_offload_active:
-                    # Chunk-size backoff alone can't help once it's already at its floor: that tier
-                    # only attacks activation memory, which scales with batch size, not the fixed
-                    # cost of AdamW's exp_avg/exp_avg_sq. Move those to pinned CPU memory instead.
-                    previous_optimizer = optimizer
-                    optimizer = migrate_optimizer_to_cpu_offload(optimizer, model, cfg, device)
-                    if optimizer is not previous_optimizer:
-                        # A *new* optimizer object (the plain-AdamW path swaps in CPUOffloadAdamW).
-                        # Reconstructed, not resumed, so the LR trajectory continues exactly as if
-                        # training had never paused - LambdaLR only needs the lambda(s) it was built
-                        # with and the step to resume from. MuonWithAuxAdam instead flips its adamw
-                        # groups to offloaded in place and returns itself, so its scheduler — which
-                        # already points at those same param_groups — needs no rebuild.
-                        scheduler = LambdaLR(optimizer, scheduler.lr_lambdas[0], last_epoch=step - 1)
-                    del previous_optimizer
-                    # Only reclaims anything once the old optimizer (holding the GPU-resident
-                    # exp_avg/exp_avg_sq we just migrated off of) has lost its last reference above.
-                    torch.cuda.empty_cache()
-                    cpu_offload_active = True
-                    print(f"[radiance] CUDA OOM at step {step}, offloading optimizer state to CPU and retrying.")
-                    wandb.log({"train/cpu_offload": True}, step=step)
-                else:
-                    # Exit cleanly instead of raising, so a W&B sweep records this run as
-                    # finished (e.g. loss/mem too high for this config) rather than crashed.
-                    print(f"[radiance] CUDA OOM at step {step}, ending run early.")
-                    wandb.log({"train/oom": True}, step=step)
-                    give_up = True
+                        # Which columns a batch carries and how a chunk's loss is built are the only
+                        # things that differ between pretrain/SFT and DPO; everything the accumulation
+                        # contract actually consists of — the chunk_weight normalization, the autocast
+                        # block, the scaled backward, the weighted accumulation, and the enclosing
+                        # try/OOM handling — lives here once, so a change to any of it cannot apply to
+                        # one mode and silently miss the other.
+                        # chunk_weight reconstructs exactly the loss one un-split
+                        # micro_loss / grad_accum_steps backward would have produced, however many
+                        # (possibly uneven) chunks the micro-batch got split into — see
+                        # chunk_reduction_units for why the weight is each chunk's share of the
+                        # reduction's denominator rather than its share of the rows. Summed per
+                        # micro-batch rather than against cfg.train.batch_size so the weights are a
+                        # true partition of 1/grad_accum_steps whatever the batch actually holds.
+                        units = chunk_reduction_units(batch, cfg.dpo.enabled, cfg.sft.enabled, micro_chunk_size)
+                        total_units = max(sum(units), 1)  # clamp mirrors _nll_and_logz's
+                        for chunk, chunk_units in zip(
+                            split_micro_batch(batch, cfg.dpo.enabled, cfg.sft.enabled, device, micro_chunk_size), units
+                        ):
+                            chunk_weight = chunk_units / total_units / grad_accum_steps
+                            with torch.autocast(
+                                device_type=device_type, dtype=dtype, enabled=dtype != torch.float32
+                            ):
+                                chunk_loss, metrics = chunk_loss_and_metrics(
+                                    model, raw_model, cfg, loss_fn, chunk
+                                )
+
+                            scaler.scale(chunk_loss * chunk_weight).backward()
+
+                            if will_log:
+                                for name, value in metrics.items():
+                                    if name in accums:
+                                        accums[name] += value.detach() * chunk_weight
+
+                    scaler.unscale_(optimizer)
+                    # The pre-clip norm: logged, since a run whose norm sits at grad_clip is being
+                    # clipped every step and its effective LR is not the one configured.
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    scheduler.step()
+                    # Loss-free MoE load balancing (cfg.model.moe_balance). Deliberately here rather
+                    # than inside forward: it mutates a buffer by an explicit rule with no gradient, so
+                    # keeping it outside the compiled region avoids a graph break on every micro-batch.
+                    # No-op unless MoE and bias balancing are both on.
+                    raw_model.update_expert_bias()
+                    # Re-quantize every FP4Linear's weight cache against the weights that just moved,
+                    # and advance the stochastic-rounding seed. Here for the same reason as the line
+                    # above — it writes buffers with no gradient, so keeping it out of the compiled
+                    # region avoids a graph break, and a validity check inside forward() would be a
+                    # Python branch dynamo guards on and recompiles for every step.
+                    #
+                    # Once per *optimizer* step is also the correct semantics rather than merely the
+                    # cheap one: every micro-batch of an accumulated step must be differentiated
+                    # against the same weights. Omitting this call fails silently — the forward would
+                    # keep using step-0 weights while the fp32 masters trained on, so the loss still
+                    # falls and then plateaus. No-op unless model.fp4_linear.
+                    nvfp4.refresh_fp4_weights(raw_model)
+                    step += 1
+                    step_done = True
+                    meter.step()
+                    final_step = step == cfg.train.max_steps
+
+                    display.on_step(step)
+
+                    if will_log:
+                        train_scalars = {name: v.item() for name, v in accums.items()}
+                        perf = meter.read()
+                        # Reserved VRAM: a run whose memory climbs step over step is the signature
+                        # of a torch.compile re-record (see compile_mode below), and it is
+                        # otherwise invisible until the run dies of an OOM hundreds of steps later.
+                        display.on_train_log(
+                            step,
+                            train_scalars,
+                            lr=scheduler.get_last_lr()[0],
+                            grad_norm=grad_norm.item(),
+                            mem_gb=torch.cuda.memory_reserved(device) / 1e9 if device_type == "cuda" else None,
+                            perf=perf,
+                            micro_chunk_size=micro_chunk_size,
+                        )
+                        wandb.log(
+                            {
+                                **{f"train/{name}": v for name, v in train_scalars.items()},
+                                **(
+                                    {"train/expert_bias_spread": raw_model.expert_bias_spread()}
+                                    if cfg.model.use_moe
+                                    else {}
+                                ),
+                                "train/grad_norm": grad_norm.item(),
+                                "train/lr": scheduler.get_last_lr()[0],
+                                **{f"train/{k}": v for k, v in _group_lrs(optimizer).items()},
+                                "train/micro_chunk_size": micro_chunk_size,
+                                **perf,
+                            },
+                            step=step,
+                        )
+
+                    # Both also fire on the final step: max_steps is rarely a multiple of eval_every
+                    # or save_every (V1's 68,688 is not), and without this the last partial interval
+                    # was trained, never evaluated, and never saved — for a --decay-from branch, that
+                    # would be the annealed model itself.
+                    if val_loader is not None and (step % cfg.train.eval_every == 0 or final_step):
+                        display.on_eval_start()
+                        started = time.perf_counter()
+                        result = evaluate_detailed(
+                            model,
+                            val_loader,
+                            device,
+                            device_type,
+                            dtype,
+                            cfg.train.eval_max_batches,
+                            eval_loss_fn,
+                            sft=cfg.sft.enabled,
+                            dpo=cfg.dpo.enabled,
+                            dpo_beta=cfg.dpo.beta if cfg.dpo.enabled else None,
+                            micro_chunk_size=micro_chunk_size,
+                            token_bytes=token_bytes,
+                        )
+                        display.on_val(step, result.loss, result.loss_stderr, result.bits_per_byte)
+                        if result.dpo_reward_accuracy is not None:
+                            display.event(
+                                f"step {step} val reward_acc {result.dpo_reward_accuracy:.3f}"
+                                f" margin_acc {result.dpo_margin_accuracy:.3f}"
+                            )
+                        wandb.log(
+                            {
+                                "val/loss": result.loss,
+                                **({"val/loss_stderr": result.loss_stderr} if result.loss_stderr is not None else {}),
+                                **({"val/bits_per_byte": result.bits_per_byte} if result.bits_per_byte is not None else {}),
+                                **(
+                                    {
+                                        "val/dpo_reward_accuracy": result.dpo_reward_accuracy,
+                                        "val/dpo_margin_accuracy": result.dpo_margin_accuracy,
+                                    }
+                                    if result.dpo_reward_accuracy is not None
+                                    else {}
+                                ),
+                            },
+                            step=step,
+                        )
+                        meter.exclude(time.perf_counter() - started)
+
+                    if step % cfg.train.save_every == 0 or final_step:
+                        display.on_save_start()
+                        started = time.perf_counter()
+                        # Keep only the latest checkpoint (plus any train.keep_every multiples) — but
+                        # prune only after the new one is fully written. Pruning first meant a save
+                        # that died mid-write (OOM kill, power loss, full disk) left no checkpoint at
+                        # all, and resume_from: auto then silently restarted the run from step 0.
+                        ckpt_path = output_dir / f"step_{step}.pt"
+                        save_checkpoint(
+                            ckpt_path, raw_model, optimizer, scheduler, scaler, step, cfg,
+                            train_batches_drawn=train_batches_drawn, dpo_reference=dpo_reference,
+                        )
+                        prune_checkpoints(output_dir, keep=ckpt_path, keep_every=cfg.train.keep_every)
+                        display.on_checkpoint(step, ckpt_path)
+                        meter.exclude(time.perf_counter() - started)
+                except torch.cuda.OutOfMemoryError:
+                    # An OOM anywhere at or after scaler.unscale_() below leaves this optimizer marked
+                    # as already-unscaled for the current scaler generation, so the retry's own
+                    # unscale_ would raise "unscale_() has already been called on this optimizer since
+                    # the last update()" — an uncaught crash exactly when the backoff is supposed to be
+                    # saving the run. update(get_scale()) resets that per-optimizer bookkeeping without
+                    # disturbing the scale factor (a bare update() would treat the aborted step as a
+                    # successful one and grow it). No-op unless dtype is fp16, since bf16/fp32 run with
+                    # the scaler disabled.
+                    if scaler.is_enabled():
+                        scaler.update(scaler.get_scale())
+                    if cfg.train.auto_batch_size and micro_chunk_size > 1:
+                        torch.cuda.empty_cache()
+                        micro_chunk_size = max(1, micro_chunk_size // 2)
+                        display.event(
+                            f"CUDA OOM at step {step}, backing off micro_chunk_size to "
+                            f"{micro_chunk_size} and retrying."
+                        )
+                        wandb.log({"train/oom_backoff": micro_chunk_size}, step=step)
+                    elif cfg.train.auto_batch_size and not cpu_offload_active:
+                        # Chunk-size backoff alone can't help once it's already at its floor: that tier
+                        # only attacks activation memory, which scales with batch size, not the fixed
+                        # cost of AdamW's exp_avg/exp_avg_sq. Move those to pinned CPU memory instead.
+                        previous_optimizer = optimizer
+                        optimizer = migrate_optimizer_to_cpu_offload(optimizer, model, cfg, device)
+                        if optimizer is not previous_optimizer:
+                            # A *new* optimizer object (the plain-AdamW path swaps in CPUOffloadAdamW).
+                            # Reconstructed, not resumed, so the LR trajectory continues exactly as if
+                            # training had never paused - LambdaLR only needs the lambda(s) it was built
+                            # with and the step to resume from. MuonWithAuxAdam instead flips its adamw
+                            # groups to offloaded in place and returns itself, so its scheduler — which
+                            # already points at those same param_groups — needs no rebuild.
+                            scheduler = LambdaLR(optimizer, scheduler.lr_lambdas[0], last_epoch=step - 1)
+                        del previous_optimizer
+                        # Only reclaims anything once the old optimizer (holding the GPU-resident
+                        # exp_avg/exp_avg_sq we just migrated off of) has lost its last reference above.
+                        torch.cuda.empty_cache()
+                        cpu_offload_active = True
+                        display.event(f"CUDA OOM at step {step}, offloading optimizer state to CPU and retrying.")
+                        wandb.log({"train/cpu_offload": True}, step=step)
+                    else:
+                        # Exit cleanly instead of raising, so a W&B sweep records this run as
+                        # finished (e.g. loss/mem too high for this config) rather than crashed.
+                        display.event(f"CUDA OOM at step {step}, ending run early.")
+                        wandb.log({"train/oom": True}, step=step)
+                        give_up = True
 
     wandb.finish()
 
@@ -774,14 +806,29 @@ def main() -> None:
         "to min_lr_ratio over --decay-steps (WSD), writing to <output_dir>/decay_from_<step>",
     )
     parser.add_argument("--decay-steps", type=int, help="length of the --decay-from anneal, in steps")
+    parser.add_argument(
+        "--set",
+        nargs="+",
+        action="extend",  # repeatable: --set a=1 --set b=2 keeps both
+        default=[],
+        metavar="KEY=VALUE",
+        help="section.field=value overrides applied on top of --config, parsed as YAML (string fields "
+        "verbatim) — e.g. chaining post-training stages: --set train.init_from=checkpoints/sft/step_800.pt",
+    )
+    parser.add_argument(
+        "--no-hud",
+        action="store_true",
+        help="print one line per log step instead of the live terminal display "
+        "(automatic when stdout is not a terminal)",
+    )
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    cfg = load_config_with_overrides(args.config, args.set)
     if (args.decay_from is None) != (args.decay_steps is None):
         parser.error("--decay-from and --decay-steps go together")
     if args.decay_from is not None:
         configure_decay_branch(cfg, args.decay_from, args.decay_steps)
-    train(cfg)
+    train(cfg, hud=False if args.no_hud else None)
 
 
 if __name__ == "__main__":

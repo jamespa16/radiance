@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 from radiance.config import SFTConfig
 from radiance.generate import generate
 from radiance.model import DenseTransformer
-from radiance.sft_data import format_chat_messages
+from radiance.sft_data import chat_prompt_ids
 from radiance.serve import _require_chat_enabled, create_app
 from tests.conftest import TINY_VOCAB
 from tests._fake_tokenizer import WordTokenizer
@@ -78,11 +78,11 @@ def test_non_streaming_matches_generate(tiny_cfg):
     )
     content = resp.json()["choices"][0]["message"]["content"]
 
-    prompt = format_chat_messages([{"role": "user", "content": "hello there"}], cfg)
+    # The chat route prompts with chat_prompt_ids, the token-level prompt radiance-rlaif uses.
+    prompt_ids = chat_prompt_ids([{"role": "user", "content": "hello there"}], tokenizer, cfg)
     torch.manual_seed(0)
-    full_text = generate(model, tokenizer, prompt, max_new_tokens=5, temperature=0, device="cpu")
+    full_text = generate(model, tokenizer, prompt_ids, max_new_tokens=5, temperature=0, device="cpu")
 
-    prompt_ids = tokenizer(prompt)["input_ids"]
     prompt_decoded = tokenizer.decode(prompt_ids, skip_special_tokens=True)
     expected = (prompt_decoded + " " + content) if content else prompt_decoded
     assert full_text == expected
