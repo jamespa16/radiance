@@ -34,6 +34,7 @@ radiance-eval = "radiance.eval_harness:main"
 radiance-size = "radiance.size:main"
 radiance-export = "radiance.export:main"
 radiance-pretokenize = "radiance.pretokenize:main"
+radiance-rlaif = "radiance.rlaif:main"
 
 [build-system]
 requires = ["setuptools>=68"]

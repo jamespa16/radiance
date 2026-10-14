@@ -1,10 +1,102 @@
-# Post-training: SFT and DPO
+# Post-training: SFT, DPO and RLAIF
 
-Two post-training modes, both implemented as mode switches inside `train()` rather than separate trainers — each
+Two post-training modes, SFT and DPO, plus `radiance-rlaif` for on-policy preference data from AI feedback, which
+feeds DPO. The modes are implemented as mode switches inside `train()` rather than separate trainers — each
 swaps `data.py`'s pipeline and `train.py`'s loss function and reuses everything else (optimizer, LR schedule,
 `auto_batch_size`, OOM backoff, checkpointing, `train.init_from`, wandb/stdout logging) unchanged. `cfg.sft.enabled`
 and `cfg.dpo.enabled` are mutually exclusive — `validate_post_training_config` raises if both are set, called at the
 top of `train()`.
+
+## The workflow
+
+`configs/post_training/` is the chain, set up against a V2 base checkpoint, with every stage's input given on the
+command line so no file is edited between runs:
+
+```bash
+BASE=checkpoints/v2/decay_from_<N>/step_<M>.pt          # an annealed base
+radiance-train --config configs/post_training/sft.yaml --set train.init_from=$BASE
+SFT=checkpoints/post_training/sft/step_3000.pt
+
+# offline preference tuning — AI feedback (UltraFeedback) or human feedback (hh-rlhf):
+radiance-train --config configs/post_training/dpo_ultrafeedback.yaml --set train.init_from=$SFT
+radiance-train --config configs/post_training/dpo_hh_rlhf.yaml       --set train.init_from=$SFT
+
+# or on-policy RLAIF, one round (repeat with the new checkpoint as the policy):
+radiance-rlaif pairs --checkpoint $SFT --output data/rlaif/round1 --max-prompts 8000
+radiance-train --config configs/post_training/dpo_rlaif.yaml \
+    --set train.init_from=$SFT dpo.dataset=data/rlaif/round1
+
+# and the judge-scored comparison against the SFT model:
+radiance-rlaif eval --checkpoint $SFT --checkpoint checkpoints/post_training/dpo_ultrafeedback/step_1000.pt
+```
+
+Three pieces make that work without hand-editing:
+
+- **`radiance-train --set section.field=value`** — the same override syntax `radiance-size` already had (now shared as
+  `config.load_config_with_overrides`). Overrides are applied to the raw YAML and go through `load_config` itself, so
+  its cross-field checks and `inherit_model_config` see them.
+- **`train.inherit_model_config`** — the `model:` section (and `data.tokenizer`) comes from `init_from`'s own saved
+  config, with only the keys this YAML's `model:` spells out applied on top. Before it, every post-training config
+  carried a hand copy of the base's `model:` block, and `load_pretrained_weights` only checks *shape* fields: a copy
+  that drops a behavioral one (`loop_count`, a RoPE setting, `qk_norm`) loads cleanly and fine-tunes a different model
+  from the one pretrained. Opt-in, because it is not inert — an existing config's *omitted* model keys would change
+  from the dataclass defaults to the checkpoint's values. Resolved in `load_config` (only the raw YAML knows which
+  keys were written down), and cheaply: `export.read_checkpoint_config` mmaps the `.pt`, or reads an export's
+  `config.json` alone. One field is deliberately *not* inherited from a DPO checkpoint: `doc_attention_mask: false`
+  there is `resolve_dpo_doc_mask`'s per-run resolution, and an SFT stage inheriting it would let its packed
+  conversations attend to each other.
+- **`dpo.reference_checkpoint` defaults to `train.init_from`** (`Config.resolved_reference_checkpoint`) — a
+  range-collapsed default: a config naming the reference is unaffected, and one naming neither still raises.
+
+`tests/test_stage_chaining.py` loads each stage config exactly the way its header says to run it.
+
+**The learning rates in those configs are not measured.** They are about a tenth of V2's pretraining rates for SFT
+and a tenth again for DPO — the usual rules of thumb, under Muon, where nothing post-training has been swept.
+
+## Datasets
+
+The split fields — `subset`, `train_split`, `eval_split`, `max_examples`, on both `sft` and `dpo` — exist because the
+most-used public sets could not be loaded before: `HuggingFaceH4/ultrafeedback_binarized` has `train_prefs`/
+`test_prefs` and `HuggingFaceH4/ultrachat_200k` `train_sft`/`test_sft`, and neither has a `train` split, which the
+pipelines hard-coded; `HuggingFaceTB/smoltalk` needs a config name. Selection is `sft_data.select_splits`: an explicit
+`eval_split` must exist, otherwise the first fallback present is used (`validation` for SFT, `validation` then
+`test` for DPO — each pipeline's old behavior, unchanged), otherwise `eval_split_size` rows are carved off train.
+`max_examples` caps train *after* the carve (so the held-out rows don't depend on the cap) and after a fixed-seed
+shuffle (hub datasets are often sorted by source, so a head would be one source).
+
+`dataset` may also be local: a `save_to_disk` directory or a `.json`/`.jsonl` file (`sft_data.load_chat_dataset`).
+That is how `radiance-rlaif` output reaches DPO. A local dataset's cache key includes a fingerprint of its files
+(latest mtime + total size, the same identity idea the reference-checkpoint key uses), because the path alone goes
+stale the moment the directory is regenerated in place.
+
+**Every pre-existing cache key is unchanged**: the new fields join the key only when they differ from their defaults
+(`split_key_extras`), and `tests/test_post_training_datasets.py` pins the old SFT key formula verbatim.
+
+Shapes — **run** marks those taken through `radiance-train` in the smoke runs under Status; the rest were checked
+against the dataset's published schema/splits only:
+
+| dataset | stage | fields | |
+|---|---|---|---|
+| `HuggingFaceTB/smol-smoltalk` | SFT | `messages_column: messages`, `eval_split: test` | run |
+| `HuggingFaceTB/smoltalk` | SFT | `subset: all` | schema |
+| `HuggingFaceH4/ultrachat_200k` | SFT | `train_split: train_sft`, `eval_split: test_sft` | schema |
+| `HuggingFaceH4/ultrafeedback_binarized` | DPO | `train_split: train_prefs`, `eval_split: test_prefs`, optional score filter on `score_chosen`/`score_rejected` | run |
+| `Anthropic/hh-rlhf` | DPO | defaults — transcript strings are parsed | run |
+| `argilla/dpo-mix-7k` | DPO | defaults — message lists | earlier worked example |
+| a `radiance-rlaif pairs` directory | DPO | `prompt_column: prompt`, score filter on `chosen_score`/`rejected_score` | run |
+
+**hh-rlhf transcripts.** `chosen`/`rejected` there are whole `"\n\nHuman: ...\n\nAssistant: ..."` strings sharing
+every turn but the last. With no `prompt_column`, a string-valued side is parsed into turns
+(`dpo_data.parse_hh_transcript`); before, it crashed iterating characters as turns, so no working config took that
+branch. Parsed, the shared turns tokenize identically on both sides (tokenization is per turn), and attention is
+causal, so their log-probabilities are equal and cancel in the log-ratio: only the final response carries the
+preference.
+
+**Score-margin filter.** `dpo.min_score_margin` with `score_chosen_column`/`score_rejected_column` drops pairs the
+judge barely separated. For AI-judged data the near-ties are where the labels are noisiest and carry the least
+signal. It runs as its own pass ahead of tokenization so its drop count prints separately from the `seq_len` one —
+on a 300-row UltraFeedback smoke at `seq_len: 512`, margin >= 1.0 kept 215, and then 98 of those were too long. (At
+512, ~45% of UltraFeedback overflows; the configs use 1024.)
 
 ## SFT
 
@@ -139,6 +231,46 @@ tensors when their feature is off. Because `model.z_loss_weight` defaults nonzer
 prints a one-time startup note under `dpo.enabled` when it's still set, rather than raising the way `mtp_heads > 1`
 does — raising would break every existing default DPO config over a term that was never meant to apply here.
 
+### Loss variants
+
+`dpo.loss_type`, `dpo.label_smoothing` and `dpo.sft_weight` select among the standard offline-preference objectives,
+all on the same reference-relative margin `(policy_chosen - policy_rejected) - (ref_chosen - ref_rejected)`:
+
+| setting | objective | what it changes |
+|---|---|---|
+| `loss_type: sigmoid` (default) | DPO, `-logsigmoid(beta * margin)` | — |
+| `label_smoothing: e` | cDPO, `(1-e) * DPO(c>r) + e * DPO(r>c)` | optimum is the finite margin `log((1-e)/e) / beta`, not infinity: a pair that may be mislabeled is not pushed apart forever. The case for AI-judged data. |
+| `loss_type: ipo` | IPO, `(m - 1/(2*beta))^2` on **per-token-mean** log-ratios | regresses to a fixed margin, so it stops pushing a pair it already separates; per-token means because with sums the target margin would scale with response length (TRL does the same) |
+| | | note `beta` means something else here: the target is `1/(2*beta)` nats *per token* — 5 at the default 0.1, so the loss starts near 25 (seen in the hh-rlhf smoke). An IPO run wants its own, larger `beta` |
+| `loss_type: hinge` | SLiC, `relu(1 - beta * margin)` | exactly zero past the margin |
+| `sft_weight: w` | `+ w * NLL(chosen)`, per-token mean (RPO; Llama 3's DPO+NLL) | DPO constrains only the *gap*; on small models both log-probs commonly fall together, and this anchors the chosen side |
+
+They are bound into the loss once, in `build_dpo_loss_fn` (a `functools.partial` over the possibly-compiled
+`compute_dpo_loss_from_logits`), so every call site still passes the same nine positional arguments. Two
+consequences: `val/loss` is the *configured* objective, not always plain DPO; and at the defaults the code path is the
+original one operation for operation — `tests/test_preference_losses.py` checks it is bit-identical, and checks each
+variant by its defining property (cDPO's zero-gradient point, hinge's zero region, IPO's zero at its target) rather than
+against a re-typed formula. Token counts for the two length-normalized terms are the *shifted* mask's,
+`loss_mask[:, 1:].sum()` — exactly the positions `sequence_logprob_sum` scores; an off-by-one there would silently
+rescale the term. They are only computed when a variant needs them.
+
+### Validation: preference accuracies
+
+`evaluate_detailed` now also returns `dpo_reward_accuracy` and `dpo_margin_accuracy` over the val pairs (row-weighted
+across chunks and batches, so a backed-off eval matches an un-split one), logged as `val/dpo_*_accuracy` and printed
+beside `val/loss`. `val/loss` cannot say whether the policy *ranks* held-out pairs correctly; these can.
+
+### Dropout biases the DPO loss
+
+The reference log-probabilities are computed once, in eval mode; the policy's are computed in train mode. With
+`model.dropout > 0` the policy's log-probs are dropout-noised and the reference's are not, so even at step 1, where the
+policy *is* the reference, the margin is noise rather than 0 and the loss does not start at `log(2)`. Measured on a
+one-pair CPU smoke run: **0.661 at `dropout: 0.1`, exactly 0.6931 at `0.0`**. TRL disables dropout for DPO by default
+for this reason. Here `train()` prints a note (`losses.note_dpo_dropout`) rather than overriding it, since silently
+changing `model.dropout` would change what an existing DPO config trains; the `configs/post_training/` DPO stages pin
+`model.dropout: 0.0` on top of the inherited model config. (V2 itself trains at 0.0, so the chain above is unaffected
+either way; a base with dropout is not.)
+
 ### Why `sft.enabled`/`dpo.enabled` stay two booleans, not a mode enum
 
 Considered and rejected. Mutual exclusion is centrally enforced (`validate_post_training_config` raises if both are
@@ -150,6 +282,65 @@ repeated (not inconsistent) `if dpo.enabled: ... elif sft.enabled: ...` structur
 collapse those to one property read, but it means a `Config` dataclass schema change plus pickle-compat handling in
 `_backfill_missing_fields` for checkpoints saved with only the two booleans — a real migration, not a local fix, and
 not justified without a concrete bug the current shape causes.
+
+## RLAIF: on-policy preference rounds (`radiance-rlaif`)
+
+`radiance-rlaif pairs` turns DPO into iterated, on-policy RLAIF (the form used by Self-Rewarding LMs and
+iterative/"online" DPO): sample `--num-samples` completions per prompt from the current policy, score each with a
+public reward model, keep the best against the worst as a preference pair, write the pairs as a local HF dataset, DPO
+on it, repeat with the new checkpoint. What distinguishes it from offline DPO on UltraFeedback or hh-rlhf is *whose*
+completions the preferences are over: offline pairs were sampled from other models, and drift further from the
+policy's own distribution the more training moves it; a round's pairs are from the policy being trained.
+
+**Why not PPO/GRPO.** For the reason DPO itself was chosen here: one resident model. A PPO step holds the policy, a
+value model, a reference and a reward model, and needs generation inside the training loop. Here sampling, judging
+and training run strictly in sequence — `pairs` samples with the policy, frees it, then loads the judge — so the peak
+is one model, and `train()` is untouched. The cost is that the data goes stale *within* a round, so rounds should be
+short (`dpo_rlaif.yaml` defaults to 250 steps over ~8k prompts). An in-loop GRPO is the natural next step if a round
+structure turns out to be the limiter; nothing has measured that.
+
+**The judge** is `--judge`, any one-output `AutoModelForSequenceClassification` reward model; the default,
+`Skywork/Skywork-Reward-V2-Qwen3-0.6B`, is a 0.6B Bradley-Terry model, small enough to run beside a training job. A
+judge with a chat template gets the conversation through it (tokenized with `add_special_tokens=False`, since the
+template already emits any BOS); one without gets a `(prompt, response)` text pair. Checked by hand against the real
+default judge: "Paris" for the capital of France scored 2.66, "Berlin" -4.41, "banana banana banana" -8.38. Batched
+(right-padded) and single-sequence scores agree to ~0.03 in bf16, against score gaps of several units.
+
+**Pairing rules** (`rlaif.build_preference_pairs`), each for a reason:
+
+- **chosen is the best *finished* sample; rejected the worst other one.** An unfinished sample (cut at
+  `--max-new-tokens`) can be rejected but never chosen: the DPO tokenizer appends EOS to both sides, so a truncated
+  "chosen" would teach the policy to stop mid-sentence. Best-vs-worst is the pair the judge is most sure of, and one
+  pair per prompt keeps prompts equally weighted.
+- **identical sides are skipped** (common at low temperature): such a pair has exactly zero gradient and only dilutes
+  the batch mean.
+- **`--min-margin`** drops pairs below a judge-score margin at write time; `dpo.min_score_margin` does the same at
+  train time, so one sampled round can be re-filtered without re-sampling. Every sample and score is kept in the
+  output (`completions`, `completion_scores`, `completion_finished`) for the same reason.
+
+Completions are decoded jointly with the prompt and split off it (`_decode_completion`), so `assistant_prefix +
+completion` — what the DPO pipeline rebuilds — is exactly the string the policy produced, leading space included.
+Re-tokenizing that string can still merge differently at the prefix boundary; that is the usual cost of a text-level
+handoff, and is why the pairs are text rather than ids (the DPO pipeline, its caching and its tests all take text).
+
+A round that yields few pairs almost always means few samples sampled EOS in time; `pairs` prints the finished
+fraction and says so below 50%. A policy that rarely stops is not ready for preference tuning — the random-init smoke
+policy finished 0.6% of its samples and produced 1 pair from 48 prompts, the intended behavior.
+
+**`radiance-rlaif eval`** samples one completion per prompt from each `--checkpoint` (same seed for each), scores
+them with the judge on the prompts every checkpoint could answer, and reports mean reward ± stderr, finished fraction,
+mean length and, from the second checkpoint on, the win rate against the first (ties count half). It defaults to 500
+prompts from `test_prefs` — disjoint from the `train_prefs` prompts the training rounds draw. This is the
+measurement the DPO metrics cannot make: `val/loss` and the preference accuracies score pairs someone else wrote,
+not what the policy now generates. Mind the obvious confound when it is the same judge that produced a round's pairs:
+the policy was optimized against that judge, so its win rate under it is an upper bound. A second, different judge
+(`--judge OpenAssistant/reward-model-deberta-v3-large-v2`, say) is the cheap check. On the smoke models (near-random
+text, 29 prompts) the two judges disagreed outright — 0.655 vs 0.500 for the same pair of checkpoints — which is what
+judging noise looks like at that n; the default is 500 prompts for a reason.
+
+Identical completions count as exact ties whatever their scores: the judge runs in bf16, where a text's score moves
+~0.03 with the rest of its padded batch, so two checkpoints that wrote the same answer would otherwise be separated by
+numerical noise. `--output` writes the per-prompt completions and rewards beside the summary.
 
 ## Shared plumbing
 
@@ -171,16 +362,26 @@ set. `generate.py --chat` calls this instead of `format_sft_prompt`.
 
 ## Status
 
-See `configs/tinystories_dpo.yaml` for a worked example — a three-stage pretrain -> SFT -> DPO chain, with
-`train.init_from` seeding the policy and `dpo.reference_checkpoint` anchoring the loss, usually (but not necessarily
-— they're separate fields) the same checkpoint.
+`configs/post_training/` is the worked chain (see [The workflow](#the-workflow)); the TinyStories-scale
+`configs/old_tests/tinystories_{sft,dpo}.yaml` predate it.
 
-**No quality A/B has been run yet.** The CPU smoke run above establishes that the pipeline runs and the loss starts
-where the math says it must, not that DPO improves anything at this scale. `tests/test_dpo_data.py`,
-`tests/test_dpo_loss.py` and `tests/test_dpo_reference_logprob.py` cover the data pipeline, the loss (including the
-policy-equals-reference equivalence check that predicted the smoke run's `log(2)` observation), and the precompute
-pass at unit-test depth; `tests/test_sft_train_e2e.py` and `tests/test_dpo_train_e2e.py` now also run
+**No quality A/B has been run yet** — of DPO, its variants, or RLAIF. What has been established is plumbing, on CPU
+with a 2-layer `d_model: 64` random-init base and the real public datasets: SFT on `smol-smoltalk`
+(`max_examples: 300`); DPO on `ultrafeedback_binarized` (`train_prefs`/`test_prefs`, score filter, cDPO + RPO terms,
+val accuracies); DPO on `hh-rlhf` (transcript parsing, IPO); `radiance-rlaif pairs` with the real Skywork judge on
+GPU; DPO on its output; and `radiance-rlaif eval` under both the Skywork (chat-template) and DeBERTa (text-pair)
+judges. The step-1 DPO loss is exactly `log(2)` at `dropout: 0` (and is not otherwise — see
+[Dropout](#dropout-biases-the-dpo-loss)). The natural first A/B, from an SFT'd V2: SFT alone vs. offline DPO on
+UltraFeedback vs. one or two on-policy RLAIF rounds over the same prompt pool, compared by `radiance-rlaif eval` under
+two judges, plus `radiance-eval` benchmarks to catch regressions the judge doesn't see.
+
+Unit coverage: `tests/test_dpo_data.py`, `tests/test_dpo_loss.py` and `tests/test_dpo_reference_logprob.py` cover the
+data pipeline, the loss (including the policy-equals-reference equivalence check that predicted the `log(2)`
+observation), and the precompute pass; `tests/test_sft_train_e2e.py` and `tests/test_dpo_train_e2e.py` run
 `train.train()` itself end-to-end (tiny model, faked dataset/tokenizer, CPU) for each mode, checking the loss
 actually decreases and the resulting checkpoint reloads and forwards cleanly — the DPO one also pins that
-`resolve_dpo_doc_mask` fires for real inside a full run and that the reference-logprob precompute populates
-`dpo.cache_dir`, neither of which the unit tests above exercise through the real `train()` wiring.
+`resolve_dpo_doc_mask` fires inside a full run and that the reference-logprob precompute populates `dpo.cache_dir`.
+`tests/test_post_training_datasets.py` covers split selection, local datasets, cache-key stability, hh-rlhf
+parsing and the score filter; `tests/test_preference_losses.py` the loss variants and val accuracies;
+`tests/test_rlaif.py` the pairing rules, sampling bookkeeping, and that `pairs` output loads as a DPO dataset with no
+hand-editing; `tests/test_stage_chaining.py` `inherit_model_config`, `--set`, and every `configs/post_training/` stage.

@@ -21,6 +21,103 @@ from .data import split_off_eval
 # pretraining documents is deliberate — see CLAUDE.md/the SFT design notes for why no model
 # change is needed for that.
 
+def load_chat_dataset(dataset: str, subset: str | None = None) -> DatasetDict:
+    """A post-training dataset by name: an HF hub id (with an optional config `subset`), a local
+    `save_to_disk` directory (what radiance-rlaif writes), or a local .json/.jsonl file.
+
+    Shared by the SFT and DPO pipelines. A local directory holding a single `Dataset` rather than a
+    `DatasetDict` is treated as its train split. The no-subset hub call is the bare
+    `load_dataset(dataset)` it always was.
+    """
+    path = Path(dataset)
+    if path.is_dir():
+        loaded = load_from_disk(str(path))
+        return loaded if isinstance(loaded, DatasetDict) else DatasetDict({"train": loaded})
+    if path.is_file() and path.suffix in (".json", ".jsonl"):
+        return load_dataset("json", data_files=str(path))
+    if subset is not None:
+        return load_dataset(dataset, subset)
+    return load_dataset(dataset)
+
+
+def select_splits(
+    raw: DatasetDict,
+    dataset: str,
+    train_split: str,
+    eval_split: str | None,
+    eval_fallbacks: tuple[str, ...],
+    eval_split_size: int,
+    max_examples: int | None,
+):
+    """(train, eval-or-None) from a loaded DatasetDict, by the sft/dpo split fields.
+
+    An explicit eval_split must exist. Otherwise the first of `eval_fallbacks` the dataset has is
+    used, and failing that eval_split_size rows are carved off the train split. max_examples caps
+    the *train* side, after the eval carve (so the held-out rows are the same whatever the cap) and
+    after a fixed-seed shuffle (so a cap samples the split rather than its head — hub datasets are
+    often sorted by source).
+    """
+    available = ", ".join(sorted(raw.keys()))
+    if train_split not in raw:
+        raise ValueError(
+            f"dataset {dataset!r} has no {train_split!r} split (it has: {available}). Set train_split."
+        )
+    train = raw[train_split]
+    if eval_split is not None:
+        if eval_split not in raw:
+            raise ValueError(f"dataset {dataset!r} has no {eval_split!r} split (it has: {available}).")
+        val = raw[eval_split]
+    else:
+        val = next((raw[s] for s in eval_fallbacks if s in raw and s != train_split), None)
+        if val is None:
+            if eval_split_size >= len(train):
+                # Small generated datasets (a radiance-rlaif round over few prompts) hit this; the
+                # alternative is an IndexError from inside datasets' take().
+                raise ValueError(
+                    f"eval_split_size={eval_split_size} would carve all {len(train)} rows of "
+                    f"{dataset!r}:{train_split} off as validation, leaving nothing to train on."
+                )
+            train, val = split_off_eval(train, eval_split_size)
+    if max_examples is not None and len(train) > max_examples:
+        train = train.shuffle(seed=0).select(range(max_examples))
+    return train, val
+
+
+def local_dataset_fingerprint(dataset: str) -> str | None:
+    """An identity for a *local* dataset's contents (latest mtime + total size over its files), or
+    None for a hub id. Cache keys built from the path alone go stale the moment the directory is
+    rewritten — which is the normal case for radiance-rlaif, whose round-N output directory is
+    regenerated in place. Same path+mtime+size idea dpo_data uses for the reference checkpoint."""
+    path = Path(dataset)
+    if path.is_file():
+        files = [path]
+    elif path.is_dir():
+        files = [p for p in path.rglob("*") if p.is_file()]
+    else:
+        return None
+    stats = [p.stat() for p in files]
+    return f"{max((s.st_mtime for s in stats), default=0)}|{sum(s.st_size for s in stats)}"
+
+
+def split_key_extras(section) -> list[str]:
+    """Cache-key parts for the split/subset/max_examples fields, and a local dataset's
+    fingerprint — each included only when it differs from its default, so every cache key built
+    before these fields existed hashes exactly as it did and those caches stay valid."""
+    extras = []
+    if section.subset is not None:
+        extras.append(f"subset={section.subset}")
+    if section.train_split != "train":
+        extras.append(f"train_split={section.train_split}")
+    if section.eval_split is not None:
+        extras.append(f"eval_split={section.eval_split}")
+    if section.max_examples is not None:
+        extras.append(f"max_examples={section.max_examples}")
+    fingerprint = local_dataset_fingerprint(section.dataset)
+    if fingerprint is not None:
+        extras.append(f"local={fingerprint}")
+    return extras
+
+
 def _format_sft_messages(example: dict, cfg: Config) -> list[dict]:
     """Normalize one dataset row to a [{"role": ..., "content": ...}, ...] turn list.
 
@@ -179,6 +276,7 @@ def _sft_cache_path(cfg: Config) -> Path:
             cfg.sft.user_prefix,
             cfg.sft.assistant_prefix,
             str(cfg.sft.eval_split_size),
+            *split_key_extras(cfg.sft),
         ]
     )
     digest = hashlib.sha256(key.encode()).hexdigest()[:16]
@@ -192,11 +290,16 @@ def _load_or_build_sft_packed(cfg: Config, tokenizer: PreTrainedTokenizerBase):
         packed.set_format(type="torch", columns=["input_ids", "loss_mask"])
         return packed
 
-    raw = load_dataset(cfg.sft.dataset)
-    train_split = raw["train"]
-    val_split = raw.get("validation")
-    if val_split is None:
-        train_split, val_split = split_off_eval(train_split, cfg.sft.eval_split_size)
+    raw = load_chat_dataset(cfg.sft.dataset, cfg.sft.subset)
+    train_split, val_split = select_splits(
+        raw,
+        cfg.sft.dataset,
+        cfg.sft.train_split,
+        cfg.sft.eval_split,
+        ("validation",),
+        cfg.sft.eval_split_size,
+        cfg.sft.max_examples,
+    )
 
     packed = DatasetDict({"train": _tokenize_and_pack_sft(train_split, tokenizer, cfg)})
     if val_split is not None:

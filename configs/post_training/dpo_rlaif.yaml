@@ -1,0 +1,64 @@
+# Post-training stage 2+ (on-policy RLAIF): iterated DPO on the policy's own samples, judged by a
+# public reward model. One round:
+#
+#   POLICY=$SFT                                     # round 1; later rounds use the last round's output
+#   radiance-rlaif pairs --checkpoint $POLICY --output data/rlaif/round1 \
+#       --prompts HuggingFaceH4/ultrafeedback_binarized --split train_prefs --max-prompts 8000
+#   radiance-train --config configs/post_training/dpo_rlaif.yaml \
+#       --set train.init_from=$POLICY dpo.dataset=data/rlaif/round1 \
+#             train.output_dir=checkpoints/post_training/rlaif_round1
+#   radiance-rlaif eval --checkpoint $SFT --checkpoint checkpoints/post_training/rlaif_round1/step_250.pt
+#
+# then round 2 with POLICY=checkpoints/post_training/rlaif_round1/step_250.pt, a fresh --output,
+# and a fresh train.output_dir. The reference resolves to init_from, so each round is anchored to
+# its own starting policy (the iterative-DPO convention), not to the SFT model.
+#
+# `pairs` samples --num-samples (default 4) completions per prompt, scores each with --judge
+# (default Skywork/Skywork-Reward-V2-Qwen3-0.6B), and keeps the best finished completion against
+# the worst; see radiance/rlaif.py for the pairing rules. Prompts are drawn from the same
+# UltraFeedback pool the offline stage uses, so offline-vs-on-policy is a like-for-like A/B.
+#
+# The pair dataset is local, written by `pairs`: plain-string chosen/rejected with a separate
+# prompt column, plus the judge's scores. A round over a few thousand prompts is small, hence
+# eval_split_size rather than a separate eval split, and the short max_steps.
+
+run_name: post-training-dpo-rlaif
+
+data:
+  seq_len: 1024
+  num_workers: 8
+
+model:
+  dropout: 0.0 # see dpo_ultrafeedback.yaml
+  z_loss_weight: 0.0
+
+dpo:
+  enabled: true
+  dataset: null # --set dpo.dataset=<radiance-rlaif pairs --output directory>
+  prompt_column: prompt
+  chosen_column: chosen
+  rejected_column: rejected
+  score_chosen_column: chosen_score
+  score_rejected_column: rejected_score
+  min_score_margin: 0.5 # in the judge's own (unbounded Bradley-Terry) units; a prior, not a result
+  eval_split_size: 200
+  beta: 0.1
+
+train:
+  init_from: null # --set train.init_from=<this round's policy>
+  inherit_model_config: true
+  batch_size: 8
+  grad_accum_steps: 8
+  lr: 1.0e-4
+  muon_lr: 2.0e-4
+  warmup_ratio: 0.1
+  max_steps: 250 # ~16k pairs: about two passes over an 8k-prompt round
+  log_every: 10
+  eval_every: 50
+  save_every: 250
+  output_dir: checkpoints/post_training/rlaif_round1
+  dtype: bf16
+
+wandb:
+  project: radiance
+  mode: online

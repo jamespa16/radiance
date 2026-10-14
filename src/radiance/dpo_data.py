@@ -1,18 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from pathlib import Path
 
 import torch
-from datasets import DatasetDict, load_dataset, load_from_disk
+from datasets import DatasetDict, load_from_disk
 from torch.utils.data import DataLoader
 from transformers import PreTrainedTokenizerBase
 
 from radiance.config import Config, doc_mask_is_inert_for_dpo, resolve_device, resolve_dtype
 from radiance.model import load_transformer_from_checkpoint, sequence_logprob_sum
 
-from .data import split_off_eval
-from .sft_data import tokenize_sft_example
+from .sft_data import load_chat_dataset, select_splits, split_key_extras, tokenize_sft_example
 
 # DPO (preference post-training): different packing strategy from SFT's above, deliberately.
 # SFT packs many chat examples per fixed-seq_len block, relying on
@@ -33,6 +33,31 @@ from .sft_data import tokenize_sft_example
 # never attend to padding regardless of whether document-boundary masking is active. Whether the
 # reference-logprob precompute pass below sets eos_id on its model is therefore a free choice,
 # not a correctness requirement.
+
+_HH_TURN = re.compile(r"\n\n(Human|Assistant):[ ]?")
+
+
+def parse_hh_transcript(text: str) -> list[dict]:
+    """An Anthropic/hh-rlhf-style transcript string ("\\n\\nHuman: ...\\n\\nAssistant: ...") ->
+    [{"role", "content"}, ...] turns.
+
+    hh-rlhf (and datasets derived from it) ship chosen/rejected as whole transcripts that share
+    every turn but the last assistant one. Parsed into turns, the shared turns tokenize identically
+    on both sides (tokenize_sft_example works turn by turn), and attention is causal, so their
+    log-probabilities are equal under any model (to floating-point) and cancel in the DPO
+    log-ratio: only the final, differing response carries the preference, as it should. Text before the first marker, if any, is a user turn.
+    """
+    parts = _HH_TURN.split(text)
+    if len(parts) < 3:
+        raise ValueError(
+            "expected an hh-rlhf-style transcript with '\\n\\nHuman:'/'\\n\\nAssistant:' turn markers; "
+            f"got {text[:80]!r}. For plain completion strings, set dpo.prompt_column."
+        )
+    messages = [{"role": "user", "content": parts[0]}] if parts[0].strip() else []
+    for role, content in zip(parts[1::2], parts[2::2]):
+        messages.append({"role": "user" if role == "Human" else "assistant", "content": content})
+    return messages
+
 
 def _format_dpo_pair(example: dict, cfg: Config) -> tuple[list[dict], list[dict]]:
     """Normalize one dataset row to (chosen_messages, rejected_messages).
@@ -55,7 +80,15 @@ def _format_dpo_pair(example: dict, cfg: Config) -> tuple[list[dict], list[dict]
         chosen = prompt_turns + [{"role": "assistant", "content": example[cfg.dpo.chosen_column]}]
         rejected = prompt_turns + [{"role": "assistant", "content": example[cfg.dpo.rejected_column]}]
         return chosen, rejected
-    return example[cfg.dpo.chosen_column], example[cfg.dpo.rejected_column]
+    chosen, rejected = example[cfg.dpo.chosen_column], example[cfg.dpo.rejected_column]
+    # A string here, with no prompt_column, can only be a whole transcript (a message list is the
+    # other shape); before this it crashed iterating characters as turns, so no working config
+    # took this branch.
+    if isinstance(chosen, str):
+        chosen = parse_hh_transcript(chosen)
+    if isinstance(rejected, str):
+        rejected = parse_hh_transcript(rejected)
+    return chosen, rejected
 
 
 def _tokenize_dpo_row(
@@ -97,8 +130,32 @@ def _tokenize_dpo_row(
     }
 
 
+def _filter_score_margin(dataset, cfg: Config):
+    """Drop pairs whose judged score margin is below dpo.min_score_margin (no-op when unset).
+
+    A separate pass ahead of tokenization, rather than one more reason inside its batch_fn, so the
+    two drop counts are reported separately — a margin filter that removes 40% of the data and a
+    seq_len that removes 40% call for different fixes.
+    """
+    dpo = cfg.dpo
+    if dpo.min_score_margin is None:
+        return dataset
+    n_before = len(dataset)
+    kept = dataset.filter(
+        lambda ex: ex[dpo.score_chosen_column] - ex[dpo.score_rejected_column] >= dpo.min_score_margin,
+        num_proc=cfg.data.num_workers or None,
+    )
+    print(
+        f"[radiance] dpo data prep: dropped {n_before - len(kept)}/{n_before} pairs with score margin "
+        f"< min_score_margin={dpo.min_score_margin}",
+        flush=True,
+    )
+    return kept
+
+
 def _tokenize_and_filter_dpo(dataset, tokenizer: PreTrainedTokenizerBase, cfg: Config):
     seq_len = cfg.dpo.seq_len or cfg.data.seq_len
+    dataset = _filter_score_margin(dataset, cfg)
     n_before = len(dataset)
 
     def batch_fn(batch):
@@ -150,7 +207,7 @@ def _add_reference_logprobs(
     function, which is what keeps DPO training at exactly one resident model's VRAM cost.
     """
     ref_model, ref_cfg = load_transformer_from_checkpoint(
-        cfg.dpo.reference_checkpoint, device, eos_id=tokenizer.eos_token_id
+        cfg.resolved_reference_checkpoint, device, eos_id=tokenizer.eos_token_id
     )
     # The checkpoint was trained with whatever tokenizer its own saved config names. If that
     # differs from this run's data.tokenizer, its vocab ids don't correspond to this run's packed
@@ -162,7 +219,7 @@ def _add_reference_logprobs(
     # in hand, rather than letting a mismatched reference surface as a plausible-looking loss.
     if ref_cfg.data.tokenizer != cfg.data.tokenizer:
         raise ValueError(
-            f"dpo.reference_checkpoint {cfg.dpo.reference_checkpoint!r} was trained with "
+            f"dpo.reference_checkpoint {cfg.resolved_reference_checkpoint!r} was trained with "
             f"data.tokenizer={ref_cfg.data.tokenizer!r}, but this run uses "
             f"data.tokenizer={cfg.data.tokenizer!r}: a mismatched vocabulary, so the reference "
             "log-probabilities would be meaningless. Point dpo.reference_checkpoint at a "
@@ -290,11 +347,19 @@ def _dpo_cache_path(cfg: Config) -> Path:
             cfg.dpo.user_prefix,
             cfg.dpo.assistant_prefix,
             str(cfg.dpo.eval_split_size),
+            *split_key_extras(cfg.dpo),
+            # Only when set, for the same keep-old-keys-stable reason as split_key_extras.
+            *(
+                [f"min_score_margin={cfg.dpo.min_score_margin}|{cfg.dpo.score_chosen_column}"
+                 f"|{cfg.dpo.score_rejected_column}"]
+                if cfg.dpo.min_score_margin is not None
+                else []
+            ),
         ]
     )
     base_dir = Path(cfg.dpo.cache_dir) / hashlib.sha256(base_key.encode()).hexdigest()[:16]
 
-    ref_path = Path(cfg.dpo.reference_checkpoint)
+    ref_path = Path(cfg.resolved_reference_checkpoint)
     try:
         ref_stat = ref_path.stat()
     except FileNotFoundError:
@@ -305,7 +370,7 @@ def _dpo_cache_path(cfg: Config) -> Path:
         )
         if not candidates:
             raise ValueError(
-                f"dpo.reference_checkpoint {cfg.dpo.reference_checkpoint!r} does not exist, and "
+                f"dpo.reference_checkpoint {cfg.resolved_reference_checkpoint!r} does not exist, and "
                 f"no cached DPO dataset for this dataset/config was found under "
                 f"{cfg.dpo.cache_dir!r}: the reference log-probabilities are computed from that "
                 "checkpoint, so there is nothing to load and nothing to rebuild it from. Restore "
@@ -313,7 +378,7 @@ def _dpo_cache_path(cfg: Config) -> Path:
             )
         if len(candidates) > 1:
             raise ValueError(
-                f"dpo.reference_checkpoint {cfg.dpo.reference_checkpoint!r} does not exist, and "
+                f"dpo.reference_checkpoint {cfg.resolved_reference_checkpoint!r} does not exist, and "
                 f"{len(candidates)} cached DPO datasets built against different reference "
                 f"checkpoints were found under {base_dir}: it is not possible to tell which "
                 "reference model the reference log-probabilities were computed against, and "
@@ -322,7 +387,7 @@ def _dpo_cache_path(cfg: Config) -> Path:
                 f"cache, or delete the ones you no longer need ({', '.join(c.name for c in candidates)})."
             )
         return candidates[0]
-    ref_key = f"{cfg.dpo.reference_checkpoint}|{ref_stat.st_mtime}|{ref_stat.st_size}"
+    ref_key = f"{cfg.resolved_reference_checkpoint}|{ref_stat.st_mtime}|{ref_stat.st_size}"
     return base_dir / ("ref-" + hashlib.sha256(ref_key.encode()).hexdigest()[:16])
 
 
@@ -349,13 +414,16 @@ def _load_or_build_dpo_packed(cfg: Config, tokenizer: PreTrainedTokenizerBase):
         packed.set_format(type="torch")
         return packed
 
-    raw = load_dataset(cfg.dpo.dataset)
-    train_split = raw["train"]
-    val_split = raw.get("validation")
-    if val_split is None:
-        val_split = raw.get("test")
-    if val_split is None:
-        train_split, val_split = split_off_eval(train_split, cfg.dpo.eval_split_size)
+    raw = load_chat_dataset(cfg.dpo.dataset, cfg.dpo.subset)
+    train_split, val_split = select_splits(
+        raw,
+        cfg.dpo.dataset,
+        cfg.dpo.train_split,
+        cfg.dpo.eval_split,
+        ("validation", "test"),
+        cfg.dpo.eval_split_size,
+        cfg.dpo.max_examples,
+    )
 
     packed = DatasetDict({"train": _tokenize_and_filter_dpo(train_split, tokenizer, cfg)})
     if val_split is not None:
@@ -382,8 +450,10 @@ def build_dpo_dataloaders(cfg: Config, tokenizer: PreTrainedTokenizerBase) -> tu
     module docstring above)."""
     if not cfg.dpo.dataset:
         raise ValueError("dpo.enabled requires dpo.dataset to be set.")
-    if not cfg.dpo.reference_checkpoint:
-        raise ValueError("dpo.enabled requires dpo.reference_checkpoint to be set.")
+    if not cfg.resolved_reference_checkpoint:
+        raise ValueError(
+            "dpo.enabled requires dpo.reference_checkpoint (or train.init_from, which it defaults to) to be set."
+        )
 
     def collate(batch):
         cols = [

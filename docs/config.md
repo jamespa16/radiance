@@ -2,8 +2,15 @@
 
 Dataclass schema (`DataConfig`, `ModelConfig`, `TrainConfig`, `WandbConfig`, `SFTConfig`, `DPOConfig` nested in
 `Config`) plus `load_config(path)`. This is the single source of truth for every tunable; a new hyperparameter is
-added here first, then threaded through. Plain dataclasses, not OmegaConf/Hydra — no CLI overrides, no config
-composition, one YAML file per run.
+added here first, then threaded through. Plain dataclasses, not OmegaConf/Hydra — no config composition, one YAML
+file per run. The one CLI layer is `--set section.field=value` on `radiance-train`/`radiance-size`
+(`load_config_with_overrides`): applied to the raw YAML *before* `load_config`, so every cross-field check sees it,
+and parsed as YAML, so values land typed. It exists for chaining post-training stages without editing files
+([post-training.md](post-training.md#the-workflow)).
+
+`train.inherit_model_config` is the other place `load_config` reads outside its own file: it takes the `model:`
+section (and `data.tokenizer`) from `train.init_from`'s saved config, with the YAML's explicit `model:` keys on top.
+It is opt-in rather than default-on because it is not inert — see [post-training.md](post-training.md#the-workflow).
 
 A pickled `Config` predating a field is schema-evolved at unpickle time: pickle restores `__dict__` without running
 `__init__`, so `Config.__setstate__` backfills each missing field with its *current* default, exactly the way

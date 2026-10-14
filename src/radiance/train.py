@@ -14,7 +14,7 @@ import wandb
 from radiance import nvfp4
 from radiance.config import (
     Config,
-    load_config,
+    load_config_with_overrides,
     resolve_device,
     resolve_dtype,
 )
@@ -48,6 +48,7 @@ from .losses import (
     build_dpo_loss_fn,
     build_loss_fn,
     chunk_loss_and_metrics,
+    note_dpo_dropout,
     note_dpo_z_loss_omitted,
     resolve_dpo_doc_mask,
     validate_post_training_config,
@@ -325,6 +326,7 @@ def train(cfg: Config) -> None:
     # will build BlockMasks.
     resolve_dpo_doc_mask(cfg)
     note_dpo_z_loss_omitted(cfg)
+    note_dpo_dropout(cfg)
 
     # eos_id is what recovers packed document boundaries for doc_attention_mask (see
     # model.document_ids) — data.py joins documents with exactly this token.
@@ -679,12 +681,25 @@ def train(cfg: Config) -> None:
                         extra += f" ± {result.loss_stderr:.4f}"
                     if result.bits_per_byte is not None:
                         extra += f" bpb {result.bits_per_byte:.4f}"
+                    if result.dpo_reward_accuracy is not None:
+                        extra += (
+                            f" reward_acc {result.dpo_reward_accuracy:.3f}"
+                            f" margin_acc {result.dpo_margin_accuracy:.3f}"
+                        )
                     print(f"[radiance] step {step:>6} val/loss {result.loss:.4f}{extra}", flush=True)
                     wandb.log(
                         {
                             "val/loss": result.loss,
                             **({"val/loss_stderr": result.loss_stderr} if result.loss_stderr is not None else {}),
                             **({"val/bits_per_byte": result.bits_per_byte} if result.bits_per_byte is not None else {}),
+                            **(
+                                {
+                                    "val/dpo_reward_accuracy": result.dpo_reward_accuracy,
+                                    "val/dpo_margin_accuracy": result.dpo_margin_accuracy,
+                                }
+                                if result.dpo_reward_accuracy is not None
+                                else {}
+                            ),
                         },
                         step=step,
                     )
@@ -763,9 +778,17 @@ def main() -> None:
         "to min_lr_ratio over --decay-steps (WSD), writing to <output_dir>/decay_from_<step>",
     )
     parser.add_argument("--decay-steps", type=int, help="length of the --decay-from anneal, in steps")
+    parser.add_argument(
+        "--set",
+        nargs="+",
+        default=[],
+        metavar="KEY=VALUE",
+        help="section.field=value overrides applied on top of --config, parsed as YAML — e.g. "
+        "chaining post-training stages: --set train.init_from=checkpoints/sft/step_800.pt",
+    )
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    cfg = load_config_with_overrides(args.config, args.set)
     if (args.decay_from is None) != (args.decay_steps is None):
         parser.error("--decay-from and --decay-steps go together")
     if args.decay_from is not None:

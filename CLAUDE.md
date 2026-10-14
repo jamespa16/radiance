@@ -13,7 +13,7 @@ what is written down there is a measurement or a bug that cost a training run, n
 | [docs/nvfp4.md](docs/nvfp4.md) | `nvfp4/` — NVFP4 4-bit GEMMs behind `model.fp4_linear` |
 | [docs/optim.md](docs/optim.md) | `optim.py` — Muon, muP, parameter groups, the `lr` retune |
 | [docs/train.md](docs/train.md) | `train.py` (+ `losses.py`, `batching.py`, `checkpointing.py`, `evaluation.py`) + `generate.py` — loop, loss, compile modes, batch sizing, OOM tiers |
-| [docs/post-training.md](docs/post-training.md) | SFT and DPO |
+| [docs/post-training.md](docs/post-training.md) | SFT, DPO (and its IPO/cDPO/RPO variants), `radiance-rlaif`, the stage chain in `configs/post_training/` |
 | [docs/eval.md](docs/eval.md) | `eval_harness.py` — standard benchmarks (HellaSwag, PIQA, ARC, ...) via lm-evaluation-harness |
 | [docs/results.md](docs/results.md) | **every A/B ever run here**, and the cautions for running a new one |
 | [experiments/](experiments/) | the harness + working notes behind the larger A/Bs, when the result alone isn't the whole story |
@@ -68,6 +68,22 @@ WANDB_MODE=offline uv run radiance-train --config configs/v2.yaml
 Under `lr_schedule: wsd`, any checkpoint can be annealed into a finished model on a side branch without stopping the
 run: `radiance-train --config <cfg> --decay-from <step_N.pt> --decay-steps K` writes to
 `<output_dir>/decay_from_N/`. `train.keep_every` keeps the branch points; see [docs/train.md](docs/train.md).
+
+## Post-training
+
+```bash
+radiance-train --config configs/post_training/sft.yaml --set train.init_from=<base.pt>
+radiance-train --config configs/post_training/dpo_ultrafeedback.yaml --set train.init_from=<sft.pt>
+radiance-rlaif pairs --checkpoint <policy.pt> --output data/rlaif/round1      # on-policy RLAIF round
+radiance-rlaif eval --checkpoint <sft.pt> --checkpoint <dpo.pt>              # judge reward + win rate
+```
+
+`--set section.field=value` overrides a config on the command line (as on `radiance-size`), which is how one stage's
+checkpoint is handed to the next. The stage configs set `train.inherit_model_config`, so they carry no copy of the
+base's `model:` block, and `dpo.reference_checkpoint` defaults to `train.init_from`. `radiance-rlaif` samples from
+the policy, scores with a public reward model (default `Skywork/Skywork-Reward-V2-Qwen3-0.6B`) and writes best-vs-worst
+pairs for DPO — iterated on-policy DPO rather than PPO, so one model is resident at a time. **Nothing post-training
+has a quality A/B yet**; see [docs/post-training.md](docs/post-training.md). Entry point: `radiance.rlaif:main`.
 
 ## Running inference
 
@@ -219,6 +235,8 @@ only the model package imports. `model/` and `nvfp4/` are packages whose `__init
 - **`pretokenize.py`** — `radiance-pretokenize`: a config's corpus -> flat local token files for
   `data.pretokenized_dir`, resumable, with the held-out carve split off.
 - **`export.py`** — checkpoint -> safetensors + `config.json` export (`radiance-export`) and its inverse `load_export`.
+- **`rlaif.py`** — `radiance-rlaif`: on-policy preference pairs from a policy + public reward model, and
+  judge-scored checkpoint comparison.
 - **`eval_harness.py`** — an lm-evaluation-harness `LM` backend (`RadianceLM`) plus the `radiance-eval` CLI; runs
   standard benchmarks in-process against a loaded checkpoint. `eval` dependency group, not core.
 

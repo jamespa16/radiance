@@ -1,0 +1,59 @@
+# Post-training stage 1: SFT on HuggingFaceTB/smol-smoltalk, on top of a V2 base checkpoint.
+#
+# The chain (docs/post-training.md has the reasoning; every stage takes its input on the command
+# line, so nothing here needs editing between runs):
+#
+#   BASE=checkpoints/v2/decay_from_<N>/step_<M>.pt     # an *annealed* V2 checkpoint
+#   radiance-train --config configs/post_training/sft.yaml --set train.init_from=$BASE
+#   SFT=checkpoints/post_training/sft/step_3000.pt
+#
+#   # then any of, each a separate DPO run from $SFT:
+#   radiance-train --config configs/post_training/dpo_ultrafeedback.yaml --set train.init_from=$SFT
+#   radiance-train --config configs/post_training/dpo_hh_rlhf.yaml       --set train.init_from=$SFT
+#   # or on-policy RLAIF rounds — see dpo_rlaif.yaml
+#
+#   # and measure each against $SFT with an AI judge on held-out prompts:
+#   radiance-rlaif eval --checkpoint $SFT --checkpoint checkpoints/post_training/dpo_ultrafeedback/step_1000.pt
+#
+# train.inherit_model_config takes the whole `model:` section (and data.tokenizer) from init_from's
+# own saved config, so this file carries no copy of V2's architecture to drift out of sync with
+# the checkpoint. It is why init_from must be given (it raises otherwise) — load_config reads it.
+#
+# smol-smoltalk is the SmolLM2 team's cut of smoltalk for models under 1B parameters (shorter,
+# simpler conversations; no function-calling or long-context subsets), ~460k conversations with a
+# native `messages` column and a `test` split. For the full mix: dataset: HuggingFaceTB/smoltalk,
+# subset: all. For a quick look: --set sft.max_examples=20000.
+#
+# The learning rates are a starting point, NOT a measurement: about a tenth of V2's pretraining
+# rates, the usual SFT rule of thumb. Nothing post-training has been swept at this scale yet.
+
+run_name: post-training-sft
+
+data:
+  seq_len: 1024
+  num_workers: 8
+
+sft:
+  enabled: true
+  dataset: HuggingFaceTB/smol-smoltalk
+  messages_column: messages
+  eval_split: test
+
+train:
+  init_from: null # --set train.init_from=<base checkpoint>
+  inherit_model_config: true
+  batch_size: 16
+  grad_accum_steps: 2 # 32 x 1024 tokens/step; 3000 steps ~ 98M tokens, about half an epoch
+  lr: 1.0e-3
+  muon_lr: 2.0e-3
+  warmup_ratio: 0.03
+  max_steps: 3000
+  log_every: 20
+  eval_every: 250
+  save_every: 500
+  output_dir: checkpoints/post_training/sft
+  dtype: bf16
+
+wandb:
+  project: radiance
+  mode: online

@@ -99,6 +99,7 @@ Only the fields you need to change — everything else falls back to the datacla
 - **`output_dir`** — directory for checkpoints.
 - **`resume_from`** — path to resume from, or `"auto"` for the highest-numbered checkpoint in `output_dir`. Restores weights, optimizer state, LR schedule, and GradScaler.
 - **`init_from`** — path to a checkpoint to seed *model weights only* from (e.g. starting SFT from a pretrained checkpoint); unlike `resume_from`, the optimizer/scheduler/step are not restored, so this run gets a fresh optimizer/scheduler and starts at step 0. Ignored whenever `resume_from` finds a checkpoint. `None` = fresh init.
+- **`inherit_model_config`** — take the `model:` section (and `data.tokenizer`) from `init_from`'s own saved config, with only the keys this config's `model:` section spells out applied on top. Requires `init_from`. Default `false` (it is not inert: omitted model keys would change from the dataclass defaults to the checkpoint's). See `configs/post_training/`.
 - **`seed`** — random seed.
 - **`device`** — `"auto"` (CUDA > MPS > CPU), `"cuda"`, `"mps"`, or `"cpu"`.
 - **`compile`** — enable `torch.compile` on the model.
@@ -109,7 +110,11 @@ Only the fields you need to change — everything else falls back to the datacla
 Post-training: supervised fine-tuning on chat/instruction data. A mode switch (like `use_moe`/`use_router`), not an inert default-on feature — enabling it swaps `train.py`'s data pipeline and loss function entirely. Pair with `train.init_from` to seed the model from a pretrained checkpoint; see `configs/tinystories_sft.yaml` for a worked example.
 
 - **`enabled`** — route `train.py` through `build_sft_dataloaders`/`compute_sft_loss` instead of the pretrain path. Default `false`.
-- **`dataset`** — HF `user/dataset`-style instruction dataset. Required when `enabled`.
+- **`dataset`** — HF `user/dataset`-style instruction dataset, or a local dataset (a `save_to_disk` directory, or a `.json`/`.jsonl` file). Required when `enabled`.
+- **`subset`** — HF dataset config name, e.g. `all` for `HuggingFaceTB/smoltalk`. `null` = the dataset's default.
+- **`train_split`** — the split to train on. Default `"train"`; e.g. `train_sft` for `HuggingFaceH4/ultrachat_200k`, `train_prefs` for `HuggingFaceH4/ultrafeedback_binarized`.
+- **`eval_split`** — `null` (default): `validation` if the dataset has one, else carve `eval_split_size` rows off the train split. Set to name the split explicitly (e.g. `test_sft`, `test_prefs`).
+- **`max_examples`** — cap on train-split rows, sampled with a fixed-seed shuffle after the eval carve. `null` = all.
 - **`messages_column`** — column holding `[{"role", "content"}, ...]` chat turns (the standard shape for chat-formatted HF datasets, e.g. `HuggingFaceH4/no_robots`). Ignored if `instruction_column` is set instead.
 - **`instruction_column` / `input_column` / `output_column`** — Alpaca-style fallback for datasets with separate instruction/input/output columns rather than a `messages` column; a 2-turn user/assistant list is built from these instead.
 - **`seq_len`** — packed block width for SFT; `None` resolves to `data.seq_len`.
@@ -124,15 +129,23 @@ Post-training: Direct Preference Optimization on `(prompt, chosen, rejected)` tr
 Each `(prompt+chosen)`/`(prompt+rejected)` sequence is packed as its own row, independently padded to `seq_len` with trailing `eos_token_id` (loss-masked) — "packing of one," unlike `sft`'s many-examples-per-block packing — so a pair's two halves can never be separated by `DataLoader` shuffling. This needs no `model/` changes: attention is strictly causal and the real content always precedes its own padding within a row, so the padding can never influence the scored tokens' logits.
 
 - **`enabled`** — route `train.py` through `build_dpo_dataloaders`/`compute_dpo_loss_from_logits` instead of the pretrain/SFT path. Default `false`.
-- **`dataset`** — HF `user/dataset`-style preference dataset. Required when `enabled`.
+- **`dataset`** — HF `user/dataset`-style preference dataset, or a local dataset (a `save_to_disk` directory — what `radiance-rlaif pairs` writes — or a `.json`/`.jsonl` file). Required when `enabled`.
+- **`subset`** — HF dataset config name, e.g. `all` for `HuggingFaceTB/smoltalk`. `null` = the dataset's default.
+- **`train_split`** — the split to train on. Default `"train"`; e.g. `train_sft` for `HuggingFaceH4/ultrachat_200k`, `train_prefs` for `HuggingFaceH4/ultrafeedback_binarized`.
+- **`eval_split`** — `null` (default): `validation`, then `test`, if the dataset has one, else carve `eval_split_size` rows off the train split. Set to name the split explicitly (e.g. `test_sft`, `test_prefs`).
+- **`max_examples`** — cap on train-split rows, sampled with a fixed-seed shuffle after the eval carve. `null` = all.
 - **`prompt_column`** — `null` (default): `chosen_column`/`rejected_column` are full `[{"role", "content"}, ...]` message lists that already include the prompt turn (e.g. `argilla/dpo-mix-7k`). Set: `chosen_column`/`rejected_column` are plain completion strings, combined with `prompt_column` (+ optional `system_column`) into a shared 1-turn user prompt (e.g. `Intel/orca_dpo_pairs`, which has separate `system`/`question`/`chosen`/`rejected` string columns — set `prompt_column: question`, `system_column: system`).
 - **`system_column`** — only consulted when `prompt_column` is set.
-- **`chosen_column` / `rejected_column`** — column names for the preferred/dispreferred side. Default `"chosen"`/`"rejected"`.
+- **`chosen_column` / `rejected_column`** — column names for the preferred/dispreferred side. Default `"chosen"`/`"rejected"`. Without `prompt_column`, each may hold a message list or an `Anthropic/hh-rlhf`-style `"\n\nHuman: ...\n\nAssistant: ..."` transcript string, which is parsed into turns.
+- **`score_chosen_column` / `score_rejected_column` / `min_score_margin`** — opt-in pair filter: drop pairs whose `score_chosen - score_rejected` is below `min_score_margin` (the near-ties, where AI-judged labels are least reliable). `null` (default) keeps every pair.
 - **`seq_len`** — packed row width for DPO; `null` resolves to `data.seq_len`. A pair with either side exceeding this is dropped, not truncated (truncating the completion would score a partial response as fully chosen/rejected; truncating the prompt would silently change what's being conditioned on).
 - **`cache_dir`** — tokenized+packed+reference-scored cache for the DPO dataset, separate from `data.cache_dir`/`sft.cache_dir`. The cache key includes the reference checkpoint's path/mtime/size, so changing `reference_checkpoint` invalidates it.
 - **`eval_split_size`** — same semantics as `data.eval_split_size`, applied to the DPO dataset.
 - **`beta`** — DPO temperature / regularization strength (Rafailov et al. 2023). Default `0.1`.
-- **`reference_checkpoint`** — path to a frozen checkpoint whose log-probabilities anchor the DPO loss. Required when `enabled`. Often, but not necessarily, the same checkpoint `train.init_from` seeds the policy from.
+- **`loss_type`** — `"sigmoid"` (default; DPO), `"ipo"` (IPO, squared loss toward a margin of `1/(2*beta)` on per-token-mean log-ratios), or `"hinge"` (SLiC).
+- **`label_smoothing`** — `sigmoid` only: assumed label-flip probability (cDPO), giving a finite optimal margin instead of an infinite one. `0.0` (default) is plain DPO.
+- **`sft_weight`** — weight on a per-token-mean NLL term over the chosen response (RPO). `0.0` (default) is inert.
+- **`reference_checkpoint`** — path to a frozen checkpoint whose log-probabilities anchor the DPO loss. `null` (default) resolves to `train.init_from` — the common case — and one of the two is required when `enabled`.
 - **`reference_batch_size`** — batch size for the one-time reference-logprob precompute pass. Default `32`.
 - **`user_prefix` / `assistant_prefix`** — same plain-text turn-marker convention as `sft.user_prefix`/`sft.assistant_prefix`.
 

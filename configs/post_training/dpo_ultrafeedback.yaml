@@ -1,0 +1,61 @@
+# Post-training stage 2 (offline RLAIF): DPO on HuggingFaceH4/ultrafeedback_binarized.
+#
+#   radiance-train --config configs/post_training/dpo_ultrafeedback.yaml --set train.init_from=$SFT
+#
+# (see sft.yaml for the whole chain). dpo.reference_checkpoint is left unset, so it resolves to
+# train.init_from: the SFT checkpoint is both the starting policy and the frozen reference.
+#
+# UltraFeedback is AI feedback: four completions per prompt from a pool of models, each rated by
+# GPT-4; the binarized version pairs the top-rated completion against one of the others.
+# Its splits are train_prefs/test_prefs (there is no "train"), and chosen/rejected are message
+# lists that already include the prompt turn.
+#
+# min_score_margin: 1.0 drops pairs the judge rated within a point of each other on its 1-10
+# scale — the near-ties, which are where AI labels are least reliable. Measure it before
+# trusting it: it is a sensible prior, not a result here.
+#
+# Most UltraFeedback responses are long; at seq_len 1024 the pipeline drops (never truncates)
+# every pair either side of which overflows, and prints how many. For an A/B, the natural arms
+# are the loss variants: --set dpo.label_smoothing=0.1 (cDPO, for label noise),
+# dpo.sft_weight=1.0 (RPO, against both log-probs falling together), dpo.loss_type=ipo.
+
+run_name: post-training-dpo-ultrafeedback
+
+data:
+  seq_len: 1024
+  num_workers: 8
+
+model:
+  # Applied on top of the inherited model config. Dropout would noise the policy's log-probs but
+  # not the (eval-mode) reference's, biasing the loss from step 1 — see losses.note_dpo_dropout.
+  dropout: 0.0
+  z_loss_weight: 0.0 # not part of the DPO loss; zeroed so its startup note stays quiet
+
+dpo:
+  enabled: true
+  dataset: HuggingFaceH4/ultrafeedback_binarized
+  train_split: train_prefs
+  eval_split: test_prefs
+  score_chosen_column: score_chosen
+  score_rejected_column: score_rejected
+  min_score_margin: 1.0
+  beta: 0.1
+
+train:
+  init_from: null # --set train.init_from=<SFT checkpoint>
+  inherit_model_config: true
+  batch_size: 8 # pairs; each forwards chosen+rejected, so 2 x 1024 tokens per row
+  grad_accum_steps: 8
+  lr: 1.0e-4 # a tenth of the SFT stage's — a starting point, not a measurement
+  muon_lr: 2.0e-4
+  warmup_ratio: 0.1
+  max_steps: 1000 # ~64k pairs seen, about one pass over what survives the filters
+  log_every: 10
+  eval_every: 100
+  save_every: 250
+  output_dir: checkpoints/post_training/dpo_ultrafeedback
+  dtype: bf16
+
+wandb:
+  project: radiance
+  mode: online

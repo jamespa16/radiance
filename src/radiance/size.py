@@ -35,9 +35,8 @@ from __future__ import annotations
 import argparse
 
 import torch
-import yaml
 
-from radiance.config import Config, load_config
+from radiance.config import Config, load_config_with_overrides
 from radiance.model import DenseTransformer, padded_vocab_size
 
 # Resolving this needs the tokenizer, which needs a network fetch or a warm HF cache -- far too
@@ -45,19 +44,6 @@ from radiance.model import DenseTransformer, padded_vocab_size
 # default everywhere (configs/default.yaml, every config in configs/), and --vocab-size overrides
 # it for anything else, so the constant buys speed without hiding a decision.
 GPT2_VOCAB_SIZE = 50257
-
-
-def _apply_overrides(raw: dict, assignments: list[str]) -> dict:
-    """Apply `dotted.key=value` assignments to a raw config dict, parsing values as YAML."""
-    for assignment in assignments:
-        if "=" not in assignment:
-            raise ValueError(f"--set expects dotted.key=value, got {assignment!r}")
-        key, _, value = assignment.partition("=")
-        section, _, field = key.strip().partition(".")
-        if not field:
-            raise ValueError(f"--set key must name a section, e.g. model.d_model, got {key!r}")
-        raw.setdefault(section, {})[field] = yaml.safe_load(value)
-    return raw
 
 
 def size_config(cfg: Config, vocab_size: int) -> dict[str, int]:
@@ -100,21 +86,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.set:
-        # Round-trip through the raw dict so overrides go through load_config's own validation
-        # rather than being poked onto an already-resolved Config, where a cross-field check
-        # (dtype/fp4_linear, dataset/dataset_mix) would never see them.
-        raw = yaml.safe_load(open(args.config)) or {} if args.config else {}
-        import tempfile
-
-        with tempfile.NamedTemporaryFile("w", suffix=".yaml") as f:
-            yaml.safe_dump(_apply_overrides(raw, args.set), f)
-            f.flush()
-            cfg = load_config(f.name)
-    elif args.config:
-        cfg = load_config(args.config)
-    else:
-        cfg = Config()
+    cfg = load_config_with_overrides(args.config, args.set)
 
     counts = size_config(cfg, args.vocab_size)
     m = cfg.model

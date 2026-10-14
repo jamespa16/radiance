@@ -36,12 +36,12 @@ def dpo_reference_reserve_bytes(cfg: Config) -> int:
     load. No 3x grad/optimizer multiplier is needed here, unlike the policy model's reservation
     below — the reference model runs once under torch.no_grad() and is never optimized.
     """
-    if not (cfg.dpo.enabled and cfg.dpo.reference_checkpoint):
+    if not (cfg.dpo.enabled and cfg.resolved_reference_checkpoint):
         return 0
     if dpo_cache_exists(cfg):
         return 0
     try:
-        return checkpoint_param_bytes(cfg.dpo.reference_checkpoint)
+        return checkpoint_param_bytes(cfg.resolved_reference_checkpoint)
     except (FileNotFoundError, KeyError):
         return 0
 

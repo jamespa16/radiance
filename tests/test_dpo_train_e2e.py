@@ -16,6 +16,7 @@ import torch
 from datasets import Dataset, DatasetDict
 
 import radiance.dpo_data as dpo_data_mod
+import radiance.sft_data as sft_data_mod
 import radiance.train as train_mod
 from radiance.checkpointing import save_checkpoint
 from radiance.config import Config, DataConfig, DPOConfig, ModelConfig, TrainConfig, WandbConfig
@@ -58,7 +59,7 @@ def test_dpo_train_loop_runs_end_to_end_and_loss_decreases(tmp_path, monkeypatch
     # example, and it's the reference checkpoint that exercises the precompute pass under test.
     base_ckpt = _save_base_checkpoint(tmp_path, model_cfg, "base.pt")
 
-    monkeypatch.setattr(dpo_data_mod, "load_dataset", lambda name: _dpo_pairs(32))
+    monkeypatch.setattr(sft_data_mod, "load_dataset", lambda name: _dpo_pairs(32))
     tokenizer = WordTokenizer(vocab_size=TINY_VOCAB)
     monkeypatch.setattr(train_mod, "build_tokenizer", lambda cfg: tokenizer)
 
