@@ -525,6 +525,38 @@ Other arms measured and rejected under the cap: MQA (+0.0136), `mtp_heads: 2` pa
 14 to 48 at `d256`-`d320` sits inside the noise floor, so the shape decision is nearly free once
 you are deep and narrow, and the 0.031 available between L16 and L24 is the whole of it.
 
+## WSD vs cosine — a wash at each schedule's best LR, a loss at the LR you'd actually use
+
+`lr_schedule: wsd` had been kept off on the argument that it "isn't a quality win" without a measurement behind it.
+Now measured: TinyStories, `ts16k` tokenizer, `d_model: 256`, `n_layers: 8`, `ffn_mult: 3.0` (15.77M), effective
+batch 32 pinned, `bf16`, **4000 steps** for every arm, peak LR swept separately per schedule (`lr` and `muon_lr`
+scaled together by `m` from `1e-2` / `0.02`). Harness, logs and the mid-run curves in
+[experiments/wsd-vs-cosine/](../experiments/wsd-vs-cosine/).
+
+| peak LR `m` | cosine | WSD 10% decay | WSD 20% decay | WSD 30% decay |
+|---|---|---|---|---|
+| 0.25 | 1.6196 | | 1.6095 | |
+| **0.5** | **1.6032** | 1.6181 | 1.6050 | **1.5998** |
+| 1.0 | 1.6091 (n=3) | 1.6304 | 1.6147 (n=3) | 1.6093 |
+| 2.0 | 1.6184 | | 1.6406 | |
+
+**Noise floor 0.0009 / 0.0006 (stdev)** from three identical runs of each schedule at `m = 1` — about half
+under-50m's 0.0021 at this smaller shape; rank two single runs at ~0.003.
+
+- **At each schedule's best LR (`m ≈ 0.5`, bracketed for both) they tie.** WSD 20% is +0.0018 (noise); WSD 30% is
+  −0.0034, suggestive rather than established — one run each, and 30% was picked after seeing 20%.
+- **WSD is far more LR-sensitive**, because at a given peak its mean LR is higher: −0.010 at `m = 0.25`, +0.006 at
+  `m = 1`, +0.022 at `m = 2`. A cosine-tuned config switched to WSD without re-sweeping lands on the losing side,
+  which is [config.md](config.md)'s "changes a tuned quantity" reason, measured.
+- **Decay length matters more than the schedule.** 10% / 20% / 30% at `m = 0.5`: 1.6181 / 1.6050 / 1.5998, same
+  ordering at `m = 1`, and 30% was the longest tried.
+- **The stable phase is ~0.10 behind cosine at step 3000 and the decay recovers all of it.** Don't read a WSD run's
+  quality off its stable-phase evals; read it through a `--decay-from` branch.
+
+So `cosine` stays the default. WSD's case remains operational (extendable runs, decay branches); using it means a
+~30% decay and a fresh LR sweep, not the 20% default on a cosine-tuned `lr`. Not measured: any horizon or scale near
+`configs/v2.yaml`, where WSD's reported advantages usually show.
+
 ## Cautions when running an A/B
 
 1. **Pin `batch_size` and set `auto_batch_size: false`.** Otherwise a change that reduces memory (sparsity,

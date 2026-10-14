@@ -46,8 +46,9 @@ once someone configures it or training moves its weights. In practice that means
 2. **It costs time even while inert.** `hyper_conn_streams` stays `1`: `n` times the residual stream's activation
    memory *and* 30-40% of step time in the looped regime. Inert is not the same as free.
 3. **It changes a tuned quantity.** `lr_schedule` stays `"cosine"` — WSD is an operational convenience, not a
-   quality win, and switching it would silently reshape the LR trajectory of every config whose `lr` was tuned
-   against cosine.
+   quality win (measured: a tie at each schedule's own best LR), and switching it would silently reshape the LR
+   trajectory of every config whose `lr` was tuned against cosine — at that LR WSD measured 0.006 worse, and 0.022 at twice it (see
+   [results.md](results.md#wsd-vs-cosine--a-wash-at-each-schedules-best-lr-a-loss-at-the-lr-youd-actually-use)).
 4. **It is an approximation you reach for deliberately.** `loop_bptt_window` stays `None` (truncating the gradient).
 5. **The measurement said no.** `moe_counterfactual_weight` (`0.0`) and `moe_balance_signal` (`"count"`) are both
    free and both inert at their defaults, so they would default on under the rule above. They don't, because the A/B

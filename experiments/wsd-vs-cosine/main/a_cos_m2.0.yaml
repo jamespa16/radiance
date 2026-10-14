@@ -1,0 +1,43 @@
+run_name: a_cos_m2.0
+
+data:
+  dataset: roneneldan/TinyStories
+  text_column: text
+  tokenizer: .cache/radiance/tok/ts16k
+  seq_len: 512
+  num_workers: 4
+  cache_dir: .cache/radiance/tokenized
+
+model:
+  d_model: 256
+  head_dim: 64
+  n_layers: 8
+  loop_count: 1
+  ffn_mult: 3.0
+  ffn_depth: 2
+  dropout: 0.0
+  max_seq_len: 512
+
+train:
+  batch_size: 16
+  grad_accum_steps: 2
+  auto_batch_size: false
+  lr: 0.02
+  muon_lr: 0.04
+  weight_decay: 0.01
+  warmup_ratio: 0.04
+  lr_schedule: cosine
+  wsd_decay_ratio: 0.2
+  max_steps: 4000
+  grad_clip: 1.0
+  log_every: 100
+  eval_every: 500
+  eval_max_batches: 50
+  save_every: 4000
+  output_dir: experiments/wsd-vs-cosine/main/ckpt/a_cos_m2.0
+  seed: 42
+  compile: true
+  dtype: bf16
+
+wandb:
+  mode: disabled

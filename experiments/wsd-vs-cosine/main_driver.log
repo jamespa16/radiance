@@ -1,0 +1,25 @@
+[driver] === a_cos_m0.5 ===
+[driver] a_cos_m0.5 done in 114s :: [radiance] step   4000 val/loss 1.6032 ± 0.0411 bpb 0.5513
+[driver] === a_cos_m1.0 ===
+[driver] a_cos_m1.0 done in 114s :: [radiance] step   4000 val/loss 1.6084 ± 0.0414 bpb 0.5531
+[driver] === a_cos_m2.0 ===
+[driver] a_cos_m2.0 done in 114s :: [radiance] step   4000 val/loss 1.6184 ± 0.0410 bpb 0.5565
+[driver] === a_wsd20_m0.5 ===
+[driver] a_wsd20_m0.5 done in 114s :: [radiance] step   4000 val/loss 1.6050 ± 0.0411 bpb 0.5519
+[driver] === a_wsd20_m1.0 ===
+[driver] a_wsd20_m1.0 done in 113s :: [radiance] step   4000 val/loss 1.6154 ± 0.0410 bpb 0.5555
+[driver] === a_wsd20_m2.0 ===
+[driver] a_wsd20_m2.0 done in 114s :: [radiance] step   4000 val/loss 1.6406 ± 0.0411 bpb 0.5642
+[driver] === b_wsd10_m1.0 ===
+[driver] b_wsd10_m1.0 done in 114s :: [radiance] step   4000 val/loss 1.6304 ± 0.0409 bpb 0.5607
+[driver] === b_wsd30_m1.0 ===
+[driver] b_wsd30_m1.0 done in 114s :: [radiance] step   4000 val/loss 1.6093 ± 0.0410 bpb 0.5534
+[driver] === c_cos_m1.0_r1 ===
+[driver] c_cos_m1.0_r1 done in 114s :: [radiance] step   4000 val/loss 1.6102 ± 0.0411 bpb 0.5537
+[driver] === c_cos_m1.0_r2 ===
+[driver] c_cos_m1.0_r2 done in 115s :: [radiance] step   4000 val/loss 1.6088 ± 0.0411 bpb 0.5532
+[driver] === c_wsd20_m1.0_r1 ===
+[driver] c_wsd20_m1.0_r1 done in 114s :: [radiance] step   4000 val/loss 1.6142 ± 0.0410 bpb 0.5551
+[driver] === c_wsd20_m1.0_r2 ===
+[driver] c_wsd20_m1.0_r2 done in 114s :: [radiance] step   4000 val/loss 1.6146 ± 0.0411 bpb 0.5552
+[driver] ALL DONE
