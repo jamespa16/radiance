@@ -99,7 +99,7 @@ Only the fields you need to change — everything else falls back to the datacla
 - **`output_dir`** — directory for checkpoints.
 - **`resume_from`** — path to resume from, or `"auto"` for the highest-numbered checkpoint in `output_dir`. Restores weights, optimizer state, LR schedule, and GradScaler.
 - **`init_from`** — path to a checkpoint to seed *model weights only* from (e.g. starting SFT from a pretrained checkpoint); unlike `resume_from`, the optimizer/scheduler/step are not restored, so this run gets a fresh optimizer/scheduler and starts at step 0. Ignored whenever `resume_from` finds a checkpoint. `None` = fresh init.
-- **`inherit_model_config`** — take the `model:` section (and `data.tokenizer`) from `init_from`'s own saved config, with only the keys this config's `model:` section spells out applied on top. Requires `init_from`. Default `false` (it is not inert: omitted model keys would change from the dataclass defaults to the checkpoint's). See `configs/post_training/`.
+- **`inherit_model_config`** — take the model architecture (and `data.tokenizer`) from `init_from`'s own saved config — not its run-time fields (`fp4_*`, loss weights, `dropout`, `grad_checkpoint`, `doc_attention_mask`; `config._RUN_TIME_MODEL_FIELDS`), which come from this config — with only the keys this config's `model:` section spells out applied on top. Requires `init_from`. Default `false` (it is not inert: omitted model keys would change from the dataclass defaults to the checkpoint's). See `configs/post_training/`.
 - **`seed`** — random seed.
 - **`device`** — `"auto"` (CUDA > MPS > CPU), `"cuda"`, `"mps"`, or `"cpu"`.
 - **`compile`** — enable `torch.compile` on the model.

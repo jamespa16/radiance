@@ -44,7 +44,7 @@ DataLoader. Use `torch.cuda.mem_get_info()` (or `nvidia-smi`); `(total - free) -
 non-allocator footprint and is the number that moved. And **CUDA graphs were never buying anything here anyway**:
 84.2 ms vs 82.7 ms in the one configuration where they work correctly. Since `doc_attention_mask` defaults on,
 `mode="reduce-overhead"` is now nearly dead code on real configs — it survives for cases that build no per-step mask
-(`head_dim < 16`, non-CUDA, doc masking explicitly off, and **DPO runs**, where `resolve_dpo_doc_mask` turns the mask
+(`head_dim < 16`, non-CUDA, doc masking explicitly off, and **DPO runs**, where `dpo_model_config` turns the mask
 off because its one-pair-per-row packing makes it provably inert — see [post-training.md](post-training.md)). If a
 future change makes CUDA graphs actually pay, the fix
 is to give the BlockMask stable addresses (build once, `copy_` into it, keeping `mask_mod`'s `doc_ids` a persistent

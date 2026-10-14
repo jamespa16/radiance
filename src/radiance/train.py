@@ -48,9 +48,9 @@ from .losses import (
     build_loss_fn,
     chunk_loss_and_metrics,
     dpo_loss_variant_configured,
+    dpo_model_config,
     note_dpo_dropout,
     note_dpo_z_loss_omitted,
-    resolve_dpo_doc_mask,
     validate_post_training_config,
 )
 def build_lr_scheduler(optimizer: torch.optim.Optimizer, cfg: Config) -> LambdaLR:
@@ -312,18 +312,18 @@ def train(cfg: Config) -> None:
             f"[radiance] padding vocab {len(tokenizer):,} -> {vocab_size:,} "
             f"(multiple of {cfg.model.vocab_pad_multiple}) for tensor-core-aligned lm_head matmuls"
         )
+    # Before the model is built, so an unsupported combination fails before a model is allocated.
     validate_post_training_config(cfg)
-    # Both before the model is built: validation so an unsupported combination fails before a
-    # model is allocated, and the doc-mask resolution because DenseTransformer reads cfg.model by
-    # reference and resolve_compile_mode's CUDA-graph decision asks the *built* model whether it
-    # will build BlockMasks.
-    resolve_dpo_doc_mask(cfg)
     note_dpo_z_loss_omitted(cfg)
     note_dpo_dropout(cfg)
 
     # eos_id is what recovers packed document boundaries for doc_attention_mask (see
-    # model.document_ids) — data.py joins documents with exactly this token.
-    raw_model = DenseTransformer(cfg.model, vocab_size=vocab_size, eos_id=tokenizer.eos_token_id).to(device)
+    # model.document_ids) — data.py joins documents with exactly this token. dpo_model_config is
+    # cfg.model unless DPO's packing makes the doc mask a no-op; resolve_compile_mode's CUDA-graph
+    # decision then asks the *built* model whether it will build BlockMasks.
+    raw_model = DenseTransformer(
+        dpo_model_config(cfg), vocab_size=vocab_size, eos_id=tokenizer.eos_token_id
+    ).to(device)
     if cfg.train.native_bf16:
         cast_params_to_native_bf16(raw_model)
         print("[radiance] train.native_bf16: parameters, gradients and optimizer moments stored in bf16")

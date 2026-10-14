@@ -31,6 +31,17 @@ class EvalResult:
     dpo_margin_accuracy: float | None = None
 
 
+def standard_error(values: list[float], mean: float) -> float | None:
+    """Standard error of `mean` over `values`: the sample standard deviation over sqrt(n). None
+    for fewer than two values, which carry no spread to estimate it from. Shared by val/loss's
+    stderr here and radiance-rlaif's judge-reward stderr."""
+    n = len(values)
+    if n < 2:
+        return None
+    var = sum((v - mean) ** 2 for v in values) / (n - 1)
+    return math.sqrt(var / n)
+
+
 def evaluate(*args, **kwargs) -> float:
     """Mean validation loss; see evaluate_detailed, whose .loss this returns."""
     return evaluate_detailed(*args, **kwargs).loss
@@ -149,10 +160,7 @@ def evaluate_detailed(
     if not count:
         return EvalResult(float("nan"))
     mean = total / count
-    stderr = None
-    if count > 1:
-        var = sum((l - mean) ** 2 for l in batch_losses) / (count - 1)
-        stderr = math.sqrt(var / count)
+    stderr = standard_error(batch_losses, mean)
     bpb = nats / (math.log(2) * n_bytes) if token_bytes is not None and n_bytes else None
     if n_pairs:
         return EvalResult(

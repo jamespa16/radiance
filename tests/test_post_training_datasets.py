@@ -131,10 +131,12 @@ def test_split_fields_and_local_contents_change_the_key(tmp_path):
 
     local = tmp_path / "round1"
     DatasetDict({"train": _rows(3)}).save_to_disk(str(local))
+    (local / sft_mod.RLAIF_MANIFEST_NAME).write_text("{}")  # as radiance-rlaif writes it
     cfg = Config(sft=SFTConfig(dataset=str(local)))
     before = _sft_cache_path(cfg)
     # Regenerated in place (the normal radiance-rlaif round-over-round case): the key must move.
     DatasetDict({"train": _rows(7)}).save_to_disk(str(local))
+    (local / sft_mod.RLAIF_MANIFEST_NAME).write_text("{}")
     assert _sft_cache_path(cfg) != before
 
 
@@ -326,3 +328,29 @@ def test_min_score_margin_drops_near_ties(tmp_path, monkeypatch):
     packed = _load_or_build_dpo_packed(cfg, _FakeTokenizer())
     assert len(packed["train"]) == 2  # margins 8, 0.5, 6, 0 -> keep the 8 and the 6
     assert "validation" not in packed
+
+
+def test_only_rlaif_output_gets_a_content_fingerprint_in_its_cache_key(tmp_path):
+    # Any other local dataset keeps its path-only key, so caches built before the fingerprint
+    # existed (DPO reference log-probs among them) are still found.
+    data = tmp_path / "pairs"
+    data.mkdir()
+    (data / "rows.jsonl").write_text("{}\n")
+    cfg = DPOConfig(dataset=str(data))
+    assert split_key_extras(cfg) == []
+    (data / sft_mod.RLAIF_MANIFEST_NAME).write_text("{}")
+    extras = split_key_extras(cfg)
+    assert len(extras) == 1 and extras[0].startswith("local=")
+    (data / "rows.jsonl").write_text("{}\n{}\n")  # regenerated in place: a new key
+    assert split_key_extras(cfg) != extras
+
+
+def test_rlaif_pairs_sampled_after_old_prompt_ids_are_refused(tmp_path):
+    manifest = {"tokenizer": "gpt2", "turn_template": {"user_prefix": "\n\nUser: ", "assistant_prefix": "\n\nAssistant: "}}
+    (tmp_path / sft_mod.RLAIF_MANIFEST_NAME).write_text(json.dumps(manifest))
+    cfg = Config(dpo=DPOConfig(dataset=str(tmp_path)))
+    with pytest.raises(ValueError, match="prompt ids"):
+        dpo_mod.check_rlaif_manifest(cfg)
+    manifest["prompt_ids_version"] = sft_mod.RLAIF_PROMPT_IDS_VERSION
+    (tmp_path / sft_mod.RLAIF_MANIFEST_NAME).write_text(json.dumps(manifest))
+    dpo_mod.check_rlaif_manifest(cfg)

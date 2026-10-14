@@ -104,6 +104,31 @@ def test_generate_tokens_batched_matches_individual_calls_at_greedy(tiny_cfg):
     assert batched_ids[1] == expected_b
 
 
+@pytest.mark.parametrize("use_diff_attn", [False, True])
+def test_samples_per_item_matches_repeating_the_items_at_greedy(tiny_cfg, use_diff_attn):
+    """samples_per_item prefills each prompt once and expands its KV cache (K/V, and differential
+    attention's K2) across its samples; at greedy every sample must equal what the same prompt
+    produces when it is simply listed that many times."""
+    cfg = tiny_cfg(loop_count=2, use_diff_attn=use_diff_attn)
+    model = DenseTransformer(cfg.model, vocab_size=TINY_VOCAB).eval()
+    tokenizer = WordTokenizer(TINY_VOCAB)
+    ids = [torch.tensor([tokenizer(p)["input_ids"]]) for p in ("the quick brown fox jumps", "a slow turtle")]
+    items = [BatchItem(input_ids=i, max_new_tokens=5, temperature=0) for i in ids]
+
+    def collect(batch_items, n_rows, **kwargs):
+        out: dict[int, list[int]] = {r: [] for r in range(n_rows)}
+        for step_results in generate_tokens_batched(model, tokenizer, batch_items, device="cpu", **kwargs):
+            for row, token_id in step_results:
+                if token_id is not None:
+                    out[row].append(token_id)
+        return out
+
+    expanded = collect(items, 6, samples_per_item=3)
+    repeated = collect([item for item in items for _ in range(3)], 6)
+    assert expanded == repeated
+    assert all(len(tokens) > 0 for tokens in expanded.values())
+
+
 def test_generate_tokens_matches_batched_sampling_at_stochastic_settings(tiny_cfg):
     """Regression guard for the _sample_next_token extraction: generate_tokens and
     generate_tokens_batched share _sample_next_token, so a seeded stochastic run (temperature >

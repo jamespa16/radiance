@@ -670,10 +670,6 @@ class DPOConfig:
     reference_batch_size: int = 32  # batch size for the one-time reference-logprob precompute pass.
     user_prefix: str = "\n\nUser: "  # same plain-text turn-marker convention as sft.user_prefix.
     assistant_prefix: str = "\n\nAssistant: "
-    doc_attention_mask_before_resolve: bool | None = None  # not a knob: losses.resolve_dpo_doc_mask
-    # records model.doc_attention_mask here before turning it off, so a later stage inheriting this
-    # checkpoint's model config (train.inherit_model_config) gets the architecture's own value back
-    # rather than DPO's per-run resolution. None on checkpoints saved before it existed.
 
 
 def _backfill_missing_fields(obj) -> None:
@@ -867,10 +863,29 @@ def _apply_dtype_sugar(cfg: Config) -> Config:
     return cfg
 
 
+# ModelConfig fields that are how a run trains, not what its weights compute: loss weights, numeric
+# format, memory/regularisation switches, and doc_attention_mask (how *this* run's packed batches
+# attend; it holds no weights). train.inherit_model_config leaves these to the stage's own YAML, or
+# their defaults. Inherited, they would carry one stage's choices silently into the next: the fp4_*
+# set comes from train.dtype: nvfp4 and would put a bf16 SFT stage on FP4 GEMMs, and a DPO
+# checkpoint saved before the doc mask stopped being written back holds doc_attention_mask=False,
+# which would let an SFT stage's packed conversations attend to each other.
+_RUN_TIME_MODEL_FIELDS = frozenset(
+    {
+        "fp4_linear", "fp4_grad_gemms", "fp4_stochastic_rounding", "fp4_hadamard",
+        "fp4_save_activations", "fp4_keep_bf16_blocks", "fp4_keep_bf16_first", "fp4_lm_head",
+        "dropout", "z_loss_weight", "mtp_weight", "ponder_weight", "moe_aux_loss_weight",
+        "moe_bias_update_rate", "moe_balance_signal", "moe_counterfactual_weight",
+        "grad_checkpoint", "loop_bptt_window", "doc_attention_mask",
+    }
+)
+
+
 def _inherit_model_config(raw: dict) -> dict:
-    """Resolve `train.inherit_model_config`: `train.init_from`'s saved model config (and
+    """Resolve `train.inherit_model_config`: `train.init_from`'s saved model architecture (and
     data.tokenizer) — or, when the run is resuming, the resume checkpoint's — overlaid with the
-    keys this raw YAML spells out explicitly.
+    keys this raw YAML spells out explicitly. Architecture only: _RUN_TIME_MODEL_FIELDS are left to
+    this stage.
 
     Raw-level for the same reason load_config's other cross-field checks are: only the raw dict
     distinguishes "this key was written down" from "this key is at its default", and it is exactly
@@ -891,19 +906,11 @@ def _inherit_model_config(raw: dict) -> dict:
     resume_keys = {k: train_raw[k] for k in ("resume_from", "output_dir") if k in train_raw}
     resume = find_resume_checkpoint(Config(train=TrainConfig(**resume_keys)))
     source = read_checkpoint_config(resume if resume is not None else init_from)
-    inherited = {f.name: getattr(source.model, f.name) for f in fields(source.model)}
-    if source.dpo.enabled and not source.model.doc_attention_mask and not source.model.loop_attn_windows:
-        # A DPO run's saved doc_attention_mask=False is losses.resolve_dpo_doc_mask's per-run
-        # resolution (the mask is inert for one-pair-per-row packing), not an architecture choice.
-        # Inherited into a stage that packs several examples per block — SFT after DPO — it would
-        # silently let them attend to each other. Restore the value the run had before resolving
-        # it, so an architecture that had the mask off keeps it off; a checkpoint saved before that
-        # was recorded leaves the field to its default. A DPO stage resolves it off again by itself.
-        before = source.dpo.doc_attention_mask_before_resolve
-        if before is None:
-            del inherited["doc_attention_mask"]
-        else:
-            inherited["doc_attention_mask"] = before
+    inherited = {
+        f.name: getattr(source.model, f.name)
+        for f in fields(source.model)
+        if f.name not in _RUN_TIME_MODEL_FIELDS
+    }
     raw = {**raw, "model": {**inherited, **(raw.get("model") or {})}}
     data = {**(raw.get("data") or {})}
     data.setdefault("tokenizer", source.data.tokenizer)
@@ -914,16 +921,26 @@ def _inherit_model_config(raw: dict) -> dict:
 _STRING_FIELD_TYPES = ("str", "str | None")
 
 
-def _override_value(section: str, field_name: str, value: str):
+def _field_type(owner, field_name: str):
+    """The annotated type of `owner.field_name` (a string, under this module's postponed
+    annotations), or None when `owner` is not a dataclass or has no such field."""
+    if owner is None or not is_dataclass(owner):
+        return None
+    return next((f.type for f in fields(owner) if f.name == field_name), None)
+
+
+def _override_value(section: str | None, field_name: str, value: str):
     """An override's value: parsed as YAML, so `true`, `4.0` and `8` land typed — except for a
     string-typed field, which takes the text as written. YAML would turn `2026-10-14` into a date
     and cut `a #b` at the comment, and paths and dataset names are exactly what `--set` passes
-    when chaining stages. `null` (or nothing) still clears an optional string."""
-    section_type = next((f.type for f in fields(Config) if f.name == section), None)
-    section_cls = globals().get(section_type) if isinstance(section_type, str) else section_type
-    field_type = None
-    if section_cls is not None and is_dataclass(section_cls):
-        field_type = next((f.type for f in fields(section_cls) if f.name == field_name), None)
+    when chaining stages. `null` (or nothing) still clears an optional string. `section` None is a
+    top-level Config field (run_name)."""
+    if section is None:
+        field_type = _field_type(Config, field_name)
+    else:
+        section_type = _field_type(Config, section)
+        section_cls = globals().get(section_type) if isinstance(section_type, str) else section_type
+        field_type = _field_type(section_cls, field_name)
     if field_type in _STRING_FIELD_TYPES:
         if field_type.endswith("None") and value.strip() in ("", "null", "~", "None"):
             return None
@@ -933,14 +950,23 @@ def _override_value(section: str, field_name: str, value: str):
 
 def apply_overrides(raw: dict, assignments: list[str]) -> dict:
     """Apply `section.field=value` assignments (`--set` on radiance-train / radiance-size) to a raw
-    config dict; see _override_value for how each value is typed."""
+    config dict, or `field=value` for a top-level field such as run_name — which is what gives each
+    chained RLAIF round its own W&B run without editing the YAML. See _override_value for how each
+    value is typed."""
+    sections = {f.name for f in fields(Config) if is_dataclass(globals().get(f.type, f.type))}
     for assignment in assignments:
         if "=" not in assignment:
             raise ValueError(f"--set expects dotted.key=value, got {assignment!r}")
         key, _, value = assignment.partition("=")
         section, _, field_name = key.strip().partition(".")
         if not field_name:
-            raise ValueError(f"--set key must name a section, e.g. model.d_model, got {key!r}")
+            if section in sections or _field_type(Config, section) is None:
+                raise ValueError(
+                    f"--set key must name a section field (e.g. model.d_model) or a top-level "
+                    f"field (e.g. run_name), got {key!r}"
+                )
+            raw[section] = _override_value(None, section, value)
+            continue
         # `or {}`: a bare `sft:` line in the YAML loads as None, not as an empty section.
         raw[section] = raw.get(section) or {}
         raw[section][field_name] = _override_value(section, field_name, value)

@@ -14,6 +14,8 @@ from radiance.config import Config, doc_mask_is_inert_for_dpo, resolve_device, r
 from radiance.model import load_transformer_from_checkpoint, sequence_logprob_sum
 
 from .sft_data import (
+    RLAIF_MANIFEST_NAME,
+    RLAIF_PROMPT_IDS_VERSION,
     load_chat_dataset,
     select_splits,
     split_key_extras,
@@ -481,11 +483,9 @@ def check_rlaif_manifest(cfg: Config) -> None:
     the ones they were sampled with (recorded in the pair directory's manifest). The pairs are
     on-policy only as exact continuations of the prompt the policy saw; rebuilt under other turn
     markers they are off-policy text, and their token ids mean nothing under another vocabulary —
-    both silently. A dataset without a manifest is not radiance-rlaif output."""
-    # Local import: rlaif imports the generation stack, which nothing else here needs.
-    from radiance.rlaif import MANIFEST_NAME
-
-    manifest_path = Path(cfg.dpo.dataset) / MANIFEST_NAME
+    both silently. Likewise pairs sampled after an older tokenize_chat_prompt's prompt ids. A
+    dataset without a manifest is not radiance-rlaif output."""
+    manifest_path = Path(cfg.dpo.dataset) / RLAIF_MANIFEST_NAME
     if not manifest_path.is_file():
         return
     manifest = json.loads(manifest_path.read_text())
@@ -494,6 +494,16 @@ def check_rlaif_manifest(cfg: Config) -> None:
         raise ValueError(
             f"dpo.dataset {cfg.dpo.dataset!r} holds radiance-rlaif pairs whose token ids are "
             f"{sampled_tokenizer!r} ids, but this config's data.tokenizer is {cfg.data.tokenizer!r}."
+        )
+    # A recorded tokenizer means the pairs carry sampled token ids, which are continuations of the
+    # exact prompt ids they were sampled after — and rebuilt on today's prompt ids they would not be.
+    version = manifest.get("prompt_ids_version", 1)
+    if sampled_tokenizer is not None and version != RLAIF_PROMPT_IDS_VERSION:
+        raise ValueError(
+            f"dpo.dataset {cfg.dpo.dataset!r} holds radiance-rlaif pairs sampled after version-"
+            f"{version} prompt ids, but this radiance builds version-{RLAIF_PROMPT_IDS_VERSION} ones "
+            "(see sft_data.RLAIF_PROMPT_IDS_VERSION), so their sampled ids no longer follow the "
+            "prompt they would be trained after. Re-run radiance-rlaif pairs to regenerate them."
         )
     template = manifest.get("turn_template")
     if template is None:  # written before the template was recorded

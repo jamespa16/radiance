@@ -10,7 +10,7 @@ import torch
 import yaml
 
 from radiance.checkpointing import save_checkpoint
-from radiance.config import Config, DataConfig, DPOConfig, ModelConfig, TrainConfig, load_config, load_config_with_overrides
+from radiance.config import Config, DataConfig, ModelConfig, TrainConfig, load_config, load_config_with_overrides
 from radiance.export import export_checkpoint, read_checkpoint_config
 from radiance.losses import validate_post_training_config
 from radiance.model import DenseTransformer
@@ -66,40 +66,27 @@ def test_inherit_respects_an_explicit_tokenizer_and_reads_exports(tmp_path):
     assert cfg.model.d_model == 32 and cfg.data.tokenizer == "explicit"
 
 
-def test_a_dpo_runs_resolved_doc_mask_is_not_inherited(tmp_path):
-    # resolve_dpo_doc_mask saves doc_attention_mask=False into every DPO checkpoint; an SFT stage
-    # started from one must not inherit that, or its packed conversations attend to each other.
-    model_cfg = ModelConfig(d_model=32, head_dim=8, n_layers=2, max_seq_len=32, doc_attention_mask=False)
-    cfg = Config(data=DataConfig(tokenizer="t"), model=model_cfg, train=TrainConfig(device="cpu", compile=False))
-    cfg.dpo.enabled = True
-    model = DenseTransformer(model_cfg, vocab_size=64)
+def test_run_time_model_fields_are_not_inherited(tmp_path):
+    # How the source run trained — its numeric format (fp4_* comes from train.dtype: nvfp4), loss
+    # weights, regularisation, and doc mask — is not architecture: a stage takes its own.
+    source = ModelConfig(
+        d_model=32, head_dim=8, n_layers=2, max_seq_len=32,
+        fp4_linear=True, dropout=0.0, z_loss_weight=0.0, doc_attention_mask=False, grad_checkpoint=True,
+    )
+    cfg = Config(data=DataConfig(tokenizer="t"), model=source, train=TrainConfig(device="cpu", compile=False))
+    model = DenseTransformer(ModelConfig(d_model=32, head_dim=8, n_layers=2, max_seq_len=32), vocab_size=64)
     opt = build_optimizer(model, cfg, "cpu")
-    ckpt = tmp_path / "dpo.pt"
+    ckpt = tmp_path / "base.pt"
     save_checkpoint(ckpt, model, opt, build_lr_scheduler(opt, cfg), torch.amp.GradScaler("cpu", enabled=False), 0, cfg)
-    raw = {"train": {"init_from": str(ckpt), "inherit_model_config": True}, "sft": {"enabled": True}}
-    assert load_config(_write(tmp_path, raw)).model.doc_attention_mask is True
-    # ...while a non-DPO source's explicit choice is inherited as-is.
-    cfg.dpo.enabled = False
-    save_checkpoint(ckpt, model, opt, build_lr_scheduler(opt, cfg), torch.amp.GradScaler("cpu", enabled=False), 0, cfg)
-    assert load_config(_write(tmp_path, raw)).model.doc_attention_mask is False
-    # ...and so is a DPO source's, once it recorded that the architecture itself had the mask off.
-    cfg.dpo.enabled = True
-    cfg.dpo.doc_attention_mask_before_resolve = False
-    save_checkpoint(ckpt, model, opt, build_lr_scheduler(opt, cfg), torch.amp.GradScaler("cpu", enabled=False), 0, cfg)
-    assert load_config(_write(tmp_path, raw)).model.doc_attention_mask is False
-
-
-def test_resolve_dpo_doc_mask_records_what_it_overrode():
-    from radiance.losses import resolve_dpo_doc_mask
-
-    cfg = Config(dpo=DPOConfig(enabled=True))
-    resolve_dpo_doc_mask(cfg)
-    assert cfg.model.doc_attention_mask is False and cfg.dpo.doc_attention_mask_before_resolve is True
-
-    # An architecture without the mask is recorded too: that is the case inheritance must keep off.
-    cfg = Config(model=ModelConfig(doc_attention_mask=False), dpo=DPOConfig(enabled=True))
-    resolve_dpo_doc_mask(cfg)
-    assert cfg.dpo.doc_attention_mask_before_resolve is False
+    raw = {"train": {"init_from": str(ckpt), "inherit_model_config": True, "dtype": "bf16"}, "sft": {"enabled": True}}
+    inherited = load_config(_write(tmp_path, raw)).model
+    default = ModelConfig()
+    assert inherited.d_model == 32 and inherited.n_layers == 2
+    for name in ("fp4_linear", "dropout", "z_loss_weight", "doc_attention_mask", "grad_checkpoint"):
+        assert getattr(inherited, name) == getattr(default, name), name
+    # ...unless the stage spells one out.
+    raw["model"] = {"dropout": 0.0}
+    assert load_config(_write(tmp_path, raw)).model.dropout == 0.0
 
 
 def test_a_resumed_stage_inherits_from_its_resume_checkpoint(tmp_path):
@@ -194,3 +181,13 @@ def test_overrides_fill_an_empty_section_and_need_no_writable_config_dir(tmp_pat
     finally:
         tmp_path.chmod(0o700)
     assert cfg.sft.enabled and cfg.train.max_steps == 3
+
+
+def test_set_overrides_a_top_level_field(tmp_path):
+    # Each chained RLAIF round needs its own run_name; it is the one top-level Config field.
+    path = _write(tmp_path, {"run_name": "round1", "train": {"max_steps": 10}})
+    cfg = load_config_with_overrides(path, ["run_name=rlaif_round2"])
+    assert cfg.run_name == "rlaif_round2"
+    for bad in ("model=3", "no_such_field=1"):
+        with pytest.raises(ValueError, match="section field"):
+            load_config_with_overrides(path, [bad])

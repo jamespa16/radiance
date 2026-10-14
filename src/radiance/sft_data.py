@@ -88,26 +88,38 @@ def select_splits(
     return train, val
 
 
+# radiance-rlaif's pair directories carry this manifest; defined here rather than in rlaif.py so
+# the data pipelines can recognise one without importing the generation stack.
+RLAIF_MANIFEST_NAME = "rlaif_manifest.json"
+# Bumped when tokenize_chat_prompt's prompt ids change, since radiance-rlaif pairs store sampled
+# ids that are only valid after the exact prompt they were sampled with. 2: the assistant prefix's
+# merged-away tail (gpt2's bare-space token) is left to the policy instead of ending the prompt.
+RLAIF_PROMPT_IDS_VERSION = 2
+
+
 def local_dataset_fingerprint(dataset: str) -> str | None:
-    """An identity for a *local* dataset's contents (latest mtime + total size over its files), or
-    None for a hub id. Cache keys built from the path alone go stale the moment the directory is
-    rewritten — which is the normal case for radiance-rlaif, whose round-N output directory is
-    regenerated in place. Same path+mtime+size idea dpo_data uses for the reference checkpoint."""
+    """An identity for a radiance-rlaif pair directory's contents (latest mtime + total size over
+    its files), or None for anything else. Cache keys built from the path alone go stale the moment
+    the directory is rewritten — the normal case for radiance-rlaif, whose round-N output directory
+    is regenerated in place. Same path+mtime+size idea dpo_data uses for the reference checkpoint.
+
+    Limited to rlaif output (recognised by its manifest) so every other local dataset keeps the
+    path-only key it had before this existed: fingerprinting those too would orphan their caches,
+    and with them DPO reference log-probs that cannot be recomputed once the reference checkpoint
+    is gone. A hand-maintained local dataset rewritten in place still needs its cache cleared."""
     path = Path(dataset)
-    if path.is_file():
-        files = [path]
-    elif path.is_dir():
-        files = [p for p in path.rglob("*") if p.is_file()]
-    else:
+    if not (path / RLAIF_MANIFEST_NAME).is_file():
         return None
+    files = [p for p in path.rglob("*") if p.is_file()]
     stats = [p.stat() for p in files]
     return f"{max((s.st_mtime for s in stats), default=0)}|{sum(s.st_size for s in stats)}"
 
 
 def split_key_extras(section) -> list[str]:
-    """Cache-key parts for the split/subset/max_examples fields, and a local dataset's
-    fingerprint — each included only when it differs from its default, so every cache key built
-    before these fields existed hashes exactly as it did and those caches stay valid."""
+    """Cache-key parts for the split/subset/max_examples fields, and a radiance-rlaif pair
+    directory's fingerprint — each included only when it differs from its default (or, for the
+    fingerprint, only for rlaif output), so every cache key built before these existed hashes
+    exactly as it did and those caches stay valid."""
     extras = []
     if section.subset is not None:
         extras.append(f"subset={section.subset}")
@@ -175,8 +187,15 @@ def tokenize_chat_prompt(
 ) -> tuple[list[int], list[int]]:
     """A conversation plus an open assistant turn, as (ids, loss_mask): the token-level form of
     format_chat_messages, built turn by turn exactly as tokenize_sft_example builds them (and with
-    its mask, so the open turn's prefix tokens are 1, as an assistant turn's are). The prefix is
-    tokenized on its own, there being no content yet to tokenize it with.
+    its mask, so the open turn's prefix tokens are 1, as an assistant turn's are).
+
+    The open prefix stops at the last token a reply leaves alone. SFT tokenizes prefix and reply
+    together, and BPE merges the prefix's tail into the reply's first word: with gpt2,
+    "\\n\\nAssistant: " alone ends in a bare-space token (220), but "\\n\\nAssistant: Hello" ends
+    ":", " Hello" — so a prompt ending in 220 is one SFT never trained after. Dropping the
+    merged-away tail (found by tokenizing the prefix with a probe word after it) leaves the policy
+    to sample " Hello" itself, as it learned to; a reply that does start with whitespace can still
+    produce the bare token.
 
     radiance-rlaif samples after these ids and the DPO pipeline rebuilds its pairs on them, which
     is what makes a pair the policy's own token sequence rather than a re-tokenization of its text.
@@ -184,6 +203,11 @@ def tokenize_chat_prompt(
     ids, mask = tokenize_sft_example(messages, tokenizer, user_prefix, assistant_prefix)
     ids, mask = ids[:-1], mask[:-1]  # the conversation is not over: no EOS
     prefix = tokenizer(assistant_prefix)["input_ids"]
+    probe = tokenizer(assistant_prefix + "Hello")["input_ids"]
+    keep = 0
+    while keep < len(prefix) and keep < len(probe) and prefix[keep] == probe[keep]:
+        keep += 1
+    prefix = prefix[:keep]
     return ids + prefix, mask + [1] * len(prefix)
 
 

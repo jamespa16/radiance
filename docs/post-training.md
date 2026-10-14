@@ -36,9 +36,10 @@ Three pieces make that work without hand-editing:
   `config.load_config_with_overrides`). Overrides are applied to the raw YAML and go through `load_config` itself, so
   its cross-field checks and `inherit_model_config` see them. Repeatable (`--set a=1 --set b=2` keeps both). Values
   are parsed as YAML, except a string-typed field's, which is taken verbatim: YAML would make `dpo.dataset=2026-10-14`
-  a date and cut `a #b` at the comment.
-- **`train.inherit_model_config`** — the `model:` section (and `data.tokenizer`) comes from `init_from`'s own saved
-  config, with only the keys this YAML's `model:` spells out applied on top. A resuming run reads the resume
+  a date and cut `a #b` at the comment. A top-level field takes no section — `--set run_name=rlaif_round2` — which is
+  how each RLAIF round gets its own W&B run.
+- **`train.inherit_model_config`** — the model *architecture* (and `data.tokenizer`) comes from `init_from`'s own
+  saved config, with only the keys this YAML's `model:` spells out applied on top. A resuming run reads the resume
   checkpoint's instead, which already holds the inherited config, so a resume no longer needs `init_from` to exist,
   or to be unchanged. Before it, every post-training config
   carried a hand copy of the base's `model:` block, and `load_pretrained_weights` only checks *shape* fields: a copy
@@ -46,11 +47,13 @@ Three pieces make that work without hand-editing:
   from the one pretrained. Opt-in, because it is not inert — an existing config's *omitted* model keys would change
   from the dataclass defaults to the checkpoint's values. Resolved in `load_config` (only the raw YAML knows which
   keys were written down), and cheaply: `export.read_checkpoint_config` mmaps the `.pt`, or reads an export's
-  `config.json` alone. One field is deliberately *not* inherited as saved from a DPO checkpoint: `doc_attention_mask:
-  false` there is `resolve_dpo_doc_mask`'s per-run resolution, and an SFT stage inheriting it would let its packed
-  conversations attend to each other. `resolve_dpo_doc_mask` records the value it overrode in
-  `dpo.doc_attention_mask_before_resolve`, and that is what is inherited — so an architecture that genuinely had the
-  mask off keeps it off. A DPO checkpoint saved before that field existed falls back to the default (on).
+  `config.json` alone. Fields that are how the source run *trained* rather than what its weights compute
+  (`config._RUN_TIME_MODEL_FIELDS`: the `fp4_*` numeric format, loss weights such as `z_loss_weight`, `dropout`,
+  `grad_checkpoint`, `loop_bptt_window`, `doc_attention_mask`) are not inherited: they come from this stage's YAML or
+  their defaults. Inherited, they would carry over silently — `fp4_linear` is resolved from `train.dtype: nvfp4`, so a
+  bf16 SFT stage off an NVFP4 base would train on FP4 GEMMs, and a DPO checkpoint from before `dpo_model_config`
+  stopped writing its doc-mask skip back holds `doc_attention_mask: false`, which would let an SFT stage's packed
+  conversations attend to each other.
 - **`dpo.reference_checkpoint` defaults to `train.init_from`** (`Config.resolved_reference_checkpoint`) — a
   range-collapsed default: a config naming the reference is unaffected, and one naming neither still raises.
 
@@ -71,9 +74,12 @@ pipelines hard-coded; `HuggingFaceTB/smoltalk` needs a config name. Selection is
 shuffle (hub datasets are often sorted by source, so a head would be one source).
 
 `dataset` may also be local: a `save_to_disk` directory or a `.json`/`.jsonl` file (`sft_data.load_chat_dataset`).
-That is how `radiance-rlaif` output reaches DPO. A local dataset's cache key includes a fingerprint of its files
-(latest mtime + total size, the same identity idea the reference-checkpoint key uses), because the path alone goes
-stale the moment the directory is regenerated in place.
+That is how `radiance-rlaif` output reaches DPO. A `radiance-rlaif` directory's cache key includes a fingerprint of
+its files (latest mtime + total size, the same identity idea the reference-checkpoint key uses), because the path
+alone goes stale the moment a round's directory is regenerated in place. Only rlaif output (recognised by its
+`rlaif_manifest.json`) gets one: any other local dataset keeps the path-only key it always had, so its existing
+caches — DPO reference log-probs among them, which cannot be rebuilt once the reference checkpoint is gone — are still
+found. Rewriting such a dataset in place still needs its cache cleared by hand.
 
 **Every pre-existing cache key is unchanged**: the new fields join the key only when they differ from their defaults
 (`split_key_extras`), and `tests/test_post_training_datasets.py` pins the old SFT key formula verbatim.
@@ -184,16 +190,16 @@ unlike SFT's genuinely-multi-document blocks, where `doc_attention_mask` *is* lo
 CPU smoke run's step-1 DPO loss came out at exactly `log(2) = 0.6931`, the value the loss must take when the policy
 hasn't moved from the reference yet — plain SDPA on CPU, no doc masking involved.
 
-So `train.resolve_dpo_doc_mask` **turns it off** for a DPO run, rather than leaving a default-on feature to build a
+So `losses.dpo_model_config` **turns it off** for a DPO run, rather than leaving a default-on feature to build a
 mask nothing reads. Precisely (`config.doc_mask_is_inert_for_dpo`): `document_ids`' exclusive cumsum puts all of a
 row's real content — including the single scored EOS terminating it — in document 0, and each padding EOS in a
 document of its own, so the only attention the mask removes belongs to a padded position, and no padded position
-contributes a scored logit. It is turned off before the model is built, which matters twice over: `DenseTransformer`
-reads `cfg.model` by reference, and `doc_attention_mask` is one of the three things that force `resolve_compile_mode`
-down to `mode=None` — so a DPO run gets CUDA graphs back, which is the larger half of what this is worth (the other
+contributes a scored logit. The model is built from a copy of `cfg.model` with the mask off, which matters because
+`doc_attention_mask` is one of the three things that force `resolve_compile_mode` down to `mode=None` — so a DPO run gets CUDA graphs back, which is the larger half of what this is worth (the other
 half is one skipped `BlockMask` build per step, plus one per reference-precompute batch — `data._add_reference_logprobs`
-applies the same skip to the reference model's own config). Because it mutates `cfg`, the value saved into the
-checkpoint is the one the run actually trained with.
+applies the same skip to the reference model's own config). A copy, not a mutation of `cfg`: the skip is a property
+of this run's packing, not of the weights, so the checkpoint saves the architecture's own value, and a later stage
+that packs several examples per block (SFT after DPO) gets its mask back.
 
 **`loop_attn_windows` is the exception**, and the reason this is a predicate and not a bare `cfg.dpo.enabled`: windows
 ride the very same `BlockMask`, and a sliding window restricts attention *within* document 0, which real DPO content
@@ -285,7 +291,7 @@ either way; a base with dropout is not.)
 
 Considered and rejected. Mutual exclusion is centrally enforced (`validate_post_training_config` raises if both are
 set), and every dispatch site that branches on the two booleans — `estimate_batch_size`, `build_loss_fn`,
-`chunk_reduction_units`/`split_micro_batch`, `chunk_loss_and_metrics`, `resolve_dpo_doc_mask`'s predicate, `train()`'s
+`chunk_reduction_units`/`split_micro_batch`, `chunk_loss_and_metrics`, `dpo_model_config`'s predicate, `train()`'s
 own loader/loss-fn dispatch, `Config.resolved_seq_len`/`train_width_multiplier`, and `data.format_chat_prompt` — was
 individually audited and is already correctly guarded; there is no live bug from the two-boolean shape today, only
 repeated (not inconsistent) `if dpo.enabled: ... elif sft.enabled: ...` structure. A `PostTrainingMode` enum would
@@ -323,20 +329,34 @@ default judge: "Paris" for the capital of France scored 2.66, "Berlin" -4.41, "b
   be rejected but never chosen: the DPO tokenizer appends EOS to both sides, so a truncated
   "chosen" would teach the policy to stop mid-sentence. Best-vs-worst is the pair the judge is most sure of, and one
   pair per prompt keeps prompts equally weighted.
-- **identical sides are skipped** (common at low temperature): such a pair has exactly zero gradient and only dilutes
-  the batch mean.
+- **identical sides are skipped** (common at low temperature), compared after stripping edge whitespace, which the
+  judge never sees: such a pair carries no preference and only dilutes the batch mean. So is a **non-positive
+  margin** — an exact tie, which would otherwise pass the default `--min-margin 0`.
 - **`--min-margin`** drops pairs below a judge-score margin at write time; `dpo.min_score_margin` does the same at
   train time, so one sampled round can be re-filtered without re-sampling. Every sample and score is kept in the
   output (`completions`, `completion_scores`, `completion_finished`) for the same reason.
 
-**The pairs are the policy's own token sequences.** Re-tokenizing sampled text is not: with GPT-2's BPE the policy
-samples after `":", " "` (the assistant prefix's trailing space as its own token), but `"Assistant: Hello"`
-re-tokenizes as `":", " Hello"` — a sequence it never produced, which DPO would then score. So the prompt is
-tokenized turn by turn (`sft_data.tokenize_chat_prompt`, the same construction `tokenize_sft_example` uses), sampling
-runs after those ids, and `pairs` writes the sampled ids beside the text (`chosen_token_ids`, `rejected_token_ids`,
-`completion_token_ids`). The DPO pipeline, given a row with them and `prompt_column` set, rebuilds the prompt with
-the same function and appends the ids plus EOS instead of re-tokenizing. The text (decoded jointly with the prompt and
-split off it, `_decode_completion`) is what the judge scores and a reader sees.
+**The pairs are the policy's own token sequences.** Re-tokenizing sampled text is not: BPE can merge the sampled
+tokens differently once they are text again, and DPO would then score a sequence the policy never produced. So the
+prompt is tokenized turn by turn (`sft_data.tokenize_chat_prompt`, the same construction `tokenize_sft_example`
+uses), sampling runs after those ids, and `pairs` writes the sampled ids beside the text (`chosen_token_ids`,
+`rejected_token_ids`, `completion_token_ids`). The DPO pipeline, given a row with them and `prompt_column` set,
+rebuilds the prompt with the same function and appends the ids plus EOS instead of re-tokenizing. The text (decoded
+jointly with the prompt and split off the full formatted prompt, `_decode_completion`) is what the judge scores and
+a reader sees.
+
+**The open prompt ends where SFT's tokens do.** With GPT-2, `"\n\nAssistant: "` tokenized alone ends in a bare-space
+token (220), but SFT tokenizes prefix and reply together, and there the space merges into the first word
+(`":", " Hello"`) — so a prompt ending in 220 is a position SFT never trained after. `tokenize_chat_prompt` drops the
+prefix's merged-away tail (found by tokenizing the prefix with a probe word after it), leaving the policy to sample
+`" Hello"` itself; a reply that genuinely starts with whitespace can still produce the bare token. Pairs sampled
+before this follow the old prompt ids, so the manifest records `prompt_ids_version` and the DPO pipeline refuses
+token-id pairs from an older version rather than splice them onto a prompt they were not sampled after.
+
+**Sampling prefills each prompt once.** `--batch-size` counts sequences, so a batch holds `batch_size // num_samples`
+prompts; `generate_tokens_batched(samples_per_item=K)` prefills each and expands its KV cache across its K samples,
+instead of paying K identical prefills. `load_prompts` reads the shuffled prompt column in slices and stops at
+`--max-prompts`, so `eval`'s 500-prompt default does not decode a million-row column first.
 
 That only holds under the turn template and tokenizer the policy was sampled with (its own `sft.*`, or `dpo.*` for a
 DPO or plain checkpoint), so `pairs` records both in `rlaif_manifest.json` and the DPO pipeline refuses to train the
@@ -400,7 +420,7 @@ data pipeline, the loss (including the policy-equals-reference equivalence check
 observation), and the precompute pass; `tests/test_sft_train_e2e.py` and `tests/test_dpo_train_e2e.py` run
 `train.train()` itself end-to-end (tiny model, faked dataset/tokenizer, CPU) for each mode, checking the loss
 actually decreases and the resulting checkpoint reloads and forwards cleanly — the DPO one also pins that
-`resolve_dpo_doc_mask` fires inside a full run and that the reference-logprob precompute populates `dpo.cache_dir`.
+`dpo_model_config` applies inside a full run and that the reference-logprob precompute populates `dpo.cache_dir`.
 `tests/test_post_training_datasets.py` covers split selection, local datasets, cache-key stability, hh-rlhf
 parsing and the score filter; `tests/test_preference_losses.py` the loss variants and val accuracies;
 `tests/test_rlaif.py` the pairing rules, sampling bookkeeping, and that `pairs` output loads as a DPO dataset with no

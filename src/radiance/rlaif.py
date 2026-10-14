@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -42,12 +41,20 @@ from datasets import Dataset, DatasetDict
 from transformers import PreTrainedTokenizerBase
 
 from radiance.config import Config, resolve_device, set_seed
+from radiance.evaluation import standard_error
 from radiance.generate import BatchItem, generate_tokens_batched, load_checkpoint
 from radiance.model import DenseTransformer
-from radiance.sft_data import load_chat_dataset, tokenize_chat_prompt
+from radiance.sft_data import (
+    RLAIF_MANIFEST_NAME as MANIFEST_NAME,
+    RLAIF_PROMPT_IDS_VERSION,
+    load_chat_dataset,
+    tokenize_chat_prompt,
+)
 
 DEFAULT_JUDGE = "Skywork/Skywork-Reward-V2-Qwen3-0.6B"
-MANIFEST_NAME = "rlaif_manifest.json"
+# Rows read per slice while collecting prompts: large enough that slicing overhead is noise, small
+# enough that a capped run reads a few thousand rows of a million-row dataset, not all of them.
+_PROMPT_READ_CHUNK = 1024
 
 
 @dataclass
@@ -77,18 +84,21 @@ def load_prompts(
     raw = load_chat_dataset(dataset, subset)
     if split not in raw:
         raise ValueError(f"dataset {dataset!r} has no {split!r} split (it has: {', '.join(raw.keys())})")
-    rows = raw[split].shuffle(seed=seed)
+    rows = raw[split].select_columns([column]).shuffle(seed=seed)
     prompts: list[str] = []
     seen: set[str] = set()
-    for value in rows[column]:
-        if isinstance(value, list):
-            value = next((m["content"] for m in value if m["role"] == "user"), None)
-        if not value or value in seen:
-            continue
-        seen.add(value)
-        prompts.append(value)
-        if max_prompts is not None and len(prompts) >= max_prompts:
-            break
+    # Read in slices and stop at the cap: rows[column] would decode the whole shuffled column
+    # (every message list of a ~1M-row dataset) before the cap applied.
+    for start in range(0, len(rows), _PROMPT_READ_CHUNK):
+        for value in rows[start : start + _PROMPT_READ_CHUNK][column]:
+            if isinstance(value, list):
+                value = next((m["content"] for m in value if m["role"] == "user"), None)
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            prompts.append(value)
+            if max_prompts is not None and len(prompts) >= max_prompts:
+                return prompts
     return prompts
 
 
@@ -127,31 +137,35 @@ def sample_completions(
     """`num_samples` completions per prompt, batched through generate_tokens_batched. None for a
     prompt whose formatted length leaves no room for max_new_tokens in the model's context.
 
+    `batch_size` counts sequences, so each batch holds batch_size // num_samples prompts; each
+    prompt is prefilled once and its KV cache shared by its num_samples rows (samples_per_item).
+
     Generates one token past max_new_tokens: generate_tokens_batched ends a row at its budget
     without saying whether the token it sampled there was EOS, so a response that used exactly
     max_new_tokens and then stopped would otherwise count as unfinished. A row that runs into the
     extra token is unfinished, and is cut back to max_new_tokens."""
     template = turn_template(_chat_cfg(cfg))
     budget = model.cfg.max_seq_len - (max_new_tokens + 1)
+    prompt_texts = [template["user_prefix"] + p + template["assistant_prefix"] for p in prompts]
     prompt_ids = [
         tokenize_chat_prompt(
             [{"role": "user", "content": p}], tokenizer, template["user_prefix"], template["assistant_prefix"]
         )[0]
         for p in prompts
     ]
-    work = [(i, s) for i, ids in enumerate(prompt_ids) if len(ids) <= budget for s in range(num_samples)]
+    work = [i for i, ids in enumerate(prompt_ids) if len(ids) <= budget]
     results: list[list[Completion] | None] = [None] * len(prompts)
-    for i, ids in enumerate(prompt_ids):
-        if len(ids) <= budget:
-            results[i] = []
-    n_skipped = sum(r is None for r in results)
+    for i in work:
+        results[i] = []
+    n_skipped = len(prompts) - len(work)
     if n_skipped:
         print(f"[radiance] rlaif: skipped {n_skipped} prompts longer than max_seq_len - max_new_tokens = {budget}")
 
     model.eval()
     use_autocast = device.startswith("cuda")
-    for start in range(0, len(work), batch_size):
-        chunk = work[start : start + batch_size]
+    prompts_per_batch = max(1, batch_size // num_samples)
+    for start in range(0, len(work), prompts_per_batch):
+        chunk = work[start : start + prompts_per_batch]
         items = [
             BatchItem(
                 input_ids=torch.tensor([prompt_ids[i]], device=device),
@@ -159,31 +173,43 @@ def sample_completions(
                 temperature=temperature,
                 top_k=top_k,
             )
-            for i, _ in chunk
+            for i in chunk
         ]
-        generated: list[list[int]] = [[] for _ in chunk]
+        # Row r is sample r % num_samples of prompt chunk[r // num_samples].
+        generated: list[list[int]] = [[] for _ in range(len(chunk) * num_samples)]
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_autocast):
-            for step in generate_tokens_batched(model, tokenizer, items, device=device):
+            for step in generate_tokens_batched(
+                model, tokenizer, items, device=device, samples_per_item=num_samples
+            ):
                 for row, token in step:
                     if token is not None:
                         generated[row].append(token)
-        for (i, _), gen in zip(chunk, generated):
+        for row, gen in enumerate(generated):
+            i = chunk[row // num_samples]
             finished = len(gen) <= max_new_tokens
             gen = gen[:max_new_tokens]
-            results[i].append(Completion(_decode_completion(tokenizer, prompt_ids[i], gen), finished, gen))
-        print(f"[radiance] rlaif: sampled {min(start + batch_size, len(work))}/{len(work)} completions", flush=True)
+            text = _decode_completion(tokenizer, prompt_ids[i], gen, prompt_texts[i])
+            results[i].append(Completion(text, finished, gen))
+        done = min(start + prompts_per_batch, len(work)) * num_samples
+        print(f"[radiance] rlaif: sampled {done}/{len(work) * num_samples} completions", flush=True)
     return results
 
 
-def _decode_completion(tokenizer: PreTrainedTokenizerBase, prompt_ids: list[int], gen: list[int]) -> str:
+def _decode_completion(
+    tokenizer: PreTrainedTokenizerBase, prompt_ids: list[int], gen: list[int], prompt_text: str
+) -> str:
     """The completion as the text that follows the prompt — decoded jointly with the prompt and
     then split off it, for the reason generate.generate gives (a BPE decode of a continuation is
     not always its decode in isolation). This is what the judge scores and what a reader sees;
-    the DPO pipeline trains on the Completion's token_ids instead."""
+    the DPO pipeline trains on the Completion's token_ids instead.
+
+    Split off `prompt_text` (the full formatted prompt) first, not just the decode of prompt_ids:
+    tokenize_chat_prompt leaves the assistant prefix's trailing space for the policy to sample as
+    part of its first word, and that space belongs to the template, not the reply."""
     full = tokenizer.decode(prompt_ids + gen, skip_special_tokens=True)
-    prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=True)
-    if full.startswith(prompt_text):
-        return full[len(prompt_text) :]
+    for prefix in (prompt_text, tokenizer.decode(prompt_ids, skip_special_tokens=True)):
+        if full.startswith(prefix):
+            return full[len(prefix) :]
     return tokenizer.decode(gen, skip_special_tokens=True)
 
 
@@ -265,8 +291,10 @@ def build_preference_pairs(
     Best-vs-worst rather than all pairs or best-vs-random because it takes the pair the judge is
     most confident about — the one least likely to be label noise — and one pair per prompt keeps
     each prompt's weight equal. A prompt is skipped when it has no finished completion, when the
-    two sides are the same text (at low temperature, common: such a pair has zero gradient and
-    only dilutes the batch mean), or when the score margin is below `min_margin`.
+    two sides are the same text once stripped (at low temperature, common: such a pair carries no
+    preference and only dilutes the batch mean — and edge whitespace is not something the judge
+    sees, see score_completions), when the margin is not positive (a tie, or a finished best
+    outscored by every unfinished sample), or when it is below `min_margin`.
     """
     pairs = []
     for prompt, comps, comp_scores in zip(prompts, completions, scores):
@@ -277,9 +305,10 @@ def build_preference_pairs(
             continue
         best = max(finished, key=lambda i: comp_scores[i])
         worst = min((i for i in range(len(comps)) if i != best), key=lambda i: comp_scores[i])
-        if comps[best].text == comps[worst].text:
+        if comps[best].text.strip() == comps[worst].text.strip():
             continue
-        if comp_scores[best] - comp_scores[worst] < min_margin:
+        margin = comp_scores[best] - comp_scores[worst]
+        if margin <= 0 or margin < min_margin:
             continue
         pair = {
             "prompt": prompt,
@@ -303,11 +332,9 @@ def build_preference_pairs(
     return pairs
 
 
-def _mean_stderr(values: list[float]) -> tuple[float, float]:
-    n = len(values)
-    mean = sum(values) / n
-    var = sum((v - mean) ** 2 for v in values) / (n - 1) if n > 1 else 0.0
-    return mean, math.sqrt(var / n)
+def _mean_stderr(values: list[float]) -> tuple[float, float | None]:
+    mean = sum(values) / len(values)
+    return mean, standard_error(values, mean)
 
 
 def _sample_from_checkpoint(path: str, prompts: list[str], args, num_samples: int, device: str):
@@ -321,7 +348,11 @@ def _sample_from_checkpoint(path: str, prompts: list[str], args, num_samples: in
     del model
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
-    return completions, {"turn_template": turn_template(cfg), "tokenizer": cfg.data.tokenizer}
+    return completions, {
+        "turn_template": turn_template(cfg),
+        "tokenizer": cfg.data.tokenizer,
+        "prompt_ids_version": RLAIF_PROMPT_IDS_VERSION,
+    }
 
 
 def run_pairs(args) -> None:
@@ -386,13 +417,14 @@ def win_rates(
 ) -> float:
     """Fraction of prompts where `other` outscores `baseline`, ties counting half.
 
-    Identical completions are ties whatever their scores: the judge runs in bf16 and its score for
-    a given text moves by ~0.03 with the rest of its padded batch, so without this, two checkpoints
-    that wrote the same answer would be separated by numerical noise.
+    Identical completions (compared stripped, as the judge sees them) are ties whatever their
+    scores: the judge runs in bf16 and its score for a given text moves by ~0.03 with the rest of
+    its padded batch, so without this, two checkpoints that wrote the same answer would be
+    separated by numerical noise.
     """
     wins = 0.0
     for i, (b, o) in enumerate(zip(baseline, other)):
-        if baseline_texts is not None and baseline_texts[i] == other_texts[i]:
+        if baseline_texts is not None and baseline_texts[i].strip() == other_texts[i].strip():
             wins += 0.5
         else:
             wins += 1.0 if o > b else 0.5 if o == b else 0.0
@@ -439,7 +471,8 @@ def run_eval(args) -> None:
             row["win_rate_vs_first"] = win_rates(rewards[0], r, texts[0], t)
         report.append(row)
         print(
-            f"[radiance] {path}: reward {mean:.3f} ± {stderr:.3f}"
+            f"[radiance] {path}: reward {mean:.3f}"
+            + (f" ± {stderr:.3f}" if stderr is not None else "")
             + (f", win rate vs {args.checkpoint[0]} {row['win_rate_vs_first']:.3f}" if len(rewards) > 1 else "")
             + f", finished {row['finished_fraction']:.2f}"
         )

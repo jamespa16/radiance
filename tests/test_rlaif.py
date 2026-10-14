@@ -21,7 +21,7 @@ from radiance.config import Config, DataConfig, DPOConfig, ModelConfig, SFTConfi
 from radiance.dpo_data import _load_or_build_dpo_packed
 from radiance.model import DenseTransformer
 from radiance.rlaif import Completion, build_preference_pairs, sample_completions, score_completions, win_rates
-from radiance.sft_data import tokenize_chat_prompt
+from radiance.sft_data import tokenize_chat_prompt, tokenize_sft_example
 from tests._fake_tokenizer import WordTokenizer
 
 VOCAB = 64
@@ -73,6 +73,14 @@ def test_skips_identical_sides_small_margins_and_skipped_prompts():
     assert build_preference_pairs(["p", "q"], [None, [_c("a")]], [None, [1.0]]) == []
 
 
+def test_sides_differing_only_in_edge_whitespace_or_tied_are_skipped():
+    # The judge scores stripped text, so these two are one answer with bf16 noise between them.
+    assert build_preference_pairs(["p"], [[_c("Sure."), _c("Sure. ")]], [[1.02, 1.0]]) == []
+    # An exact tie carries no preference either, even at the default min_margin=0.0.
+    assert build_preference_pairs(["p"], [[_c("a"), _c("b")]], [[1.0, 1.0]]) == []
+    assert len(build_preference_pairs(["p"], [[_c("a"), _c("b")]], [[1.0, 0.9]])) == 1
+
+
 def test_score_completions_regroups_in_order_and_skips_none():
     judge = _LengthJudge()
     comps = [[_c("one"), _c("one two")], None, [_c("  one two three  ")]]
@@ -87,6 +95,35 @@ def test_win_rates_count_ties_as_half():
 def test_identical_completions_tie_whatever_their_bf16_scores():
     # The judge's bf16 score for one text moves ~0.03 with its batch; the same answer is a tie.
     assert win_rates([1.00, 1.0], [1.03, 2.0], ["same", "a"], ["same", "b"]) == pytest.approx(1.5 / 2)
+    # ...and an edge-whitespace difference is the same answer, since the judge saw it stripped.
+    assert win_rates([1.00], [1.03], ["same"], [" same\n"]) == pytest.approx(0.5)
+
+
+def test_open_prompt_is_a_token_prefix_of_what_sft_trained_on():
+    """With gpt2, "\n\nAssistant: " tokenized alone ends in a bare-space token (220) that SFT,
+    which tokenizes prefix and reply together, never puts there: the space merges into the reply's
+    first word. The prompt rlaif samples after must be a prefix of the SFT sequence instead."""
+    from transformers import AutoTokenizer
+
+    try:
+        tok = AutoTokenizer.from_pretrained("gpt2", local_files_only=True)
+    except OSError:
+        pytest.skip("gpt2 tokenizer not in the local HF cache")
+    user, assistant = "\n\nUser: ", "\n\nAssistant: "
+    prompt_ids, prompt_mask = tokenize_chat_prompt([{"role": "user", "content": "Hi"}], tok, user, assistant)
+    assert len(prompt_ids) == len(prompt_mask) and prompt_ids[-1] != 220
+    for reply in ("Hello there.", "The answer is 4.", "\nA list:", " indented"):
+        sft_ids, _ = tokenize_sft_example(
+            [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": reply}], tok, user, assistant
+        )
+        assert sft_ids[: len(prompt_ids)] == prompt_ids, reply
+    # The decoded completion is the reply alone: the template's trailing space is not part of it.
+    sft_ids, _ = tokenize_sft_example(
+        [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello there."}], tok, user, assistant
+    )
+    gen = sft_ids[len(prompt_ids) : -1]  # what the policy samples after the prompt, minus EOS
+    text = rlaif._decode_completion(tok, prompt_ids, gen, user + "Hi" + assistant)
+    assert text == "Hello there."
 
 
 # --- sampling ---------------------------------------------------------------------------------
@@ -132,7 +169,9 @@ def test_a_completion_ending_exactly_at_the_cap_is_finished(monkeypatch):
     # Row 0 samples EOS right after its 6th token; row 1 is still going at the 7th.
     scripts = [[5] * 6, [5] * 7]
 
-    def fake_generate(model, tokenizer, items, device):
+    def fake_generate(model, tokenizer, items, device, samples_per_item=1):
+        # One prompt, prefilled once and expanded to its two samples.
+        assert len(items) == 1 and samples_per_item == 2
         assert all(item.max_new_tokens == 7 for item in items)
         for step in range(8):
             yield [(row, s[step] if step < len(s) else None) for row, s in enumerate(scripts) if step <= len(s)]

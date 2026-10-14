@@ -93,13 +93,24 @@ def test_dpo_train_loop_runs_end_to_end_and_loss_decreases(tmp_path, monkeypatch
         wandb=WandbConfig(mode="disabled"),
     )
 
+    built_with: list[ModelConfig] = []
+
+    class _RecordingTransformer(DenseTransformer):
+        def __init__(self, model_cfg, *args, **kwargs):
+            built_with.append(model_cfg)
+            super().__init__(model_cfg, *args, **kwargs)
+
+    monkeypatch.setattr(train_mod, "DenseTransformer", _RecordingTransformer)
     train_mod.train(cfg)
 
-    # resolve_dpo_doc_mask must have fired for real inside train(): DPO's "packing of one" makes
+    # dpo_model_config must have applied for real inside train(): DPO's "packing of one" makes
     # doc_attention_mask a no-op, and docs/post-training.md's comment on configs/tinystories_dpo.yaml
     # says a DPO run turns it off for itself at startup — this is the first test to actually run
-    # train() far enough to see that happen rather than calling resolve_dpo_doc_mask directly.
-    assert cfg.model.doc_attention_mask is False
+    # train() far enough to see that happen rather than calling dpo_model_config directly. The
+    # policy is built without it, while cfg.model (what the checkpoint saves) keeps the
+    # architecture's own value.
+    assert built_with[0].doc_attention_mask is False
+    assert cfg.model.doc_attention_mask is True
 
     # The reference-logprob precompute pass actually ran against a real checkpoint and cached its
     # output to disk (not stubbed out, unlike the unit-level test in test_dpo_reference_logprob.py).

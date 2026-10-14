@@ -6,7 +6,7 @@
 #       --prompts HuggingFaceH4/ultrafeedback_binarized --split train_prefs --max-prompts 8000
 #   radiance-train --config configs/post_training/dpo_rlaif.yaml \
 #       --set train.init_from=$POLICY dpo.dataset=data/rlaif/round1 \
-#             train.output_dir=checkpoints/post_training/rlaif_round1
+#             train.output_dir=checkpoints/post_training/rlaif_round1 run_name=rlaif_round1
 #   radiance-rlaif eval --checkpoint $SFT --checkpoint checkpoints/post_training/rlaif_round1/step_250.pt
 #
 # then round 2 with POLICY=checkpoints/post_training/rlaif_round1/step_250.pt, a fresh --output,

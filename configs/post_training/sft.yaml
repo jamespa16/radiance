@@ -15,7 +15,7 @@
 #   # and measure each against $SFT with an AI judge on held-out prompts:
 #   radiance-rlaif eval --checkpoint $SFT --checkpoint checkpoints/post_training/dpo_ultrafeedback/step_1000.pt
 #
-# train.inherit_model_config takes the whole `model:` section (and data.tokenizer) from init_from's
+# train.inherit_model_config takes the model architecture (and data.tokenizer) from init_from's
 # own saved config, so this file carries no copy of V2's architecture to drift out of sync with
 # the checkpoint. It is why init_from must be given (it raises otherwise) — load_config reads it.
 #

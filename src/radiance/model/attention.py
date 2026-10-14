@@ -483,6 +483,15 @@ class KVCache:
     def begin_step(self) -> None:
         self._cursor = 0
 
+    def repeat_interleave(self, n: int) -> None:
+        """Expand every cached row into `n` consecutive copies along the batch dim, so one
+        prefilled prompt can be decoded as n independent samples (generate_tokens_batched's
+        samples_per_item) without prefilling it n times."""
+        for slots in (self._k, self._k2, self._v):
+            for i, t in enumerate(slots):
+                if t is not None:
+                    slots[i] = t.repeat_interleave(n, dim=0)
+
     def write(self, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         slot = self._cursor
         self._cursor += 1

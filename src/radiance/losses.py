@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import dataclasses
 import functools
 
 import torch
 import torch.nn.functional as F
 
-from radiance.config import Config, doc_mask_is_inert_for_dpo
+from radiance.config import Config, ModelConfig, doc_mask_is_inert_for_dpo
 from radiance.model import DenseTransformer, ModelOutput, sequence_logprob_sum, target_logit_and_logz
 def compute_mtp_loss(
     model: DenseTransformer, mtp_hidden: tuple[torch.Tensor, ...] | None, input_ids: torch.Tensor
@@ -374,8 +375,9 @@ def validate_post_training_config(cfg: Config) -> None:
         raise ValueError("dpo.min_score_margin needs dpo.score_chosen_column and dpo.score_rejected_column.")
 
 
-def resolve_dpo_doc_mask(cfg: Config) -> None:
-    """Turn model.doc_attention_mask off for a DPO run whose packing makes it a no-op.
+def dpo_model_config(cfg: Config) -> ModelConfig:
+    """The model config to build this run's model from: cfg.model, except with doc_attention_mask
+    off for a DPO run whose packing makes it a no-op.
 
     See config.doc_mask_is_inert_for_dpo for why it is a no-op (and for the loop_attn_windows
     exception that keeps it on). Worth doing for two reasons, the second larger than the first:
@@ -384,24 +386,18 @@ def resolve_dpo_doc_mask(cfg: Config) -> None:
     things that force resolve_compile_mode down to mode=None — so a DPO run that skips it gets
     CUDA graphs back.
 
-    Mutates cfg rather than branching at each use, the same idiom auto_batch_size and
-    tokens_per_param already use here, which also means the value saved into the checkpoint is
-    the one the run actually trained with.
+    A copy rather than a mutation of cfg.model, so the config saved into the checkpoint keeps the
+    architecture's own value: the skip is this run's packing, not a property of the weights, and
+    a later stage that packs several examples per block (SFT after DPO) needs the mask back.
     """
-    if not cfg.dpo.enabled:
-        return
-    # Recorded for config._inherit_model_config, which otherwise cannot tell this resolution from
-    # an architecture that never had the mask — so recorded before the early return below, which
-    # is exactly the never-had-it case.
-    cfg.dpo.doc_attention_mask_before_resolve = cfg.model.doc_attention_mask
-    if not doc_mask_is_inert_for_dpo(cfg.model):
-        return
-    cfg.model.doc_attention_mask = False
+    if not (cfg.dpo.enabled and doc_mask_is_inert_for_dpo(cfg.model)):
+        return cfg.model
     print(
-        "[radiance] dpo.enabled: turning model.doc_attention_mask off — DPO packs one pair side "
-        "per row, so the document mask cannot change any scored logit, and building it every "
-        "step is pure overhead (see config.doc_mask_is_inert_for_dpo)."
+        "[radiance] dpo.enabled: building the model with doc_attention_mask off — DPO packs one "
+        "pair side per row, so the document mask cannot change any scored logit, and building it "
+        "every step is pure overhead (see config.doc_mask_is_inert_for_dpo)."
     )
+    return dataclasses.replace(cfg.model, doc_attention_mask=False)
 
 
 def note_dpo_z_loss_omitted(cfg: Config) -> None:

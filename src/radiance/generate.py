@@ -119,6 +119,7 @@ def generate_tokens_batched(
     items: list[BatchItem],
     device: str = "cpu",
     loops: int | None = None,
+    samples_per_item: int = 1,
 ) -> Iterator[list[tuple[int, int | None]]]:
     """Batched counterpart to generate_tokens: runs `items` (right-padded prompts of possibly
     different lengths, one shared KVCache) through a single forward pass per step instead of one
@@ -133,6 +134,11 @@ def generate_tokens_batched(
     the batch's tensor shapes stay uniform until every row finishes (this repo's "idle to
     completion" batching design), but since attention is masked per row, it can never influence any
     other row's output, and no further sampling work is spent on it.
+
+    `samples_per_item` > 1 decodes each item as that many independent samples: row
+    `i * samples_per_item + s` is sample `s` of item `i`. Each prompt is prefilled once and its KV
+    cache and last-position logits are then expanded across its samples, so the prefill — the
+    whole prompt, against one token per decode step — is not paid once per sample.
     """
     batch = len(items)
     prompts = [item.input_ids[:, -model.cfg.max_seq_len :] for item in items]
@@ -164,6 +170,15 @@ def generate_tokens_batched(
     mask_vocab_padding(logits, tokenizer)
     last_idx = torch.tensor([plen - 1 for plen in prompt_lens], device=device)
     next_logits = logits[torch.arange(batch, device=device), last_idx, :]
+    if samples_per_item > 1:
+        n = samples_per_item
+        kv_cache.repeat_interleave(n)
+        next_logits = next_logits.repeat_interleave(n, dim=0)
+        key_padding_mask = key_padding_mask.repeat_interleave(n, dim=0)
+        key_positions = key_positions.repeat_interleave(n, dim=0)
+        real_len = [length for length in real_len for _ in range(n)]
+        items = [item for item in items for _ in range(n)]
+        batch *= n
 
     done = [False] * batch
     yielded_count = [0] * batch
