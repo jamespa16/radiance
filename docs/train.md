@@ -12,6 +12,18 @@ The stdout line matters more than it looks: W&B was previously the only place a 
 `wandb.mode: disabled` (sweeps, CI, quick A/Bs) produced no visible signal at all. On CUDA it also carries `mem`, the
 reserved VRAM.
 
+**On an interactive terminal that line becomes a live HUD** (`hud.py`, `TrainingHUD`, built on `rich`): one panel
+redrawn in place with progress + ETA, the latest train metrics and loss delta, grad norm and LR, tok/s / ms-per-step /
+MFU / `mem`, a loss sparkline, and the latest and best validation loss. Validation results, checkpoint saves and OOM
+backoffs still print as ordinary lines *above* the panel, as does any stray print or warning (stdout/stderr are
+redirected through it), so the scrollback after a run is its event log. ETA uses `ThroughputMeter`'s step time, so it
+excludes eval/save pauses and is a slight underestimate on eval-heavy configs.
+
+The HUD switches itself off whenever stdout is not a terminal — `nohup ... > run.log`, a pipe, CI, pytest — and the
+run then prints exactly the lines above, unchanged (`tests/test_hud.py` pins them, since log files get grepped).
+`radiance-train --no-hud` forces the plain lines on a terminal too; `train(cfg, hud=...)` is the programmatic switch.
+Setup lines printed before the loop starts are plain in both modes.
+
 The loop is step-based (`cfg.train.max_steps`), not epoch-based, and cycles the train `DataLoader` via manual
 `StopIteration` handling.
 
