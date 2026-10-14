@@ -14,6 +14,7 @@ from datasets import Dataset, DatasetDict
 from radiance.config import Config, DPOConfig
 from radiance.dpo_data import _format_dpo_pair, _load_or_build_dpo_packed, _tokenize_dpo_row
 import radiance.dpo_data as dpo_mod
+import radiance.sft_data as sft_data_mod
 
 
 class _FakeTokenizer:
@@ -176,7 +177,7 @@ def test_load_or_build_dpo_packed_does_not_replace_an_empty_validation_split_wit
     # A present-but-empty "validation" split is a real (if unusual) HF DatasetDict shape - it must
     # not be swapped for "test" just because an empty datasets.Dataset is falsy.
     raw = DatasetDict({"train": _dpo_examples(2), "validation": _dpo_examples(0), "test": _dpo_examples(3)})
-    monkeypatch.setattr(dpo_mod, "load_dataset", lambda name: raw)
+    monkeypatch.setattr(sft_data_mod, "load_dataset", lambda name: raw)
     # _add_reference_logprobs would load a real reference checkpoint - irrelevant to the
     # split-selection bug this test targets, so it's replaced with a passthrough.
     monkeypatch.setattr(dpo_mod, "_add_reference_logprobs", lambda packed, cfg, tok, device: packed)

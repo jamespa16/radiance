@@ -16,6 +16,7 @@ import torch
 from datasets import Dataset, DatasetDict
 
 import radiance.dpo_data as dpo_data_mod
+import radiance.sft_data as sft_data_mod
 import radiance.train as train_mod
 from radiance.checkpointing import save_checkpoint
 from radiance.config import Config, DataConfig, DPOConfig, ModelConfig, TrainConfig, WandbConfig
@@ -58,7 +59,7 @@ def test_dpo_train_loop_runs_end_to_end_and_loss_decreases(tmp_path, monkeypatch
     # example, and it's the reference checkpoint that exercises the precompute pass under test.
     base_ckpt = _save_base_checkpoint(tmp_path, model_cfg, "base.pt")
 
-    monkeypatch.setattr(dpo_data_mod, "load_dataset", lambda name: _dpo_pairs(32))
+    monkeypatch.setattr(sft_data_mod, "load_dataset", lambda name: _dpo_pairs(32))
     tokenizer = WordTokenizer(vocab_size=TINY_VOCAB)
     monkeypatch.setattr(train_mod, "build_tokenizer", lambda cfg: tokenizer)
 
@@ -92,13 +93,24 @@ def test_dpo_train_loop_runs_end_to_end_and_loss_decreases(tmp_path, monkeypatch
         wandb=WandbConfig(mode="disabled"),
     )
 
+    built_with: list[ModelConfig] = []
+
+    class _RecordingTransformer(DenseTransformer):
+        def __init__(self, model_cfg, *args, **kwargs):
+            built_with.append(model_cfg)
+            super().__init__(model_cfg, *args, **kwargs)
+
+    monkeypatch.setattr(train_mod, "DenseTransformer", _RecordingTransformer)
     train_mod.train(cfg)
 
-    # resolve_dpo_doc_mask must have fired for real inside train(): DPO's "packing of one" makes
+    # dpo_model_config must have applied for real inside train(): DPO's "packing of one" makes
     # doc_attention_mask a no-op, and docs/post-training.md's comment on configs/tinystories_dpo.yaml
     # says a DPO run turns it off for itself at startup — this is the first test to actually run
-    # train() far enough to see that happen rather than calling resolve_dpo_doc_mask directly.
-    assert cfg.model.doc_attention_mask is False
+    # train() far enough to see that happen rather than calling dpo_model_config directly. The
+    # policy is built without it, while cfg.model (what the checkpoint saves) keeps the
+    # architecture's own value.
+    assert built_with[0].doc_attention_mask is False
+    assert cfg.model.doc_attention_mask is True
 
     # The reference-logprob precompute pass actually ran against a real checkpoint and cached its
     # output to disk (not stubbed out, unlike the unit-level test in test_dpo_reference_logprob.py).
@@ -115,3 +127,56 @@ def test_dpo_train_loop_runs_end_to_end_and_loss_decreases(tmp_path, monkeypatch
     model, _ = load_transformer_from_checkpoint(str(ckpt_path), "cpu")
     logits = model(torch.randint(1, TINY_VOCAB, (2, 8))).logits
     assert logits.shape == (2, 8, TINY_VOCAB)
+
+
+def test_dpo_resume_keeps_its_reference_when_init_from_is_rewritten(tmp_path, monkeypatch):
+    # dpo.reference_checkpoint defaults to train.init_from. A resumed run must keep the reference
+    # its log-probs were computed against even when that path has been rewritten since (a chained
+    # RLAIF round): reuse the original cache, or — with that cache gone — refuse, rather than
+    # recompute the reference half-way through the run.
+    import os
+
+    import pytest
+
+    model_cfg = _model_cfg()
+    base_ckpt = _save_base_checkpoint(tmp_path, model_cfg, "policy.pt")
+    monkeypatch.setattr(sft_data_mod, "load_dataset", lambda name: _dpo_pairs(16))
+    tokenizer = WordTokenizer(vocab_size=TINY_VOCAB)
+    monkeypatch.setattr(train_mod, "build_tokenizer", lambda cfg: tokenizer)
+    monkeypatch.setattr(train_mod, "wandb", _FakeWandb())
+    cache_dir = tmp_path / "dpo_cache"
+
+    def cfg(max_steps: int) -> Config:
+        return Config(
+            run_name="test-dpo-resume",
+            data=DataConfig(tokenizer="unused", seq_len=16, num_workers=0),
+            model=model_cfg,
+            dpo=DPOConfig(enabled=True, dataset="unused", cache_dir=str(cache_dir)),  # reference = init_from
+            train=TrainConfig(
+                init_from=str(base_ckpt), resume_from="auto", batch_size=2, auto_batch_size=False, max_steps=max_steps,
+                eval_every=10_000, save_every=2, output_dir=str(tmp_path / "out"), device="cpu", compile=False,
+            ),
+            wandb=WandbConfig(mode="disabled"),
+        )
+
+    identity = dpo_data_mod.current_reference_identity(cfg(2))
+    train_mod.train(cfg(2))
+    ref_caches = sorted(cache_dir.rglob("ref-*"))
+    assert len(ref_caches) == 1
+    assert torch.load(tmp_path / "out" / "step_2.pt", weights_only=False)["dpo_reference"] == identity
+
+    # The next round rewrites the policy path: same name, new contents, new mtime.
+    _save_base_checkpoint(tmp_path, model_cfg, "policy.pt")
+    st = base_ckpt.stat()
+    os.utime(base_ckpt, (st.st_atime, st.st_mtime + 5))
+    assert dpo_data_mod.current_reference_identity(cfg(4)) != identity
+
+    train_mod.train(cfg(4))  # resumes from step_2.pt
+    assert sorted(cache_dir.rglob("ref-*")) == ref_caches, "resume recomputed the reference"
+    assert torch.load(tmp_path / "out" / "step_4.pt", weights_only=False)["dpo_reference"] == identity
+
+    import shutil
+
+    shutil.rmtree(ref_caches[0])
+    with pytest.raises(ValueError, match="has changed since"):
+        train_mod.train(cfg(6))

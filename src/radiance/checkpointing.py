@@ -18,6 +18,7 @@ def save_checkpoint(
     step: int,
     cfg: Config,
     train_batches_drawn: int = 0,
+    dpo_reference: str | None = None,
 ) -> None:
     """Write a resumable checkpoint, atomically.
 
@@ -30,6 +31,9 @@ def save_checkpoint(
     train loader. A streaming disk-cache loader skips that many on resume (see
     StreamingPackedDataset.set_resume_position); no other loader can seek, so for them it is
     recorded but unused.
+
+    `dpo_reference` is a DPO run's dpo_data.current_reference_identity as of its first start: a
+    resume pins itself to it rather than to whatever the reference path holds by then.
 
     Not captured: RNG state. It trades off against data freshness, and the resolution here favours
     freshness — train() re-seeds off the resumed step, so a map-style loader draws a *different*
@@ -58,6 +62,7 @@ def save_checkpoint(
                 "scaler": scaler.state_dict(),
                 "step": step,
                 "train_batches_drawn": train_batches_drawn,
+                "dpo_reference": dpo_reference,
                 "config": cfg,
             },
             f,

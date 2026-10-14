@@ -23,6 +23,23 @@ class EvalResult:
     # tokenizer does, so it is what compares runs across tokenizers. None unless `token_bytes`
     # was given (pretraining only).
     bits_per_byte: float | None = None
+    # DPO only: the row-weighted means of compute_dpo_loss's two accuracy diagnostics over the
+    # scored val pairs — reward_accuracy (policy_chosen_logp > policy_rejected_logp) and
+    # margin_accuracy (the policy separates the pair more than the reference did). val/loss alone
+    # cannot say whether the policy *ranks* held-out pairs correctly; these can. None otherwise.
+    dpo_reward_accuracy: float | None = None
+    dpo_margin_accuracy: float | None = None
+
+
+def standard_error(values: list[float], mean: float) -> float | None:
+    """Standard error of `mean` over `values`: the sample standard deviation over sqrt(n). None
+    for fewer than two values, which carry no spread to estimate it from. Shared by val/loss's
+    stderr here and radiance-rlaif's judge-reward stderr."""
+    n = len(values)
+    if n < 2:
+        return None
+    var = sum((v - mean) ** 2 for v in values) / (n - 1)
+    return math.sqrt(var / n)
 
 
 def evaluate(*args, **kwargs) -> float:
@@ -88,6 +105,9 @@ def evaluate_detailed(
     total, count = 0.0, 0
     batch_losses: list[float] = []
     nats, n_bytes = 0.0, 0
+    # DPO accuracies are per-row means, so they combine across chunks and batches by row count.
+    # Accumulated on the device, and read back once after the loop rather than synced per chunk.
+    reward_correct, margin_correct, n_pairs = 0.0, 0.0, 0
     if token_bytes is not None and (sft or dpo):
         raise ValueError("evaluate: token_bytes (bits/byte) is only defined for pretraining")
     for i, batch in enumerate(val_loader):
@@ -103,11 +123,14 @@ def evaluate_detailed(
                 if dpo:
                     c_ids, r_ids = chunk["chosen_input_ids"], chunk["rejected_input_ids"]
                     _, chosen_logits, rejected_logits = forward_dpo_pair(model, chunk)
-                    chunk_loss, _, _, _ = loss_fn(
+                    chunk_loss, _, margin_acc, reward_acc = loss_fn(
                         chosen_logits, c_ids, chunk["chosen_loss_mask"],
                         rejected_logits, r_ids, chunk["rejected_loss_mask"],
                         chunk["ref_chosen_logprob"], chunk["ref_rejected_logprob"], dpo_beta,
-                    )  # margin/accuracy discarded: val/loss stays the plain DPO objective
+                    )  # margin discarded; the accuracies are reported alongside val/loss, not in it
+                    reward_correct = reward_correct + reward_acc.detach().float() * chunk_units
+                    margin_correct = margin_correct + margin_acc.detach().float() * chunk_units
+                    n_pairs += chunk_units
                 elif sft:
                     out = model(chunk["input_ids"])
                     loss_val, _ = loss_fn(out.logits, chunk["input_ids"], chunk["loss_mask"])  # z_loss discarded
@@ -137,9 +160,10 @@ def evaluate_detailed(
     if not count:
         return EvalResult(float("nan"))
     mean = total / count
-    stderr = None
-    if count > 1:
-        var = sum((l - mean) ** 2 for l in batch_losses) / (count - 1)
-        stderr = math.sqrt(var / count)
+    stderr = standard_error(batch_losses, mean)
     bpb = nats / (math.log(2) * n_bytes) if token_bytes is not None and n_bytes else None
+    if n_pairs:
+        return EvalResult(
+            mean, stderr, bpb, float(reward_correct) / n_pairs, float(margin_correct) / n_pairs
+        )
     return EvalResult(mean, stderr, bpb)

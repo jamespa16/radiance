@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import argparse
 import math
-import random
 import time
 from pathlib import Path
 
-import numpy as np
 import torch
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -14,9 +12,10 @@ import wandb
 from radiance import nvfp4
 from radiance.config import (
     Config,
-    load_config,
+    load_config_with_overrides,
     resolve_device,
     resolve_dtype,
+    set_seed,
 )
 from radiance.data import (
     EpochPermutationSampler,
@@ -25,7 +24,7 @@ from radiance.data import (
     build_tokenizer,
     token_byte_lengths,
 )
-from radiance.dpo_data import build_dpo_dataloaders
+from radiance.dpo_data import build_dpo_dataloaders, current_reference_identity
 from radiance.sft_data import build_sft_dataloaders
 from radiance.model import DenseTransformer, cast_params_to_native_bf16, padded_vocab_size
 from radiance.optim import build_optimizer, migrate_optimizer_to_cpu_offload
@@ -49,17 +48,12 @@ from .losses import (
     build_dpo_loss_fn,
     build_loss_fn,
     chunk_loss_and_metrics,
+    dpo_loss_variant_configured,
+    dpo_model_config,
+    note_dpo_dropout,
     note_dpo_z_loss_omitted,
-    resolve_dpo_doc_mask,
     validate_post_training_config,
 )
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
 def build_lr_scheduler(optimizer: torch.optim.Optimizer, cfg: Config) -> LambdaLR:
     warmup_steps = cfg.train.warmup_steps
     max_steps = cfg.train.max_steps
@@ -320,17 +314,18 @@ def train(cfg: Config, hud: bool | None = None) -> None:
             f"[radiance] padding vocab {len(tokenizer):,} -> {vocab_size:,} "
             f"(multiple of {cfg.model.vocab_pad_multiple}) for tensor-core-aligned lm_head matmuls"
         )
+    # Before the model is built, so an unsupported combination fails before a model is allocated.
     validate_post_training_config(cfg)
-    # Both before the model is built: validation so an unsupported combination fails before a
-    # model is allocated, and the doc-mask resolution because DenseTransformer reads cfg.model by
-    # reference and resolve_compile_mode's CUDA-graph decision asks the *built* model whether it
-    # will build BlockMasks.
-    resolve_dpo_doc_mask(cfg)
     note_dpo_z_loss_omitted(cfg)
+    note_dpo_dropout(cfg)
 
     # eos_id is what recovers packed document boundaries for doc_attention_mask (see
-    # model.document_ids) — data.py joins documents with exactly this token.
-    raw_model = DenseTransformer(cfg.model, vocab_size=vocab_size, eos_id=tokenizer.eos_token_id).to(device)
+    # model.document_ids) — data.py joins documents with exactly this token. dpo_model_config is
+    # cfg.model unless DPO's packing makes the doc mask a no-op; resolve_compile_mode's CUDA-graph
+    # decision then asks the *built* model whether it will build BlockMasks.
+    raw_model = DenseTransformer(
+        dpo_model_config(cfg), vocab_size=vocab_size, eos_id=tokenizer.eos_token_id
+    ).to(device)
     if cfg.train.native_bf16:
         cast_params_to_native_bf16(raw_model)
         print("[radiance] train.native_bf16: parameters, gradients and optimizer moments stored in bf16")
@@ -343,12 +338,24 @@ def train(cfg: Config, hud: bool | None = None) -> None:
         load_pretrained_weights(raw_model, cfg.train.init_from, cfg, vocab_size, device)
         print(f"[radiance] initialized model weights from {cfg.train.init_from} (fresh optimizer/scheduler/step)")
 
+    # DPO: the reference model this run's log-probs come from, pinned at its first start. A resume
+    # reuses the recorded identity (mmap read — no weights paged in) rather than re-statting the
+    # path, which defaults to train.init_from and may have been rewritten since; see
+    # dpo_data.current_reference_identity. None on a checkpoint that predates the field.
+    dpo_reference = None
+    if cfg.dpo.enabled:
+        if resume_path is not None:
+            dpo_reference = torch.load(
+                resume_path, map_location="cpu", weights_only=False, mmap=True
+            ).get("dpo_reference")
+        dpo_reference = dpo_reference or current_reference_identity(cfg)
+
     if cfg.train.auto_batch_size:
         if device_type == "cuda":
             if cfg.train.target_effective_batch_size is None:
                 cfg.train.target_effective_batch_size = cfg.train.effective_batch_size
             cfg.train.batch_size, cfg.train.grad_accum_steps = estimate_batch_size(
-                raw_model, cfg, device, device_type, reserve_bytes=dpo_reference_reserve_bytes(cfg)
+                raw_model, cfg, device, device_type, reserve_bytes=dpo_reference_reserve_bytes(cfg, dpo_reference)
             )
         else:
             print(
@@ -371,15 +378,19 @@ def train(cfg: Config, hud: bool | None = None) -> None:
     compile_mode = resolve_compile_mode(raw_model, cfg, device_type)
     model = torch.compile(raw_model, mode=compile_mode) if cfg.train.compile else raw_model
     loss_fn = build_dpo_loss_fn(cfg) if cfg.dpo.enabled else build_loss_fn(cfg)
+    # val/loss is plain DPO whatever variant trains (see build_dpo_loss_fn); the same function
+    # object when no variant is configured, so a default run compiles the loss once, as before.
+    eval_loss_fn = (
+        build_dpo_loss_fn(cfg, plain=True) if cfg.dpo.enabled and dpo_loss_variant_configured(cfg) else loss_fn
+    )
 
     # batch_size must be finalized (auto_batch_size, if any, already ran) before the DataLoader is built.
     if cfg.dpo.enabled:
-        build_loader_fn = build_dpo_dataloaders
+        train_loader, val_loader = build_dpo_dataloaders(cfg, tokenizer, dpo_reference)
     elif cfg.sft.enabled:
-        build_loader_fn = build_sft_dataloaders
+        train_loader, val_loader = build_sft_dataloaders(cfg, tokenizer)
     else:
-        build_loader_fn = build_dataloaders
-    train_loader, val_loader = build_loader_fn(cfg, tokenizer)
+        train_loader, val_loader = build_dataloaders(cfg, tokenizer)
 
     if cfg.train.tokens_per_param is not None:
         # Same per-row unit `estimate_batch_size` uses above: respects any active sft.seq_len /
@@ -678,7 +689,7 @@ def train(cfg: Config, hud: bool | None = None) -> None:
                             device_type,
                             dtype,
                             cfg.train.eval_max_batches,
-                            loss_fn,
+                            eval_loss_fn,
                             sft=cfg.sft.enabled,
                             dpo=cfg.dpo.enabled,
                             dpo_beta=cfg.dpo.beta if cfg.dpo.enabled else None,
@@ -686,11 +697,24 @@ def train(cfg: Config, hud: bool | None = None) -> None:
                             token_bytes=token_bytes,
                         )
                         display.on_val(step, result.loss, result.loss_stderr, result.bits_per_byte)
+                        if result.dpo_reward_accuracy is not None:
+                            display.event(
+                                f"step {step} val reward_acc {result.dpo_reward_accuracy:.3f}"
+                                f" margin_acc {result.dpo_margin_accuracy:.3f}"
+                            )
                         wandb.log(
                             {
                                 "val/loss": result.loss,
                                 **({"val/loss_stderr": result.loss_stderr} if result.loss_stderr is not None else {}),
                                 **({"val/bits_per_byte": result.bits_per_byte} if result.bits_per_byte is not None else {}),
+                                **(
+                                    {
+                                        "val/dpo_reward_accuracy": result.dpo_reward_accuracy,
+                                        "val/dpo_margin_accuracy": result.dpo_margin_accuracy,
+                                    }
+                                    if result.dpo_reward_accuracy is not None
+                                    else {}
+                                ),
                             },
                             step=step,
                         )
@@ -706,7 +730,7 @@ def train(cfg: Config, hud: bool | None = None) -> None:
                         ckpt_path = output_dir / f"step_{step}.pt"
                         save_checkpoint(
                             ckpt_path, raw_model, optimizer, scheduler, scaler, step, cfg,
-                            train_batches_drawn=train_batches_drawn,
+                            train_batches_drawn=train_batches_drawn, dpo_reference=dpo_reference,
                         )
                         prune_checkpoints(output_dir, keep=ckpt_path, keep_every=cfg.train.keep_every)
                         display.on_checkpoint(step, ckpt_path)
@@ -772,6 +796,15 @@ def main() -> None:
     )
     parser.add_argument("--decay-steps", type=int, help="length of the --decay-from anneal, in steps")
     parser.add_argument(
+        "--set",
+        nargs="+",
+        action="extend",  # repeatable: --set a=1 --set b=2 keeps both
+        default=[],
+        metavar="KEY=VALUE",
+        help="section.field=value overrides applied on top of --config, parsed as YAML (string fields "
+        "verbatim) — e.g. chaining post-training stages: --set train.init_from=checkpoints/sft/step_800.pt",
+    )
+    parser.add_argument(
         "--no-hud",
         action="store_true",
         help="print one line per log step instead of the live terminal display "
@@ -779,7 +812,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    cfg = load_config_with_overrides(args.config, args.set)
     if (args.decay_from is None) != (args.decay_steps is None):
         parser.error("--decay-from and --decay-steps go together")
     if args.decay_from is not None:
