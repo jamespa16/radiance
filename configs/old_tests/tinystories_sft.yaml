@@ -4,13 +4,13 @@
 # formatted instruction data (HuggingFaceH4/no_robots), with the loss masked so only the
 # assistant's turns are scored (see train.compute_sft_loss). Two things this depends on:
 #
-#   1. `model:` below matches configs/tinystories.yaml's architecture exactly. train.init_from
+#   1. `model:` below matches configs/old_tests/tinystories.yaml's architecture exactly. train.init_from
 #      loads weights into an already-constructed model, so d_model/n_layers/head_dim/n_kv_heads
 #      must match the checkpoint being loaded — a mismatch raises a clear error rather than a
 #      cryptic tensor-shape crash.
 #   2. `train.init_from` needs an actual checkpoint path. First train a base model:
 #
-#        WANDB_MODE=offline uv run radiance-train --config configs/tinystories.yaml
+#        uv run radiance-train --config configs/old_tests/tinystories.yaml --set wandb.mode=offline
 #
 #      then point init_from at the checkpoint it writes to output_dir (e.g.
 #      checkpoints/tinystories/run2/step_1000.pt) before running this config. Unlike

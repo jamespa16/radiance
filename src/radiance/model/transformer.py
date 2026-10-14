@@ -1145,7 +1145,7 @@ class DenseTransformer(nn.Module):
         # activations do. train.compute_loss no longer goes through cross_entropy (it derives both
         # the LM loss and z_loss from one logsumexp, and inductor keeps that reduction in fp32
         # without materialising an fp32 copy), so under bf16 this is 8 bytes per vocab element
-        # rather than 12. Measured against the real peak on configs/tinystories.yaml: the whole
+        # rather than 12. Measured against the real peak on configs/old_tests/tinystories.yaml: the whole
         # estimate lands 1.12x above actual, still on the intended over-estimating side, where the
         # fp32 assumption had it at 1.58x — headroom that auto_batch_size was spending on a
         # smaller micro-batch than the model actually needs.

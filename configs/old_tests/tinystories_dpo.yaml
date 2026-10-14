@@ -2,7 +2,7 @@
 #
 # This is the third stage of a pretrain -> SFT -> DPO chain, not a from-scratch run:
 #
-#   1. WANDB_MODE=offline uv run radiance-train --config configs/tinystories.yaml
+#   1. uv run radiance-train --config configs/old_tests/tinystories.yaml --set wandb.mode=offline
 #      writes a base checkpoint (e.g. checkpoints/tinystories/run2/step_1000.pt).
 #   2. Point configs/tinystories_sft.yaml's train.init_from at that checkpoint and run it —
 #      writes an SFT checkpoint (e.g. checkpoints/tinystories_sft/step_800.pt).

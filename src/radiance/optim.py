@@ -157,7 +157,7 @@ def norm_gain_param_ids(model: torch.nn.Module) -> set[int]:
         1.0 toward zero.
 
     Neither raises, neither shows up as a dead parameter, and neither can happen at loop_count 1 —
-    which is why configs/tinystories.yaml never saw it and every looped config did. Keying on the
+    which is why configs/old_tests/tinystories.yaml never saw it and every looped config did. Keying on the
     owning module instead of the tensor's rank makes the classification independent of how many
     variants a gain bank happens to hold. `recurse=False` so only the norm's own parameters count.
     """
@@ -530,7 +530,7 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
         launches with no change to the result — `orthogonalize` is already shape-generic over
         leading dims (`@`/`.mT` batch, and matrix_norm(keepdim=True) normalises each matrix
         independently), which is what BatchedExperts' stacked (n_experts, in, out) weights already
-        rely on. Measured on configs/tinystories.yaml (42 tensors, 5 shapes): 6.71 -> 1.90 ms.
+        rely on. Measured on configs/old_tests/tinystories.yaml (42 tensors, 5 shapes): 6.71 -> 1.90 ms.
 
         Momentum and weight decay move to torch._foreach_* for the same reason.
 

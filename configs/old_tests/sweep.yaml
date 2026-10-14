@@ -1,10 +1,10 @@
-# W&B sweep over configs/tinystories.yaml.
+# W&B sweep over configs/old_tests/tinystories.yaml.
 #
 # Usage:
 #   uv run wandb sweep configs/sweep.yaml
 #   uv run wandb agent <sweep-id-printed-above>
 #
-# Each agent run loads configs/tinystories.yaml as a base config, then
+# Each agent run loads configs/old_tests/tinystories.yaml as a base config, then
 # radiance.sweep overwrites the fields below with this run's sampled values
 # (see apply_sweep_overrides in src/radiance/sweep.py) before calling
 # radiance.train.train().
@@ -25,7 +25,7 @@ command:
   - ${interpreter}
   - ${program}
   - "--config"
-  - "configs/tinystories.yaml"
+  - "configs/old_tests/tinystories.yaml"
 
 parameters:
   train:
