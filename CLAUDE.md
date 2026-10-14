@@ -45,12 +45,13 @@ Drop that line/footer entirely rather than including it — the rest of the stan
 ## Running training
 
 ```bash
-WANDB_MODE=offline uv run radiance-train --config configs/tinystories.yaml
+uv run radiance-train --config configs/old_tests/tinystories.yaml --set wandb.mode=offline
 ```
 
-Drop `WANDB_MODE=offline` to log to your W&B account (`wandb.mode` in the config also controls this — `online`,
-`offline`, or `disabled`). `configs/tinystories.yaml` is the reference config, tuned for a quick first run against
-`roneneldan/TinyStories`. Copy it to start a new config.
+Drop the `--set` to log to your W&B account. `wandb.mode` (`online`, `offline`, or `disabled`) is passed to
+`wandb.init` explicitly, so it **overrides the `WANDB_MODE` env var** — `WANDB_MODE=offline` does not stop a config
+with `mode: online` from uploading. `configs/old_tests/tinystories.yaml` is the reference config, tuned for a quick
+first run against `roneneldan/TinyStories`. Copy it to start a new config.
 
 On a terminal the run shows a live HUD (progress, ETA, metrics, loss sparkline, best val loss) instead of a line per
 log step; redirected to a file or pipe it prints the plain `[radiance]` lines as before. `--no-hud` forces plain
@@ -66,7 +67,7 @@ For a long run, tokenize the data to local disk first so the run never touches t
 
 ```bash
 uv run radiance-pretokenize --config configs/v2.yaml    # resumable; re-run the same command after an interruption
-WANDB_MODE=offline uv run radiance-train --config configs/v2.yaml
+uv run radiance-train --config configs/v2.yaml --set wandb.mode=offline
 ```
 
 Under `lr_schedule: wsd`, any checkpoint can be annealed into a finished model on a side branch without stopping the
