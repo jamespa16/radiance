@@ -52,6 +52,10 @@ Drop `WANDB_MODE=offline` to log to your W&B account (`wandb.mode` in the config
 `offline`, or `disabled`). `configs/tinystories.yaml` is the reference config, tuned for a quick first run against
 `roneneldan/TinyStories`. Copy it to start a new config.
 
+On a terminal the run shows a live HUD (progress, ETA, metrics, loss sparkline, best val loss) instead of a line per
+log step; redirected to a file or pipe it prints the plain `[radiance]` lines as before. `--no-hud` forces plain
+output. See [docs/train.md](docs/train.md).
+
 **Real training runs should use the GPU** (`train.device: auto`, the default, resolves to `cuda` when one's
 available — see `resolve_device` in `config.py`). Don't drop to `train.device: cpu` for an actual run just because the GPU is temporarily busy with another
 process; wait for it to free up or ask. CPU is fine only for the tiny pipeline sanity-checks below, which are
