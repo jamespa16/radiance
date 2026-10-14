@@ -371,7 +371,7 @@ class TrainConfig:
     # Was 3.0e-4, which is what it had been tuned to back when AdamW trained *every* tensor. Moving
     # the hidden weights to Muon preserved that value but silently changed its job, leaving the tied
     # embedding — the one large matrix AdamW still owns — training ~30-100x too slowly. A sweep on
-    # configs/tinystories.yaml bottoms out flat between 1.0e-2 and 3.0e-2 and is worth ~0.44 val/loss
+    # configs/old_tests/tinystories.yaml bottoms out flat between 1.0e-2 and 3.0e-2 and is worth ~0.44 val/loss
     # at 1200 steps (2.2341 -> 1.7984), better at every eval point; see "Measured results" in
     # CLAUDE.md. This is one of the few defaults here that changes results deliberately, and unlike
     # the rest of them it is a fix, not a feature. Note it only reaches configs that *omit* lr —

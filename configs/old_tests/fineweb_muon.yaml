@@ -5,7 +5,7 @@
 # stability. Embeddings, norms, biases and routers stay on an auxiliary AdamW at train.lr — so the
 # `lr` below still means what it always did, and `muon_lr` is a separate field.
 #
-# Measured on configs/tinystories.yaml (400 steps, RTX 5090): Muon reached val/loss 2.826 where
+# Measured on configs/old_tests/tinystories.yaml (400 steps, RTX 5090): Muon reached val/loss 2.826 where
 # AdamW reached 3.300, and passed AdamW's *final* loss at roughly half the steps.
 #
 # mup_base_d_model makes the hyperparameters transferable across width. Tune lr/muon_lr once at a

@@ -1,4 +1,4 @@
-# W&B sweep over configs/tinystories.yaml, targeting the looped-block mechanism
+# W&B sweep over configs/old_tests/tinystories.yaml, targeting the looped-block mechanism
 # (model.loop_count). All other hyperparameters are pinned to reasonable constants
 # (tinystories.yaml's tuned values) so the sweep isolates the effect of this field.
 #
@@ -6,7 +6,7 @@
 #   uv run wandb sweep configs/sweep_loop_ffn.yaml
 #   uv run wandb agent <sweep-id-printed-above>
 #
-# Each agent run loads configs/tinystories.yaml as a base config, then
+# Each agent run loads configs/old_tests/tinystories.yaml as a base config, then
 # radiance.sweep overwrites the fields below with this run's sampled values
 # (see apply_sweep_overrides in src/radiance/sweep.py) before calling
 # radiance.train.train().
@@ -27,7 +27,7 @@ command:
   - ${interpreter}
   - ${program}
   - "--config"
-  - "configs/tinystories.yaml"
+  - "configs/old_tests/tinystories.yaml"
 
 parameters:
   model:

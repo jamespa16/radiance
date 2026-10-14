@@ -1,4 +1,4 @@
-# Comprehensive W&B sweep over configs/tinystories.yaml.
+# Comprehensive W&B sweep over configs/old_tests/tinystories.yaml.
 #
 # Explores the full hyperparameter surface of the model: architecture,
 # training dynamics, and loop mechanics. Uses Bayesian optimization
@@ -24,7 +24,7 @@ command:
   - ${interpreter}
   - ${program}
   - "--config"
-  - "configs/tinystories.yaml"
+  - "configs/old_tests/tinystories.yaml"
 
 parameters:
   model:

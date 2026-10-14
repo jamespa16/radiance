@@ -2,7 +2,7 @@
 # the name deliberately carries no size or dtype.
 #
 # ~27M params: d_model 256, head_dim 64 (4 heads, the d_model 256 ratio in
-# configs/tinystories.yaml), 10 layers, ffn_mult 3.0, ffn_depth 2, ACT router
+# configs/old_tests/tinystories.yaml), 10 layers, ffn_mult 3.0, ffn_depth 2, ACT router
 # (use_router) with max_loops 8. Total:
 # **27,434,810 params** (verified via DenseTransformer(...).num_parameters()).
 #
@@ -36,7 +36,7 @@ data:
 
 model:
   d_model: 256
-  head_dim: 64 # 4 heads — the d_model 256 ratio in configs/tinystories.yaml
+  head_dim: 64 # 4 heads — the d_model 256 ratio in configs/old_tests/tinystories.yaml
   n_layers: 10
   use_router: true # ACT: per-token learned halting replaces the fixed loop count; see docs/model.md
   max_loops: 8 # hard cap on loop iterations in router mode

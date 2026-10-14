@@ -1,6 +1,6 @@
 """Generate loop-vs-depth A/B configs.
 
-Three arms off configs/tinystories.yaml's reference shape:
+Three arms off configs/old_tests/tinystories.yaml's reference shape:
 
     A  dense    n_layers 6,  loop_count 1  ->  6 executed blocks, 1x params, 1x FLOPs
     B  looped   n_layers 6,  loop_count 4  -> 21 executed blocks, 1x params, 3.5x FLOPs
