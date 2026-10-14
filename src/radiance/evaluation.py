@@ -95,6 +95,7 @@ def evaluate_detailed(
     batch_losses: list[float] = []
     nats, n_bytes = 0.0, 0
     # DPO accuracies are per-row means, so they combine across chunks and batches by row count.
+    # Accumulated on the device, and read back once after the loop rather than synced per chunk.
     reward_correct, margin_correct, n_pairs = 0.0, 0.0, 0
     if token_bytes is not None and (sft or dpo):
         raise ValueError("evaluate: token_bytes (bits/byte) is only defined for pretraining")
@@ -116,8 +117,8 @@ def evaluate_detailed(
                         rejected_logits, r_ids, chunk["rejected_loss_mask"],
                         chunk["ref_chosen_logprob"], chunk["ref_rejected_logprob"], dpo_beta,
                     )  # margin discarded; the accuracies are reported alongside val/loss, not in it
-                    reward_correct += reward_acc.float().item() * chunk_units
-                    margin_correct += margin_acc.float().item() * chunk_units
+                    reward_correct = reward_correct + reward_acc.detach().float() * chunk_units
+                    margin_correct = margin_correct + margin_acc.detach().float() * chunk_units
                     n_pairs += chunk_units
                 elif sft:
                     out = model(chunk["input_ids"])
@@ -154,5 +155,7 @@ def evaluate_detailed(
         stderr = math.sqrt(var / count)
     bpb = nats / (math.log(2) * n_bytes) if token_bytes is not None and n_bytes else None
     if n_pairs:
-        return EvalResult(mean, stderr, bpb, reward_correct / n_pairs, margin_correct / n_pairs)
+        return EvalResult(
+            mean, stderr, bpb, float(reward_correct) / n_pairs, float(margin_correct) / n_pairs
+        )
     return EvalResult(mean, stderr, bpb)

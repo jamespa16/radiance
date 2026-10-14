@@ -96,6 +96,28 @@ def test_resolve_dpo_doc_mask_records_what_it_overrode():
     resolve_dpo_doc_mask(cfg)
     assert cfg.model.doc_attention_mask is False and cfg.dpo.doc_attention_mask_before_resolve is True
 
+    # An architecture without the mask is recorded too: that is the case inheritance must keep off.
+    cfg = Config(model=ModelConfig(doc_attention_mask=False), dpo=DPOConfig(enabled=True))
+    resolve_dpo_doc_mask(cfg)
+    assert cfg.dpo.doc_attention_mask_before_resolve is False
+
+
+def test_a_resumed_stage_inherits_from_its_resume_checkpoint(tmp_path):
+    out = tmp_path / "run"
+    out.mkdir()
+    resumed = _save(tmp_path, ModelConfig(d_model=32, head_dim=8, n_layers=3, max_seq_len=32))
+    resumed.rename(out / "step_5.pt")
+    raw = {
+        # init_from is gone (rotated away): a resume must not need it.
+        "train": {"init_from": str(tmp_path / "gone.pt"), "inherit_model_config": True,
+                  "resume_from": "auto", "output_dir": str(out)},
+    }
+    assert load_config(_write(tmp_path, raw)).model.n_layers == 3
+    # A fresh run (nothing to resume yet) still reads init_from.
+    raw["train"]["output_dir"] = str(tmp_path / "empty")
+    with pytest.raises(FileNotFoundError):
+        load_config(_write(tmp_path, raw))
+
 
 def test_inherit_requires_init_from(tmp_path):
     with pytest.raises(ValueError, match="requires train.init_from"):
@@ -140,6 +162,28 @@ def test_overrides_are_typed_and_validated(tmp_path):
         load_config_with_overrides(path, ["train.dtype=nvfp4", "model.fp4_linear=false"])
     # No temporary files left beside the config.
     assert sorted(p.name for p in tmp_path.iterdir()) == ["stage.yaml"]
+
+
+def test_string_fields_take_override_text_verbatim(tmp_path):
+    path = _write(tmp_path, {"dpo": {"enabled": True}})
+    cfg = load_config_with_overrides(
+        path, ["dpo.dataset=2026-10-14", "train.init_from=a #b.pt", "dpo.eval_split=null", "dpo.beta=0.05"]
+    )
+    assert cfg.dpo.dataset == "2026-10-14" and cfg.train.init_from == "a #b.pt"
+    assert cfg.dpo.eval_split is None and cfg.dpo.beta == 0.05
+
+
+def test_set_is_repeatable(monkeypatch, capsys):
+    from radiance import size
+
+    def run(*argv):
+        monkeypatch.setattr("sys.argv", ["radiance-size", *argv])
+        size.main()
+        return capsys.readouterr().out
+
+    both = run("--set", "model.d_model=64", "model.n_layers=3")
+    assert run("--set", "model.d_model=64", "--set", "model.n_layers=3") == both
+    assert run("--set", "model.n_layers=3") != both
 
 
 def test_overrides_fill_an_empty_section_and_need_no_writable_config_dir(tmp_path):

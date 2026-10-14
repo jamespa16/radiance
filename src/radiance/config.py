@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import random
 from dataclasses import MISSING, dataclass, field, fields, is_dataclass
 from pathlib import Path
 
+import numpy as np
 import torch
 import yaml
 
@@ -798,6 +800,15 @@ def resolve_device(device: str) -> str:
     return "cpu"
 
 
+def set_seed(seed: int) -> None:
+    """Seed every RNG a run draws from. Here rather than in train.py so radiance-rlaif, which never
+    trains, seeds the same way without importing the training stack."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
 _DTYPES = {
     "fp32": torch.float32,
     "fp16": torch.float16,
@@ -858,27 +869,36 @@ def _apply_dtype_sugar(cfg: Config) -> Config:
 
 def _inherit_model_config(raw: dict) -> dict:
     """Resolve `train.inherit_model_config`: `train.init_from`'s saved model config (and
-    data.tokenizer), overlaid with the keys this raw YAML spells out explicitly.
+    data.tokenizer) — or, when the run is resuming, the resume checkpoint's — overlaid with the
+    keys this raw YAML spells out explicitly.
 
     Raw-level for the same reason load_config's other cross-field checks are: only the raw dict
     distinguishes "this key was written down" from "this key is at its default", and it is exactly
     the written-down keys that must win over the checkpoint's.
     """
-    # Local import: export imports this module.
+    # Local imports: both modules import this one.
+    from radiance.checkpointing import find_resume_checkpoint
     from radiance.export import read_checkpoint_config
 
-    init_from = raw.get("train", {}).get("init_from")
+    train_raw = raw.get("train") or {}
+    init_from = train_raw.get("init_from")
     if not init_from:
         raise ValueError("train.inherit_model_config requires train.init_from to be set.")
-    source = read_checkpoint_config(init_from)
+    # A resumed stage takes its architecture from the checkpoint it resumes, which already holds
+    # the inherited config: init_from may since have been rotated away or overwritten (an RLAIF
+    # round reusing its policy path), and re-reading it would fail, or silently change the model
+    # under a run that is half trained.
+    resume_keys = {k: train_raw[k] for k in ("resume_from", "output_dir") if k in train_raw}
+    resume = find_resume_checkpoint(Config(train=TrainConfig(**resume_keys)))
+    source = read_checkpoint_config(resume if resume is not None else init_from)
     inherited = {f.name: getattr(source.model, f.name) for f in fields(source.model)}
     if source.dpo.enabled and not source.model.doc_attention_mask and not source.model.loop_attn_windows:
         # A DPO run's saved doc_attention_mask=False is losses.resolve_dpo_doc_mask's per-run
         # resolution (the mask is inert for one-pair-per-row packing), not an architecture choice.
         # Inherited into a stage that packs several examples per block — SFT after DPO — it would
         # silently let them attend to each other. Restore the value the run had before resolving
-        # it (an explicit false survives that way); a checkpoint saved before that was recorded
-        # leaves the field to its default. A DPO stage resolves it off again by itself.
+        # it, so an architecture that had the mask off keeps it off; a checkpoint saved before that
+        # was recorded leaves the field to its default. A DPO stage resolves it off again by itself.
         before = source.dpo.doc_attention_mask_before_resolve
         if before is None:
             del inherited["doc_attention_mask"]
@@ -891,9 +911,29 @@ def _inherit_model_config(raw: dict) -> dict:
     return raw
 
 
+_STRING_FIELD_TYPES = ("str", "str | None")
+
+
+def _override_value(section: str, field_name: str, value: str):
+    """An override's value: parsed as YAML, so `true`, `4.0` and `8` land typed — except for a
+    string-typed field, which takes the text as written. YAML would turn `2026-10-14` into a date
+    and cut `a #b` at the comment, and paths and dataset names are exactly what `--set` passes
+    when chaining stages. `null` (or nothing) still clears an optional string."""
+    section_type = next((f.type for f in fields(Config) if f.name == section), None)
+    section_cls = globals().get(section_type) if isinstance(section_type, str) else section_type
+    field_type = None
+    if section_cls is not None and is_dataclass(section_cls):
+        field_type = next((f.type for f in fields(section_cls) if f.name == field_name), None)
+    if field_type in _STRING_FIELD_TYPES:
+        if field_type.endswith("None") and value.strip() in ("", "null", "~", "None"):
+            return None
+        return value
+    return yaml.safe_load(value)
+
+
 def apply_overrides(raw: dict, assignments: list[str]) -> dict:
     """Apply `section.field=value` assignments (`--set` on radiance-train / radiance-size) to a raw
-    config dict, values parsed as YAML so `true`, `null`, `4.0` and `8` land typed."""
+    config dict; see _override_value for how each value is typed."""
     for assignment in assignments:
         if "=" not in assignment:
             raise ValueError(f"--set expects dotted.key=value, got {assignment!r}")
@@ -903,7 +943,7 @@ def apply_overrides(raw: dict, assignments: list[str]) -> dict:
             raise ValueError(f"--set key must name a section, e.g. model.d_model, got {key!r}")
         # `or {}`: a bare `sft:` line in the YAML loads as None, not as an empty section.
         raw[section] = raw.get(section) or {}
-        raw[section][field_name] = yaml.safe_load(value)
+        raw[section][field_name] = _override_value(section, field_name, value)
     return raw
 
 

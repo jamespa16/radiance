@@ -388,11 +388,14 @@ def resolve_dpo_doc_mask(cfg: Config) -> None:
     tokens_per_param already use here, which also means the value saved into the checkpoint is
     the one the run actually trained with.
     """
-    if not (cfg.dpo.enabled and doc_mask_is_inert_for_dpo(cfg.model)):
+    if not cfg.dpo.enabled:
         return
     # Recorded for config._inherit_model_config, which otherwise cannot tell this resolution from
-    # an architecture that never had the mask.
+    # an architecture that never had the mask — so recorded before the early return below, which
+    # is exactly the never-had-it case.
     cfg.dpo.doc_attention_mask_before_resolve = cfg.model.doc_attention_mask
+    if not doc_mask_is_inert_for_dpo(cfg.model):
+        return
     cfg.model.doc_attention_mask = False
     print(
         "[radiance] dpo.enabled: turning model.doc_attention_mask off — DPO packs one pair side "

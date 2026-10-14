@@ -34,9 +34,13 @@ Three pieces make that work without hand-editing:
 
 - **`radiance-train --set section.field=value`** — the same override syntax `radiance-size` already had (now shared as
   `config.load_config_with_overrides`). Overrides are applied to the raw YAML and go through `load_config` itself, so
-  its cross-field checks and `inherit_model_config` see them.
+  its cross-field checks and `inherit_model_config` see them. Repeatable (`--set a=1 --set b=2` keeps both). Values
+  are parsed as YAML, except a string-typed field's, which is taken verbatim: YAML would make `dpo.dataset=2026-10-14`
+  a date and cut `a #b` at the comment.
 - **`train.inherit_model_config`** — the `model:` section (and `data.tokenizer`) comes from `init_from`'s own saved
-  config, with only the keys this YAML's `model:` spells out applied on top. Before it, every post-training config
+  config, with only the keys this YAML's `model:` spells out applied on top. A resuming run reads the resume
+  checkpoint's instead, which already holds the inherited config, so a resume no longer needs `init_from` to exist,
+  or to be unchanged. Before it, every post-training config
   carried a hand copy of the base's `model:` block, and `load_pretrained_weights` only checks *shape* fields: a copy
   that drops a behavioral one (`loop_count`, a RoPE setting, `qk_norm`) loads cleanly and fine-tunes a different model
   from the one pretrained. Opt-in, because it is not inert — an existing config's *omitted* model keys would change
@@ -325,16 +329,22 @@ default judge: "Paris" for the capital of France scored 2.66, "Berlin" -4.41, "b
   train time, so one sampled round can be re-filtered without re-sampling. Every sample and score is kept in the
   output (`completions`, `completion_scores`, `completion_finished`) for the same reason.
 
-Completions are decoded jointly with the prompt and split off it (`_decode_completion`), so `assistant_prefix +
-completion` — what the DPO pipeline rebuilds — is exactly the string the policy produced, leading space included.
-That holds only under the turn template the policy was prompted with (its own `sft.*`, or `dpo.*` for a DPO or plain
-checkpoint), so `pairs` records it in `rlaif_manifest.json` and the DPO pipeline refuses to train the pairs under
-different `dpo.user_prefix`/`assistant_prefix`.
-Re-tokenizing that string can still merge differently at the prefix boundary; that is the usual cost of a text-level
-handoff, and is why the pairs are text rather than ids (the DPO pipeline, its caching and its tests all take text).
+**The pairs are the policy's own token sequences.** Re-tokenizing sampled text is not: with GPT-2's BPE the policy
+samples after `":", " "` (the assistant prefix's trailing space as its own token), but `"Assistant: Hello"`
+re-tokenizes as `":", " Hello"` — a sequence it never produced, which DPO would then score. So the prompt is
+tokenized turn by turn (`sft_data.tokenize_chat_prompt`, the same construction `tokenize_sft_example` uses), sampling
+runs after those ids, and `pairs` writes the sampled ids beside the text (`chosen_token_ids`, `rejected_token_ids`,
+`completion_token_ids`). The DPO pipeline, given a row with them and `prompt_column` set, rebuilds the prompt with
+the same function and appends the ids plus EOS instead of re-tokenizing. The text (decoded jointly with the prompt and
+split off it, `_decode_completion`) is what the judge scores and a reader sees.
+
+That only holds under the turn template and tokenizer the policy was sampled with (its own `sft.*`, or `dpo.*` for a
+DPO or plain checkpoint), so `pairs` records both in `rlaif_manifest.json` and the DPO pipeline refuses to train the
+pairs under a different `dpo.user_prefix`/`assistant_prefix` or `data.tokenizer`.
 
 A round that yields few pairs almost always means few samples sampled EOS in time; `pairs` prints the finished
-fraction and says so below 50%. A policy that rarely stops is not ready for preference tuning — the random-init smoke
+fraction and says so below 50%. (When no prompt fits the context at all, it says that instead: raising
+`--max-new-tokens` would make it worse.) A policy that rarely stops is not ready for preference tuning — the random-init smoke
 policy finished 0.6% of its samples and produced 1 pair from 48 prompts, the intended behavior.
 
 **`radiance-rlaif eval`** samples one completion per prompt from each `--checkpoint` (same seed for each), scores

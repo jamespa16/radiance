@@ -89,6 +89,15 @@ def test_load_chat_dataset_reads_local_save_to_disk_and_jsonl(tmp_path):
     assert load_chat_dataset(str(path))["train"]["prompt"] == ["p0", "p1", "p2", "p3"]
 
 
+def test_a_directory_of_raw_data_files_still_goes_to_load_dataset(tmp_path):
+    # Not a save_to_disk directory: a cloned hub repo / a folder of jsonl splits, which
+    # load_dataset(dir) has always read.
+    data = tmp_path / "raw"
+    data.mkdir()
+    (data / "train.jsonl").write_text("\n".join(json.dumps({"prompt": f"p{i}"}) for i in range(3)))
+    assert load_chat_dataset(str(data))["train"]["prompt"] == ["p0", "p1", "p2"]
+
+
 def test_hub_subset_is_passed_through(monkeypatch):
     calls = []
     monkeypatch.setattr(sft_mod, "load_dataset", lambda *a: calls.append(a) or DatasetDict({"train": _rows(1)}))
@@ -144,6 +153,24 @@ def test_dpo_score_filter_is_in_the_key_only_when_set(tmp_path):
     )
     assert _dpo_cache_path(base) != _dpo_cache_path(filtered)
     assert _dpo_cache_path(base) == _dpo_cache_path(unset_columns_only)
+
+
+def test_shared_turn_masking_rekeys_only_the_objectives_it_changes(tmp_path):
+    """Unscoring shared turns changes nothing under the summed objectives (the turns cancel), so
+    a cache built before it must still be found for them; IPO/sft_weight must not reuse one."""
+    ref = tmp_path / "ref.pt"
+    ref.write_bytes(b"x")
+
+    def key(**dpo):
+        return _dpo_cache_path(Config(dpo=DPOConfig(dataset="d", reference_checkpoint=str(ref), **dpo)))
+
+    old_formula = "|".join(
+        ["d", "gpt2", "512", "None", "None", "chosen", "rejected", "\n\nUser: ", "\n\nAssistant: ", "0"]
+    )
+    assert key().parent.name == hashlib.sha256(old_formula.encode()).hexdigest()[:16]
+    assert key(loss_type="hinge") == key(label_smoothing=0.1) == key()
+    assert key(loss_type="ipo") != key() and key(sft_weight=1.0) != key()
+    assert key(loss_type="ipo", prompt_column="p") == key(prompt_column="p")  # nothing shared is scored
 
 
 # --- hh-rlhf transcripts ----------------------------------------------------------------------
@@ -226,6 +253,26 @@ def test_ipo_ignores_turns_both_sides_share():
     torch.testing.assert_close(loss_for("4."), loss_for("four, which is a long shared reply"))
 
 
+def test_rlaif_rows_train_on_the_sampled_ids_not_a_retokenization():
+    tok = _FakeTokenizer()
+    cfg = Config(dpo=DPOConfig(prompt_column="prompt"))
+    # Ids that are deliberately *not* what the text tokenizes to: a BPE can merge the sampled
+    # tokens differently once they are text again.
+    example = {"prompt": "q", "chosen": "a b", "rejected": "c", "chosen_token_ids": [7, 8, 9], "rejected_token_ids": [5]}
+    row = dpo_mod._tokenize_dpo_row(example, tok, cfg, 16)
+    prompt_ids, prompt_mask = dpo_mod.tokenize_chat_prompt(
+        [{"role": "user", "content": "q"}], tok, cfg.dpo.user_prefix, cfg.dpo.assistant_prefix
+    )
+    n = len(prompt_ids)
+    assert row["chosen_input_ids"][: n + 4] == prompt_ids + [7, 8, 9, tok.eos_token_id]
+    assert row["rejected_input_ids"][: n + 2] == prompt_ids + [5, tok.eos_token_id]
+    assert row["chosen_loss_mask"][: n + 4] == prompt_mask + [1, 1, 1, 1]
+    assert row["chosen_loss_mask"][n + 4 :] == [0] * (16 - n - 4)
+    # The text path's prompt and mask layout is the same, so the two agree wherever the ids do.
+    text_row = dpo_mod._tokenize_dpo_row({"prompt": "q", "chosen": "a b", "rejected": "c"}, tok, cfg, 16)
+    assert text_row["chosen_input_ids"][:n] == prompt_ids
+
+
 def test_an_empty_train_split_says_so():
     with pytest.raises(ValueError, match="is empty"):
         select_splits(DatasetDict({"train": _rows(0)}), "d", "train", None, (), 0, None)
@@ -237,10 +284,14 @@ def test_rlaif_pairs_refuse_another_turn_template(tmp_path):
     )
     cfg = Config(dpo=DPOConfig(dataset=str(tmp_path)))
     with pytest.raises(ValueError, match="turn template"):
-        dpo_mod.check_rlaif_turn_template(cfg)
+        dpo_mod.check_rlaif_manifest(cfg)
     cfg.dpo.user_prefix, cfg.dpo.assistant_prefix = "<u>", "<a>"
-    dpo_mod.check_rlaif_turn_template(cfg)
-    dpo_mod.check_rlaif_turn_template(Config(dpo=DPOConfig(dataset="hub/id")))  # no manifest: no check
+    dpo_mod.check_rlaif_manifest(cfg)
+    dpo_mod.check_rlaif_manifest(Config(dpo=DPOConfig(dataset="hub/id")))  # no manifest: no check
+
+    (tmp_path / "rlaif_manifest.json").write_text(json.dumps({"tokenizer": "other-tok"}))
+    with pytest.raises(ValueError, match="other-tok"):
+        dpo_mod.check_rlaif_manifest(cfg)
 
 
 # --- score-margin filter, end to end through the packed DPO dataset ----------------------------

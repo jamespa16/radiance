@@ -110,7 +110,7 @@ Only the fields you need to change — everything else falls back to the datacla
 Post-training: supervised fine-tuning on chat/instruction data. A mode switch (like `use_moe`/`use_router`), not an inert default-on feature — enabling it swaps `train.py`'s data pipeline and loss function entirely. Pair with `train.init_from` to seed the model from a pretrained checkpoint; see `configs/tinystories_sft.yaml` for a worked example.
 
 - **`enabled`** — route `train.py` through `build_sft_dataloaders`/`compute_sft_loss` instead of the pretrain path. Default `false`.
-- **`dataset`** — HF `user/dataset`-style instruction dataset, or a local dataset (a `save_to_disk` directory, or a `.json`/`.jsonl` file). Required when `enabled`.
+- **`dataset`** — HF `user/dataset`-style instruction dataset, or a local dataset (a `save_to_disk` directory, a `.json`/`.jsonl` file, or any directory `load_dataset` reads). Required when `enabled`.
 - **`subset`** — HF dataset config name, e.g. `all` for `HuggingFaceTB/smoltalk`. `null` = the dataset's default.
 - **`train_split`** — the split to train on. Default `"train"`; e.g. `train_sft` for `HuggingFaceH4/ultrachat_200k`, `train_prefs` for `HuggingFaceH4/ultrafeedback_binarized`.
 - **`eval_split`** — `null` (default): `validation` if the dataset has one, else carve `eval_split_size` rows off the train split. Set to name the split explicitly (e.g. `test_sft`, `test_prefs`).
@@ -129,7 +129,7 @@ Post-training: Direct Preference Optimization on `(prompt, chosen, rejected)` tr
 Each `(prompt+chosen)`/`(prompt+rejected)` sequence is packed as its own row, independently padded to `seq_len` with trailing `eos_token_id` (loss-masked) — "packing of one," unlike `sft`'s many-examples-per-block packing — so a pair's two halves can never be separated by `DataLoader` shuffling. This needs no `model/` changes: attention is strictly causal and the real content always precedes its own padding within a row, so the padding can never influence the scored tokens' logits.
 
 - **`enabled`** — route `train.py` through `build_dpo_dataloaders`/`compute_dpo_loss_from_logits` instead of the pretrain/SFT path. Default `false`.
-- **`dataset`** — HF `user/dataset`-style preference dataset, or a local dataset (a `save_to_disk` directory — what `radiance-rlaif pairs` writes — or a `.json`/`.jsonl` file). Required when `enabled`.
+- **`dataset`** — HF `user/dataset`-style preference dataset, or a local dataset (a `save_to_disk` directory — what `radiance-rlaif pairs` writes — a `.json`/`.jsonl` file, or any directory `load_dataset` reads). Required when `enabled`.
 - **`subset`** — HF dataset config name, e.g. `all` for `HuggingFaceTB/smoltalk`. `null` = the dataset's default.
 - **`train_split`** — the split to train on. Default `"train"`; e.g. `train_sft` for `HuggingFaceH4/ultrachat_200k`, `train_prefs` for `HuggingFaceH4/ultrafeedback_binarized`.
 - **`eval_split`** — `null` (default): `validation`, then `test`, if the dataset has one, else carve `eval_split_size` rows off the train split. Set to name the split explicitly (e.g. `test_sft`, `test_prefs`).

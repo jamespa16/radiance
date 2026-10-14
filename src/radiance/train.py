@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import argparse
 import math
-import random
 import time
 from pathlib import Path
 
-import numpy as np
 import torch
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -17,6 +15,7 @@ from radiance.config import (
     load_config_with_overrides,
     resolve_device,
     resolve_dtype,
+    set_seed,
 )
 from radiance.data import (
     EpochPermutationSampler,
@@ -54,13 +53,6 @@ from .losses import (
     resolve_dpo_doc_mask,
     validate_post_training_config,
 )
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
 def build_lr_scheduler(optimizer: torch.optim.Optimizer, cfg: Config) -> LambdaLR:
     warmup_steps = cfg.train.warmup_steps
     max_steps = cfg.train.max_steps
@@ -787,10 +779,11 @@ def main() -> None:
     parser.add_argument(
         "--set",
         nargs="+",
+        action="extend",  # repeatable: --set a=1 --set b=2 keeps both
         default=[],
         metavar="KEY=VALUE",
-        help="section.field=value overrides applied on top of --config, parsed as YAML — e.g. "
-        "chaining post-training stages: --set train.init_from=checkpoints/sft/step_800.pt",
+        help="section.field=value overrides applied on top of --config, parsed as YAML (string fields "
+        "verbatim) — e.g. chaining post-training stages: --set train.init_from=checkpoints/sft/step_800.pt",
     )
     args = parser.parse_args()
 

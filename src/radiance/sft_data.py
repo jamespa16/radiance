@@ -26,11 +26,14 @@ def load_chat_dataset(dataset: str, subset: str | None = None) -> DatasetDict:
     `save_to_disk` directory (what radiance-rlaif writes), or a local .json/.jsonl file.
 
     Shared by the SFT and DPO pipelines. A local directory holding a single `Dataset` rather than a
-    `DatasetDict` is treated as its train split. The no-subset hub call is the bare
-    `load_dataset(dataset)` it always was.
+    `DatasetDict` is treated as its train split. Any other directory (raw data files, a cloned hub
+    repo) goes to `load_dataset` as it always did, as does a hub id — the no-subset call is the
+    bare `load_dataset(dataset)` it always was.
     """
     path = Path(dataset)
-    if path.is_dir():
+    # save_to_disk writes exactly one of these at the top level: dataset_dict.json for a
+    # DatasetDict, state.json for a single Dataset.
+    if path.is_dir() and ((path / "dataset_dict.json").is_file() or (path / "state.json").is_file()):
         loaded = load_from_disk(str(path))
         return loaded if isinstance(loaded, DatasetDict) else DatasetDict({"train": loaded})
     if path.is_file() and path.suffix in (".json", ".jsonl"):
@@ -165,6 +168,23 @@ def tokenize_sft_example(
     ids.append(tokenizer.eos_token_id)
     mask.append(1)
     return ids, mask
+
+
+def tokenize_chat_prompt(
+    messages: list[dict], tokenizer: PreTrainedTokenizerBase, user_prefix: str, assistant_prefix: str
+) -> tuple[list[int], list[int]]:
+    """A conversation plus an open assistant turn, as (ids, loss_mask): the token-level form of
+    format_chat_messages, built turn by turn exactly as tokenize_sft_example builds them (and with
+    its mask, so the open turn's prefix tokens are 1, as an assistant turn's are). The prefix is
+    tokenized on its own, there being no content yet to tokenize it with.
+
+    radiance-rlaif samples after these ids and the DPO pipeline rebuilds its pairs on them, which
+    is what makes a pair the policy's own token sequence rather than a re-tokenization of its text.
+    """
+    ids, mask = tokenize_sft_example(messages, tokenizer, user_prefix, assistant_prefix)
+    ids, mask = ids[:-1], mask[:-1]  # the conversation is not over: no EOS
+    prefix = tokenizer(assistant_prefix)["input_ids"]
+    return ids + prefix, mask + [1] * len(prefix)
 
 
 def format_sft_prompt(user_message: str, cfg: Config) -> str:

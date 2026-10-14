@@ -34,7 +34,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import random
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -42,10 +41,10 @@ import torch
 from datasets import Dataset, DatasetDict
 from transformers import PreTrainedTokenizerBase
 
-from radiance.config import Config, resolve_device
+from radiance.config import Config, resolve_device, set_seed
 from radiance.generate import BatchItem, generate_tokens_batched, load_checkpoint
 from radiance.model import DenseTransformer
-from radiance.sft_data import format_chat_messages, load_chat_dataset
+from radiance.sft_data import load_chat_dataset, tokenize_chat_prompt
 
 DEFAULT_JUDGE = "Skywork/Skywork-Reward-V2-Qwen3-0.6B"
 MANIFEST_NAME = "rlaif_manifest.json"
@@ -58,6 +57,9 @@ class Completion:
     # can be a pair's *rejected* side but never its chosen one: DPO's tokenizer appends EOS to
     # both, so a truncated "chosen" would teach the policy to stop mid-sentence.
     finished: bool
+    # The sampled ids themselves (no EOS). The DPO pipeline trains on these rather than on a
+    # re-tokenization of `text`, which can merge differently at the prompt boundary.
+    token_ids: list[int] | None = None
 
 
 def load_prompts(
@@ -91,15 +93,16 @@ def load_prompts(
 
 
 def turn_template(cfg: Config) -> dict:
-    """The (user_prefix, assistant_prefix) format_chat_messages prompts this config with —
-    recorded in the pair manifest so the DPO pipeline can refuse to train the pairs under another."""
+    """The (user_prefix, assistant_prefix) a chat-tuned config is prompted with (its sft.* when
+    SFT'd, else dpo.*) — recorded in the pair manifest so the DPO pipeline can refuse to train the
+    pairs under another."""
     section = cfg.sft if cfg.sft.enabled else cfg.dpo
     return {"user_prefix": section.user_prefix, "assistant_prefix": section.assistant_prefix}
 
 
 def _chat_cfg(cfg: Config) -> Config:
-    """The checkpoint's own config, for format_chat_messages — which needs sft or dpo enabled to
-    know the turn template. A plain pretrained checkpoint has neither; it is prompted with the DPO
+    """The checkpoint's own config, for turn_template — which needs sft or dpo enabled to know
+    the turn template. A plain pretrained checkpoint has neither; it is prompted with the DPO
     defaults, which are also the template the pairs written here will be trained under."""
     if cfg.sft.enabled or cfg.dpo.enabled:
         return cfg
@@ -128,10 +131,14 @@ def sample_completions(
     without saying whether the token it sampled there was EOS, so a response that used exactly
     max_new_tokens and then stopped would otherwise count as unfinished. A row that runs into the
     extra token is unfinished, and is cut back to max_new_tokens."""
-    chat_cfg = _chat_cfg(cfg)
+    template = turn_template(_chat_cfg(cfg))
     budget = model.cfg.max_seq_len - (max_new_tokens + 1)
-    formatted = [format_chat_messages([{"role": "user", "content": p}], chat_cfg) for p in prompts]
-    prompt_ids = [tokenizer(text)["input_ids"] for text in formatted]
+    prompt_ids = [
+        tokenize_chat_prompt(
+            [{"role": "user", "content": p}], tokenizer, template["user_prefix"], template["assistant_prefix"]
+        )[0]
+        for p in prompts
+    ]
     work = [(i, s) for i, ids in enumerate(prompt_ids) if len(ids) <= budget for s in range(num_samples)]
     results: list[list[Completion] | None] = [None] * len(prompts)
     for i, ids in enumerate(prompt_ids):
@@ -162,8 +169,8 @@ def sample_completions(
                         generated[row].append(token)
         for (i, _), gen in zip(chunk, generated):
             finished = len(gen) <= max_new_tokens
-            text = _decode_completion(tokenizer, prompt_ids[i], gen[:max_new_tokens])
-            results[i].append(Completion(text, finished))
+            gen = gen[:max_new_tokens]
+            results[i].append(Completion(_decode_completion(tokenizer, prompt_ids[i], gen), finished, gen))
         print(f"[radiance] rlaif: sampled {min(start + batch_size, len(work))}/{len(work)} completions", flush=True)
     return results
 
@@ -171,8 +178,8 @@ def sample_completions(
 def _decode_completion(tokenizer: PreTrainedTokenizerBase, prompt_ids: list[int], gen: list[int]) -> str:
     """The completion as the text that follows the prompt — decoded jointly with the prompt and
     then split off it, for the reason generate.generate gives (a BPE decode of a continuation is
-    not always its decode in isolation). The DPO pipeline later rebuilds `assistant_prefix +
-    completion`, which is then exactly the string the policy produced, leading space and all."""
+    not always its decode in isolation). This is what the judge scores and what a reader sees;
+    the DPO pipeline trains on the Completion's token_ids instead."""
     full = tokenizer.decode(prompt_ids + gen, skip_special_tokens=True)
     prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=True)
     if full.startswith(prompt_text):
@@ -274,20 +281,25 @@ def build_preference_pairs(
             continue
         if comp_scores[best] - comp_scores[worst] < min_margin:
             continue
-        pairs.append(
-            {
-                "prompt": prompt,
-                "chosen": comps[best].text,
-                "rejected": comps[worst].text,
-                "chosen_score": comp_scores[best],
-                "rejected_score": comp_scores[worst],
-                # Every sample and score, so a later round can re-pair (or re-filter) without
-                # re-sampling.
-                "completions": [c.text for c in comps],
-                "completion_scores": list(comp_scores),
-                "completion_finished": [c.finished for c in comps],
-            }
-        )
+        pair = {
+            "prompt": prompt,
+            "chosen": comps[best].text,
+            "rejected": comps[worst].text,
+            "chosen_score": comp_scores[best],
+            "rejected_score": comp_scores[worst],
+            # Every sample and score, so a later round can re-pair (or re-filter) without
+            # re-sampling.
+            "completions": [c.text for c in comps],
+            "completion_scores": list(comp_scores),
+            "completion_finished": [c.finished for c in comps],
+        }
+        if all(c.token_ids is not None for c in comps):
+            # What the DPO pipeline trains on (dpo_data._tokenize_dpo_row), so a pair is the
+            # policy's own token sequence, not a re-tokenization of its text.
+            pair["chosen_token_ids"] = comps[best].token_ids
+            pair["rejected_token_ids"] = comps[worst].token_ids
+            pair["completion_token_ids"] = [c.token_ids for c in comps]
+        pairs.append(pair)
     return pairs
 
 
@@ -299,7 +311,8 @@ def _mean_stderr(values: list[float]) -> tuple[float, float]:
 
 
 def _sample_from_checkpoint(path: str, prompts: list[str], args, num_samples: int, device: str):
-    """(completions, the turn template they were sampled under)."""
+    """(completions, the manifest fields the DPO pipeline checks the pairs against: the turn
+    template they were sampled under, and the tokenizer their token ids belong to)."""
     model, cfg, tokenizer = load_checkpoint(path, device)
     completions = sample_completions(
         model, cfg, tokenizer, prompts, num_samples, args.max_new_tokens,
@@ -308,20 +321,21 @@ def _sample_from_checkpoint(path: str, prompts: list[str], args, num_samples: in
     del model
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
-    return completions, turn_template(cfg)
-
-
-def _seed(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
+    return completions, {"turn_template": turn_template(cfg), "tokenizer": cfg.data.tokenizer}
 
 
 def run_pairs(args) -> None:
     device = resolve_device(args.device)
-    _seed(args.seed)
+    set_seed(args.seed)
     prompts = load_prompts(args.prompts, args.prompt_column, args.split, args.subset, args.max_prompts, args.seed)
     print(f"[radiance] rlaif: {len(prompts)} prompts from {args.prompts}:{args.split}")
-    completions, template = _sample_from_checkpoint(args.checkpoint, prompts, args, args.num_samples, device)
+    completions, sampled_under = _sample_from_checkpoint(args.checkpoint, prompts, args, args.num_samples, device)
+    if all(c is None for c in completions):
+        raise SystemExit(
+            "[radiance] rlaif: no prompt fits the policy's context with room for "
+            f"--max-new-tokens={args.max_new_tokens}; see the skipped count above. Lower "
+            "--max-new-tokens, or use shorter prompts — the policy's stopping is not the problem."
+        )
 
     judge = RewardModelJudge(args.judge, device, args.judge_batch_size)
     scores = score_completions(judge, prompts, completions)
@@ -352,15 +366,15 @@ def run_pairs(args) -> None:
     }
     out = Path(args.output)
     DatasetDict({"train": Dataset.from_list(pairs)}).save_to_disk(str(out))
-    manifest = {"args": vars(args), "stats": stats, "turn_template": template}
+    manifest = {"args": vars(args), "stats": stats, **sampled_under}
     (out / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2))
     print(f"[radiance] rlaif: wrote {len(pairs)} pairs to {out}")
     print(json.dumps(stats, indent=2))
     print(
         "[radiance] rlaif: train on them with a DPO config setting dpo.dataset: "
         f"{out}, dpo.prompt_column: prompt (see configs/post_training/dpo_rlaif.yaml), and "
-        f"dpo.user_prefix/assistant_prefix {template['user_prefix']!r}/{template['assistant_prefix']!r}, "
-        "the turn template these were sampled under"
+        f"dpo.user_prefix/assistant_prefix {sampled_under['turn_template']['user_prefix']!r}/"
+        f"{sampled_under['turn_template']['assistant_prefix']!r}, the turn template these were sampled under"
     )
 
 
@@ -392,7 +406,7 @@ def run_eval(args) -> None:
     per_ckpt: list[list[list[Completion] | None]] = []
     for path in args.checkpoint:
         # Same seed per checkpoint, so sampling noise is matched as closely as the models allow.
-        _seed(args.seed)
+        set_seed(args.seed)
         per_ckpt.append(_sample_from_checkpoint(path, prompts, args, 1, device)[0])
 
     # Only prompts every checkpoint produced a completion for, so the win rates compare like with like.

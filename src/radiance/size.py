@@ -74,6 +74,7 @@ def main() -> None:
     parser.add_argument(
         "--set",
         nargs="+",
+        action="extend",  # repeatable: --set a=1 --set b=2 keeps both
         default=[],
         metavar="KEY=VALUE",
         help="dotted.key=value overrides applied on top of --config, parsed as YAML",

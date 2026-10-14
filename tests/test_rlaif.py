@@ -21,6 +21,7 @@ from radiance.config import Config, DataConfig, DPOConfig, ModelConfig, SFTConfi
 from radiance.dpo_data import _load_or_build_dpo_packed
 from radiance.model import DenseTransformer
 from radiance.rlaif import Completion, build_preference_pairs, sample_completions, score_completions, win_rates
+from radiance.sft_data import tokenize_chat_prompt
 from tests._fake_tokenizer import WordTokenizer
 
 VOCAB = 64
@@ -192,6 +193,23 @@ def test_eval_with_no_prompt_that_fits_is_a_clear_error(tmp_path, monkeypatch):
         rlaif.run_eval(args)
 
 
+def test_pairs_with_no_prompt_that_fits_blames_the_prompts_not_the_policy(tmp_path, monkeypatch):
+    model, cfg = _policy()
+    tok = _tokenizer()
+    prompts_path = tmp_path / "prompts.jsonl"
+    prompts_path.write_text(json.dumps({"prompt": "w1"}))
+    monkeypatch.setattr(rlaif, "load_checkpoint", lambda path, device: (model, cfg, tok))
+    monkeypatch.setattr(rlaif, "RewardModelJudge", _LengthJudge)
+    args = argparse.Namespace(
+        checkpoint="policy.pt", output=str(tmp_path / "out"), num_samples=2, min_margin=0.0,
+        prompts=str(prompts_path), prompt_column="prompt", split="train", subset=None, max_prompts=None,
+        max_new_tokens=48, temperature=1.0, top_k=0, batch_size=4, judge="fake", judge_batch_size=8,
+        device="cpu", seed=0,
+    )
+    with pytest.raises(SystemExit, match="no prompt fits"):
+        rlaif.run_pairs(args)
+
+
 # --- pairs -> DPO dataset, end to end ---------------------------------------------------------
 
 
@@ -223,7 +241,7 @@ def test_pairs_output_loads_as_a_dpo_dataset(tmp_path, monkeypatch):
     ref = tmp_path / "ref.pt"
     ref.write_bytes(b"x")
     dpo_cfg = Config(
-        data=DataConfig(seq_len=32, num_workers=0),
+        data=DataConfig(tokenizer=cfg.data.tokenizer, seq_len=32, num_workers=0),
         dpo=DPOConfig(
             enabled=True, dataset=str(out), prompt_column="prompt", eval_split_size=2,
             score_chosen_column="chosen_score", score_rejected_column="rejected_score", min_score_margin=1.0,
@@ -234,6 +252,21 @@ def test_pairs_output_loads_as_a_dpo_dataset(tmp_path, monkeypatch):
     pairs = DatasetDict.load_from_disk(str(out))["train"]
     kept = sum(c - r >= 1.0 for c, r in zip(pairs["chosen_score"], pairs["rejected_score"]))
     assert len(packed["validation"]) + len(packed["train"]) <= kept
-    row = packed["train"][0]
-    # The chosen side really is the policy's own text under the DPO turn template.
-    assert int(row["chosen_loss_mask"].sum()) >= 1
+    # Each packed side is the policy's own sampled ids after the prompt it was sampled with, not a
+    # re-tokenization of its text.
+    expected = set()
+    for pair in pairs:
+        prompt_ids, _ = tokenize_chat_prompt(
+            [{"role": "user", "content": pair["prompt"]}], tok, cfg.sft.user_prefix, cfg.sft.assistant_prefix
+        )
+        for side in ("chosen", "rejected"):
+            expected.add(tuple(prompt_ids + pair[f"{side}_token_ids"] + [tok.eos_token_id]))
+    n_rows = 0
+    for split in packed.values():
+        for row in split:
+            for side in ("chosen", "rejected"):
+                mask = row[f"{side}_loss_mask"].tolist()
+                real_len = len(mask) - mask[::-1].index(1)
+                assert tuple(row[f"{side}_input_ids"][:real_len].tolist()) in expected
+            n_rows += 1
+    assert n_rows > 0
