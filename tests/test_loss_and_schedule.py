@@ -143,3 +143,51 @@ def test_first_step_is_not_at_zero_lr():
 def test_unknown_schedule_raises():
     with pytest.raises(ValueError, match="lr_schedule"):
         _lr_curve(max_steps=10, lr_schedule="linear")
+
+
+def test_wsd_new_fields_are_inert_at_their_defaults():
+    """wsd_decay_steps=None and wsd_decay_start_ratio=1.0 must reproduce the ratio-driven WSD
+    curve exactly — every existing wsd config's schedule is unchanged."""
+    import math
+
+    curve = _lr_curve(max_steps=100, warmup_ratio=0.1, lr_schedule="wsd", wsd_decay_ratio=0.2, min_lr_ratio=0.1)
+    for step, lr in enumerate(curve):
+        if step < 10:
+            expected = (step + 1) / 10
+        elif step < 80:
+            expected = 1.0
+        else:
+            expected = 0.1 + 0.9 * (1.0 - math.sqrt((step - 80) / 20))
+        assert lr == expected, step
+
+
+def test_wsd_decay_steps_overrides_the_ratio():
+    curve = _lr_curve(
+        max_steps=100, warmup_ratio=0.1, lr_schedule="wsd", wsd_decay_ratio=0.2, wsd_decay_steps=5
+    )
+    assert all(lr == pytest.approx(1.0) for lr in curve[10:95])
+    assert curve[95] == pytest.approx(1.0) and curve[96] < 1.0  # decay over exactly the last 5
+
+
+def test_decay_branch_continues_from_the_checkpoint_multiplier():
+    """A --decay-from branch off a checkpoint at multiplier 0.78 (a cosine checkpoint mid-run)
+    must start at 0.78 — no jump back up to full LR — and fall monotonically to min_lr_ratio."""
+    param = torch.nn.Parameter(torch.zeros(1))
+    optimizer = torch.optim.SGD([param], lr=1.0)
+    cfg = Config(train=TrainConfig(
+        max_steps=1200, warmup_ratio=0.02, lr_schedule="wsd", wsd_decay_steps=200,
+        wsd_decay_start_ratio=0.78, min_lr_ratio=0.1,
+    ))
+    scheduler = build_lr_scheduler(optimizer, cfg)
+    for _ in range(1000):  # stand-in for the resumed scheduler state at step 1000
+        optimizer.step()
+        scheduler.step()
+    curve = []
+    for _ in range(200):
+        curve.append(scheduler.get_last_lr()[0])
+        optimizer.step()
+        scheduler.step()
+    curve.append(scheduler.get_last_lr()[0])
+    assert curve[0] == pytest.approx(0.78)
+    assert all(a > b for a, b in zip(curve, curve[1:]))
+    assert curve[-1] == pytest.approx(0.1)

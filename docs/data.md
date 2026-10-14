@@ -61,6 +61,45 @@ this fail fast rather than corrupt). Once a worker's raw partition is fully cons
 data — a one-time warning is logged. Size `disk_cache_max_gb` to cover a full epoch, or skip disk-cache mode
 entirely, for open-ended multi-epoch training over a dataset larger than the cache.
 
+## Pretokenized data
+
+`data.pretokenized_dir` (opt-in, default `null`) trains from flat token files on local disk, written beforehand by
+`radiance-pretokenize --config <cfg>` (`pretokenize.py`), instead of any of the paths above. It exists because V1
+streamed fineweb over the network for its whole run and a network outage ended it. The tool reads the same config's
+`dataset`/`text_column`/`tokenizer`/`eval_split_size`, writes `val.bin` (the held-out documents — exactly the carve
+above, so the same 2,000 documents V1 scored), one `train_NNN.bin` per worker (documents joined by EOS, the same
+packing as everywhere else) and `meta.json` last, whose presence marks the directory complete. By default it writes
+the tokens the config's run will draw (from `tokens_per_param` or `max_steps`) plus 1%; `--train-tokens` overrides.
+
+- **Where the tokens come from.** Each worker reads a disjoint 1/P of the corpus's files, in a seeded shuffled
+  order (`IterableDataset.shuffle` permutes files as well as buffering documents), so a partial pass samples the
+  whole corpus rather than its first files — fineweb's are ordered by crawl dump. The held-out documents are
+  removed from train by content hash, since the shuffled stream can reach them.
+- **Interruption.** Each worker fsyncs its file and then records its position in `train_NNN.json`; re-running the
+  same command truncates each file to that position and continues. The seeded shuffle replays the same order, so
+  the result is byte-identical to an uninterrupted run (`tests/test_pretokenized.py` pins this).
+- **Workers hard-exit** (`os._exit`) once their output is durable. A worker stops at its quota partway through a live
+  HF stream, and that stream's teardown is unbounded: in-flight parquet reads fail against closing sockets and
+  retry with backoff (`'[Errno 9] Bad file descriptor' ... Retrying`). Measured at ~40 s per exit on a healthy
+  connection; the first real run on a flaky one hung after all its data was written.
+- **Reading.** `PretokenizedDataset` cuts `seq_len` blocks through `np.memmap` at read time (so one directory serves
+  any `seq_len`), and `EpochPermutationSampler` draws a seeded permutation over *every* block per epoch. An epoch's
+  order is a pure function of `(seed, epoch)`, so the data position is one integer and resume is exact — no block
+  repeated, none skipped — where the streaming disk cache is exact only up to its shuffle buffer. The loader checks
+  `meta.json`'s tokenizer and EOS id against the config and refuses a mismatch.
+
+`uint16` storage while the vocabulary fits (V2: ~18.5 GB for 9.2B tokens). `data.dataset_mix` is rejected alongside
+it, since the directory holds one corpus.
+
+## Validation is never shuffled
+
+Every validation loader yields the same blocks in the same order on every eval. The streaming disk-cache path used
+to run validation through the same shuffle buffer as train, and `evaluate()` reads only the first
+`eval_max_batches` — so under `persistent_workers`, whose `random` state carries across evals, **each eval scored a
+different random subset of the held-out set**. V1 scored ~400 of ~2,000 held-out blocks per eval, redrawn each time,
+which is the ~0.02 wobble in its `val/loss` (and consistent with the ~0.019 stderr a *full* pass over those blocks
+measures). `tests/test_run_observability.py` pins two consecutive evals to identical blocks.
+
 ## Dataset mix
 
 `data.dataset_mix` (a path to a YAML file, default `null`) trains on a **weighted blend of several

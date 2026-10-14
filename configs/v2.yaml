@@ -1,0 +1,99 @@
+# Radiance V2 — V1's model, run the way V1 should have been run.
+#
+# Architecture, optimizer, batch shape and token budget are configs/v1.yaml's, unchanged; its
+# header is the reasoning for each and is not repeated here. What changes is everything V1's run
+# (W&B 3bc1orh7, stopped by a reboot at step 23,480 of 68,688) showed was wrong with how it ran:
+#
+#   1. WSD instead of cosine. V1's cut at 34% left step_23000.pt at lr multiplier ~0.78 with no
+#      annealed model anywhere. Under WSD every stable-phase checkpoint is a branch point:
+#      `radiance-train --config configs/v2.yaml --decay-from checkpoints/v2/step_N.pt
+#      --decay-steps K` anneals one into a finished model without stopping the main run.
+#      The decay is 30%, not the 20% default: the WSD-vs-cosine A/B (docs/results.md) found WSD
+#      ties cosine at each one's best LR but is more LR-sensitive, and at a cosine-tuned LR — which
+#      the lr below is — 20% decay lost 0.006 while 30% tied (1.6093 vs cosine's 1.6091). That was
+#      a 15.8M TinyStories model at 4,000 steps; nothing near this scale or horizon is measured,
+#      so compare the final val/bits_per_byte against V1's before treating V2-vs-V1 differences as
+#      architecture or data effects.
+#   2. Pretokenized local data. V1 streamed fineweb over the network for the whole run. Run
+#      `radiance-pretokenize --config configs/v2.yaml` first (~18.5 GB at uint16); training then
+#      reads only local disk, shuffles over the whole train set, and resumes to the exact block.
+#   3. Kept checkpoints. keep_every below spares every 5,000th step (~13 over the run, 3.0 GB
+#      each, ~40 GB) from pruning — the branch points for (1).
+#   4. Logging. tok/s, step time, MFU, grad norm and per-group lr are logged; the six series that
+#      are zero by construction for this config no longer are.
+#   5. A validation number that means something. V1's val stream was shuffled and each eval read
+#      the first 50 batches, so every eval scored a different random ~400 of the ~2,000 held-out
+#      blocks — the ~0.02 wobble in its val/loss. Here val is read in order and in full, every
+#      eval, with val/loss_stderr (its sampling noise) and val/bits_per_byte (tokenizer-invariant,
+#      for the tokenizer A/B) alongside. The held-out documents are the same 2,000 as V1's.
+#
+# Also changed for every config, not just this one: eval and checkpointing now fire on the final
+# step. V1's max_steps (68,688) is not a multiple of 500, so its last 188 steps would have been
+# trained, never evaluated, and never saved.
+#
+# Benchmarks: anneal a kept checkpoint, then run radiance-eval on the branch's final .pt —
+#   for c in checkpoints/v2/decay_from_*/step_*.pt; do
+#     uv run --group eval radiance-eval --checkpoint "$c" --tasks hellaswag,arc_easy,piqa; done
+# Benchmark the annealed branch, not the stable-phase checkpoint it came from: the latter is
+# un-annealed and reads worse than the model it would become.
+
+run_name: radiance-v2-375m
+
+data:
+  # Read by radiance-pretokenize, not by train(): see data.pretokenized_dir.
+  dataset: HuggingFaceFW/fineweb
+  text_column: text
+  tokenizer: gpt2
+  eval_split_size: 2000 # the same 2,000 documents V1 carved, so the held-out set is unchanged
+  shuffle_buffer_size: 10000 # pretokenize's per-worker document shuffle; training shuffles globally
+  pretokenized_dir: .cache/radiance/pretokenized/v2-fineweb-gpt2
+  seq_len: 1024
+  num_workers: 8 # pretokenize worker processes, and DataLoader workers (memmap reads are cheap)
+  prefetch_factor: 4
+
+model:
+  d_model: 1024
+  head_dim: 64
+  n_layers: 22
+  loop_count: 1
+  ffn_mult: 2.0
+  ffn_depth: 2
+  dropout: 0.0
+  max_seq_len: 1024
+  mup_base_d_model: 256
+
+train:
+  batch_size: 8
+  grad_accum_steps: 16
+  auto_batch_size: false
+
+  optimizer: muon
+  lr: 1.0e-2
+  muon_lr: 0.02
+  weight_decay: 0.01
+  warmup_ratio: 0.02
+  grad_clip: 1.0
+
+  lr_schedule: wsd
+  wsd_decay_ratio: 0.3 # the final ~20,600 steps — see (1); a --decay-from branch sets its own length
+
+  tokens_per_param: 24
+
+  log_every: 20
+  eval_every: 500
+  eval_max_batches: null # the whole held-out set, every eval — see (5) above
+  save_every: 500
+  keep_every: 5000
+  output_dir: checkpoints/v2
+  resume_from: auto
+
+  seed: 42
+  device: auto
+  compile: true
+  dtype: bf16
+  peak_tflops: 209.5 # RTX 5090 dense BF16 tensor peak (NVIDIA's published spec), for train/mfu
+
+wandb:
+  project: radiance
+  entity: null
+  mode: online

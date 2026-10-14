@@ -30,6 +30,13 @@ class DataConfig:
     disk_cache_shard_size: int = 100
     prefetch_factor: int = 2
     eval_split_size: int = 0
+    pretokenized_dir: str | None = None  # opt-in: train from a directory written by
+    # `radiance-pretokenize` (flat token files on local disk) instead of the dataset pipeline above.
+    # While set, dataset/text_column/streaming/cache settings are not read by train() — they
+    # were already spent producing the directory, whose meta.json records them — though
+    # radiance-pretokenize reads them from this same config to write it. Local disk means a
+    # network outage cannot stop the run, blocks are shuffled over the whole train set rather
+    # than a local buffer, and resume restores the data position exactly. See docs/data.md.
 
 
 @dataclass
@@ -427,6 +434,14 @@ class TrainConfig:
     # invalidating the schedule, which cosine cannot do since its shape depends on max_steps.
     wsd_decay_ratio: float = 0.2  # only used when lr_schedule == "wsd": fraction of max_steps spent
     # in the final decay phase.
+    wsd_decay_steps: int | None = None  # only used when lr_schedule == "wsd": the decay phase's
+    # length in steps, overriding wsd_decay_ratio. None (default) collapses to the ratio. Set by
+    # `radiance-train --decay-from`, where the decay is a fixed-length branch off a checkpoint.
+    wsd_decay_start_ratio: float = 1.0  # only used when lr_schedule == "wsd": the LR multiplier the
+    # decay phase starts from. 1.0 (default) is the stable phase's full LR, i.e. exactly the
+    # original schedule. `--decay-from` sets it to the checkpoint's own multiplier so the branch
+    # continues from the LR the run was actually at — which is what lets a *cosine* checkpoint
+    # (V1's) be annealed without an LR jump.
     max_steps: int = 5000  # ignored (overwritten once the model is built) if tokens_per_param is set
     tokens_per_param: float | None = None  # opt-in: derive max_steps from model size instead of a fixed
     # step count — max_steps = round(tokens_per_param * num_active_parameters /
@@ -460,12 +475,17 @@ class TrainConfig:
     # the whole validation split (unbounded for a streaming one) every eval_every steps; a fixed count
     # also keeps val/loss comparable across configs with different val split sizes. None = full pass.
     save_every: int = 1000
+    keep_every: int | None = None  # opt-in: checkpoints at steps that are a multiple of this are
+    # exempt from pruning. None (default) keeps only the newest checkpoint, as before. Kept
+    # checkpoints are full (optimizer state included), because their main use is as a branch
+    # point for `radiance-train --decay-from`, which resumes the optimizer. ~8 bytes/param each.
     output_dir: str = "checkpoints/run"
     resume_from: str | None = None  # opt-in: path to a checkpoint to continue training from, or the
     # literal "auto" to pick the highest-numbered step_*.pt in output_dir (so an interrupted run can be
     # relaunched with the same config unchanged). Restores model + optimizer moments + LR schedule +
     # GradScaler, so the run continues rather than restarting AdamW from zero momentum at warmup LR.
-    # The DataLoader position is *not* restored — a resumed run revisits some examples. None = fresh run.
+    # The data position is restored on the data.pretokenized_dir path (exactly) and the streaming
+    # disk-cache path (up to the shuffle buffer); other loaders revisit some examples. None = fresh run.
     init_from: str | None = None  # opt-in: path to a checkpoint to seed *model weights only* from,
     # for starting a new run (e.g. SFT) on top of a previously trained model. Unlike resume_from,
     # the optimizer/scheduler/step are NOT restored — this run gets a fresh optimizer/scheduler
@@ -474,6 +494,9 @@ class TrainConfig:
     seed: int = 42
     device: str = "auto"
     compile: bool = True
+    peak_tflops: float | None = None  # opt-in: the device's dense peak TFLOPS at the compute dtype,
+    # for logging train/mfu. None (default) logs throughput but not MFU — a guessed peak would
+    # make the ratio look authoritative when it isn't. See DenseTransformer.training_flops_per_token.
     dtype: str = "fp32"
     native_bf16: bool = False  # opt-in: store parameters, gradients and optimizer moments in bf16
     # instead of the standard fp32-master-weights recipe. `dtype` alone only controls the
@@ -808,6 +831,13 @@ def load_config(path: str) -> Config:
             "takes precedence and data.dataset (and data.text_column) are silently ignored — "
             "remove data.dataset to keep the mix, or drop data.dataset_mix to train on the "
             "single dataset."
+        )
+    # Same trap: radiance-pretokenize writes one corpus, and a mix set alongside it would be
+    # silently ignored by train().
+    if data_raw.get("dataset_mix") and data_raw.get("pretokenized_dir"):
+        raise ValueError(
+            "data.dataset_mix and data.pretokenized_dir are both set. A pretokenized directory "
+            "holds a single corpus and takes precedence, so the mix would be silently ignored."
         )
 
     cfg = _apply_dtype_sugar(Config(

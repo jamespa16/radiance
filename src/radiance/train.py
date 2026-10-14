@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import math
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -17,7 +18,13 @@ from radiance.config import (
     resolve_device,
     resolve_dtype,
 )
-from radiance.data import StreamingPackedDataset, build_dataloaders, build_tokenizer
+from radiance.data import (
+    EpochPermutationSampler,
+    StreamingPackedDataset,
+    build_dataloaders,
+    build_tokenizer,
+    token_byte_lengths,
+)
 from radiance.dpo_data import build_dpo_dataloaders
 from radiance.sft_data import build_sft_dataloaders
 from radiance.model import DenseTransformer, cast_params_to_native_bf16, padded_vocab_size
@@ -29,8 +36,14 @@ from .batching import (
     estimate_batch_size,
     split_micro_batch,
 )
-from .checkpointing import find_resume_checkpoint, load_pretrained_weights, prune_checkpoints, save_checkpoint
-from .evaluation import evaluate
+from .checkpointing import (
+    configure_decay_branch,
+    find_resume_checkpoint,
+    load_pretrained_weights,
+    prune_checkpoints,
+    save_checkpoint,
+)
+from .evaluation import evaluate_detailed
 from .losses import (
     build_dpo_loss_fn,
     build_loss_fn,
@@ -55,8 +68,15 @@ def build_lr_scheduler(optimizer: torch.optim.Optimizer, cfg: Config) -> LambdaL
         raise ValueError(f"Unknown train.lr_schedule {schedule!r}, expected 'cosine' or 'wsd'")
     # Precomputed rather than derived per call: lr_lambda runs once per optimizer step, and this
     # is also the value the "wsd" branch needs to know where the stable phase ends.
-    decay_steps = max(1, round(max_steps * cfg.train.wsd_decay_ratio))
+    if cfg.train.wsd_decay_steps is not None:
+        decay_steps = max(1, cfg.train.wsd_decay_steps)
+    else:
+        decay_steps = max(1, round(max_steps * cfg.train.wsd_decay_ratio))
     decay_start = max(warmup_steps, max_steps - decay_steps)
+    # Where the decay starts from: 1.0 is the stable phase's full LR. A --decay-from branch off a
+    # checkpoint that was not at full LR (any cosine checkpoint) starts from that checkpoint's own
+    # multiplier instead, so its first step continues the LR it was already training at.
+    decay_from = cfg.train.wsd_decay_start_ratio
 
     def lr_lambda(step: int) -> float:
         # step + 1: LambdaLR evaluates the lambda at step 0 to set the LR for the *first*
@@ -72,9 +92,9 @@ def build_lr_scheduler(optimizer: torch.optim.Optimizer, cfg: Config) -> LambdaL
             # been trained on the "wrong" schedule — cosine's shape is a function of max_steps, so
             # changing it invalidates everything before the change.
             if step < decay_start:
-                return 1.0
+                return decay_from
             progress = min(1.0, (step - decay_start) / max(1, max_steps - decay_start))
-            return min_lr_ratio + (1.0 - min_lr_ratio) * (1.0 - math.sqrt(progress))
+            return min_lr_ratio + (decay_from - min_lr_ratio) * (1.0 - math.sqrt(progress))
         progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
         cosine = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
         # Decay to min_lr_ratio * lr rather than all the way to 0: the last steps of a run at a
@@ -165,16 +185,101 @@ _ACCUM_METRICS = (
 )
 
 
+def logged_metrics(cfg: Config) -> tuple[str, ...]:
+    """The subset of _ACCUM_METRICS this config can make nonzero — the only ones worth logging.
+
+    Every term is still computed (chunk_loss_and_metrics returns the full set whatever the mode);
+    this only decides what reaches the log. Before it, a plain pretraining run logged six series
+    that were zero by construction for the whole run — V1 carried dpo_margin, dpo_*_accuracy,
+    ponder_cost, mean_loop_depth, moe_aux_loss and mtp_loss at exactly 0.0 for 23k steps.
+    """
+    m = cfg.model
+    active = {"loss", "lm_loss"}
+    if m.use_router:
+        active |= {"ponder_cost", "mean_loop_depth"}
+    if m.use_moe:
+        active.add("moe_aux_loss")
+    if cfg.dpo.enabled:
+        active |= {"dpo_margin_accuracy", "dpo_reward_accuracy", "dpo_margin"}
+    else:
+        # DPO's total omits both (see chunk_loss_and_metrics), so they stay zero there.
+        active.add("z_loss")
+        if m.mtp_heads > 1:
+            active.add("mtp_loss")
+    return tuple(name for name in _ACCUM_METRICS if name in active)
+
+
+class ThroughputMeter:
+    """Tokens/sec and MFU over each logging interval, excluding time spent in eval and saves.
+
+    Wall-clock between two log points is accurate without explicit synchronisation, because the
+    log itself calls .item() — every interval ends on a device sync. Eval and checkpoint time is
+    measured separately and subtracted, so tok/s describes training steps alone and stays
+    comparable with the differenced s/step benchmarks in docs/results.md.
+
+    The first interval of a process is not reported: it includes torch.compile's warmup, which
+    would read as a throughput collapse at the start of every run and every resume.
+    """
+
+    def __init__(self, tokens_per_step: int, flops_per_token: float, peak_tflops: float | None):
+        self.tokens_per_step = tokens_per_step
+        self.flops_per_token = flops_per_token
+        self.peak_flops = peak_tflops * 1e12 if peak_tflops else None
+        self._reported_once = False
+        self._restart()
+
+    def _restart(self) -> None:
+        self._start = time.perf_counter()
+        self._excluded = 0.0
+        self._steps = 0
+
+    def step(self) -> None:
+        self._steps += 1
+
+    def exclude(self, seconds: float) -> None:
+        self._excluded += seconds
+
+    def read(self) -> dict[str, float]:
+        """Metrics for the interval since the previous read(); empty for the warmup interval."""
+        elapsed = time.perf_counter() - self._start - self._excluded
+        steps = self._steps
+        self._restart()
+        if not self._reported_once:
+            self._reported_once = True
+            return {}
+        if steps == 0 or elapsed <= 0:
+            return {}
+        tok_s = steps * self.tokens_per_step / elapsed
+        out = {"perf/tokens_per_sec": tok_s, "perf/step_time_s": elapsed / steps}
+        if self.peak_flops:
+            out["perf/mfu"] = tok_s * self.flops_per_token / self.peak_flops
+        return out
+
+
+def _group_lrs(optimizer: torch.optim.Optimizer) -> dict[str, float]:
+    """Current LR of each named param group. Groups from a checkpoint predating group names fall
+    back to their index (optimizer.load_state_dict keeps the saved group dicts)."""
+    return {
+        f"lr/{group.get('name', f'group{i}')}": group["lr"]
+        for i, group in enumerate(optimizer.param_groups)
+    }
+
+
 def _restore_data_position(train_loader, ckpt: dict, cfg: Config) -> None:
     """Point a resumed run's train loader past the data the checkpoint already trained on.
 
-    Only the streaming disk-cache loader can seek. A map-style loader needs nothing — train()
-    re-seeds its shuffle off the step — but a plain streaming loader restarts its stream from the
-    beginning with a fixed seed, so it replays already-trained data. Say so rather than let it pass
-    silently: that is the failure this function exists to prevent on the path that can prevent it.
+    Two loaders can seek: the pretokenized one exactly (EpochPermutationSampler) and the streaming
+    disk-cache one up to its shuffle buffer (StreamingPackedDataset). A map-style loader needs
+    nothing — train() re-seeds its shuffle off the step — but a plain streaming loader restarts its
+    stream from the beginning with a fixed seed, so it replays already-trained data. Say so rather
+    than let it pass silently: that is the failure this function exists to prevent on the paths
+    that can prevent it.
     """
     batches_drawn = ckpt.get("train_batches_drawn")
-    if isinstance(train_loader.dataset, StreamingPackedDataset):
+    if isinstance(train_loader.sampler, EpochPermutationSampler):
+        train_loader.sampler.set_resume_position(batches_drawn or 0)
+        print(f"[radiance] resuming pretokenized data after {batches_drawn or 0:,} batches")
+    elif isinstance(train_loader.dataset, StreamingPackedDataset):
         if batches_drawn is None:
             print(
                 "[radiance] WARNING: this checkpoint predates train_batches_drawn, so the data "
@@ -186,9 +291,9 @@ def _restore_data_position(train_loader, ckpt: dict, cfg: Config) -> None:
         print(f"[radiance] resuming data stream after {batches_drawn:,} batches")
     elif cfg.data.streaming:
         print(
-            "[radiance] WARNING: only the single-dataset streaming disk-cache loader "
-            "(data.streaming + data.disk_cache_max_gb, no dataset_mix) can resume its data "
-            "position. This loader restarts from the beginning of its stream and will replay "
+            "[radiance] WARNING: only data.pretokenized_dir and the single-dataset streaming "
+            "disk-cache loader (data.streaming + data.disk_cache_max_gb, no dataset_mix) can "
+            "resume their data position. This loader restarts from the beginning of its stream and will replay "
             "data this run has already trained on."
         )
 
@@ -379,6 +484,10 @@ def train(cfg: Config) -> None:
         step = ckpt["step"]
         _restore_data_position(train_loader, ckpt, cfg)
         train_batches_drawn = ckpt.get("train_batches_drawn") or 0
+        # Everything is copied out of it now. Loaded with map_location=device, it otherwise stays
+        # referenced for the whole run: a second copy of the weights and optimizer state on the
+        # GPU. Measured on V2's shape: 19.25 GB reserved resumed without this, 17.75 GB with it.
+        del ckpt
         # Re-seed off the resumed step before the train iterator is created below. The DataLoader's
         # shuffle order is drawn from the global RNG at iteration time, so without this a resumed
         # run replays exactly the batches the original run already trained on — measurably slower
@@ -391,6 +500,19 @@ def train(cfg: Config) -> None:
             print("[radiance] checkpoint is already at/past max_steps; nothing to do.")
             wandb.finish()
             return
+
+    # Pretraining only: SFT/DPO score a masked subset of positions, and bits/byte over a chat
+    # template's scaffolding would not mean what it means on raw text. None when the tokenizer is
+    # not byte-level BPE (see token_byte_lengths) — val/bits_per_byte is then simply not logged.
+    token_bytes = (
+        None if (cfg.sft.enabled or cfg.dpo.enabled) else token_byte_lengths(tokenizer, vocab_size)
+    )
+    metric_names = logged_metrics(cfg)
+    meter = ThroughputMeter(
+        tokens_per_step=cfg.train.effective_batch_size * cfg.resolved_row_tokens,
+        flops_per_token=raw_model.training_flops_per_token(cfg.resolved_seq_len),
+        peak_tflops=cfg.train.peak_tflops,
+    )
 
     model.train()
     # Prime the FP4 weight caches before the first forward — after any resume_from/init_from load,
@@ -418,7 +540,7 @@ def train(cfg: Config) -> None:
 
         while not step_done and not give_up:
             if will_log:
-                accums = {name: torch.zeros((), device=device) for name in _ACCUM_METRICS}
+                accums = {name: torch.zeros((), device=device) for name in metric_names}
 
             try:
                 # set_to_none=False when compiled: keeps .grad buffers stable/preallocated (see the
@@ -463,10 +585,13 @@ def train(cfg: Config) -> None:
 
                         if will_log:
                             for name, value in metrics.items():
-                                accums[name] += value.detach() * chunk_weight
+                                if name in accums:
+                                    accums[name] += value.detach() * chunk_weight
 
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
+                # The pre-clip norm: logged, since a run whose norm sits at grad_clip is being
+                # clipped every step and its effective LR is not the one configured.
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
@@ -489,6 +614,8 @@ def train(cfg: Config) -> None:
                 nvfp4.refresh_fp4_weights(raw_model)
                 step += 1
                 step_done = True
+                meter.step()
+                final_step = step == cfg.train.max_steps
 
                 if will_log:
                     # Also to stdout: W&B was previously the only place a loss ever appeared, so a
@@ -502,24 +629,38 @@ def train(cfg: Config) -> None:
                         if device_type == "cuda"
                         else ""
                     )
+                    perf = meter.read()
+                    tok_s = f" {perf['perf/tokens_per_sec'] / 1e3:.1f}k tok/s" if perf else ""
                     print(
                         f"[radiance] step {step:>6}/{cfg.train.max_steps} "
                         f"loss {accums['loss'].item():.4f} lm {accums['lm_loss'].item():.4f} "
-                        f"lr {scheduler.get_last_lr()[0]:.3e}{mem}",
+                        f"lr {scheduler.get_last_lr()[0]:.3e}{mem}{tok_s}",
                         flush=True,
                     )
                     wandb.log(
                         {
                             **{f"train/{name}": v.item() for name, v in accums.items()},
-                            "train/expert_bias_spread": raw_model.expert_bias_spread(),
+                            **(
+                                {"train/expert_bias_spread": raw_model.expert_bias_spread()}
+                                if cfg.model.use_moe
+                                else {}
+                            ),
+                            "train/grad_norm": grad_norm.item(),
                             "train/lr": scheduler.get_last_lr()[0],
+                            **{f"train/{k}": v for k, v in _group_lrs(optimizer).items()},
                             "train/micro_chunk_size": micro_chunk_size,
+                            **perf,
                         },
                         step=step,
                     )
 
-                if val_loader is not None and step % cfg.train.eval_every == 0:
-                    val_loss = evaluate(
+                # Both also fire on the final step: max_steps is rarely a multiple of eval_every
+                # or save_every (V1's 68,688 is not), and without this the last partial interval
+                # was trained, never evaluated, and never saved — for a --decay-from branch, that
+                # would be the annealed model itself.
+                if val_loader is not None and (step % cfg.train.eval_every == 0 or final_step):
+                    started = time.perf_counter()
+                    result = evaluate_detailed(
                         model,
                         val_loader,
                         device,
@@ -531,21 +672,37 @@ def train(cfg: Config) -> None:
                         dpo=cfg.dpo.enabled,
                         dpo_beta=cfg.dpo.beta if cfg.dpo.enabled else None,
                         micro_chunk_size=micro_chunk_size,
+                        token_bytes=token_bytes,
                     )
-                    print(f"[radiance] step {step:>6} val/loss {val_loss:.4f}", flush=True)
-                    wandb.log({"val/loss": val_loss}, step=step)
+                    extra = ""
+                    if result.loss_stderr is not None:
+                        extra += f" ± {result.loss_stderr:.4f}"
+                    if result.bits_per_byte is not None:
+                        extra += f" bpb {result.bits_per_byte:.4f}"
+                    print(f"[radiance] step {step:>6} val/loss {result.loss:.4f}{extra}", flush=True)
+                    wandb.log(
+                        {
+                            "val/loss": result.loss,
+                            **({"val/loss_stderr": result.loss_stderr} if result.loss_stderr is not None else {}),
+                            **({"val/bits_per_byte": result.bits_per_byte} if result.bits_per_byte is not None else {}),
+                        },
+                        step=step,
+                    )
+                    meter.exclude(time.perf_counter() - started)
 
-                if step % cfg.train.save_every == 0:
-                    # Keep only the latest checkpoint — but prune only after the new one is fully
-                    # written. Pruning first meant a save that died mid-write (OOM kill, power
-                    # loss, full disk) left no checkpoint at all, and resume_from: auto then
-                    # silently restarted the run from step 0.
+                if step % cfg.train.save_every == 0 or final_step:
+                    started = time.perf_counter()
+                    # Keep only the latest checkpoint (plus any train.keep_every multiples) — but
+                    # prune only after the new one is fully written. Pruning first meant a save
+                    # that died mid-write (OOM kill, power loss, full disk) left no checkpoint at
+                    # all, and resume_from: auto then silently restarted the run from step 0.
                     ckpt_path = output_dir / f"step_{step}.pt"
                     save_checkpoint(
                         ckpt_path, raw_model, optimizer, scheduler, scaler, step, cfg,
                         train_batches_drawn=train_batches_drawn,
                     )
-                    prune_checkpoints(output_dir, keep=ckpt_path)
+                    prune_checkpoints(output_dir, keep=ckpt_path, keep_every=cfg.train.keep_every)
+                    meter.exclude(time.perf_counter() - started)
             except torch.cuda.OutOfMemoryError:
                 # An OOM anywhere at or after scaler.unscale_() below leaves this optimizer marked
                 # as already-unscaled for the current scaler generation, so the retry's own
@@ -599,9 +756,20 @@ def train(cfg: Config) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True, help="Path to a config.yaml")
+    parser.add_argument(
+        "--decay-from",
+        metavar="CHECKPOINT",
+        help="branch off this checkpoint and anneal it: resume its full state, then decay the LR "
+        "to min_lr_ratio over --decay-steps (WSD), writing to <output_dir>/decay_from_<step>",
+    )
+    parser.add_argument("--decay-steps", type=int, help="length of the --decay-from anneal, in steps")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    if (args.decay_from is None) != (args.decay_steps is None):
+        parser.error("--decay-from and --decay-steps go together")
+    if args.decay_from is not None:
+        configure_decay_branch(cfg, args.decay_from, args.decay_steps)
     train(cfg)
 
 

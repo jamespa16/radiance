@@ -5,8 +5,7 @@ The loop is in `train.py`; the loss functions are in `losses.py`, batch sizing a
 
 Plain PyTorch training loop (no HF `Trainer`): the optimizer from `optim.build_optimizer` plus a warmup +
 cosine-or-WSD LR schedule (`build_lr_scheduler`), manual loss computation, gradient clipping, periodic W&B logging
-(`train/loss`, `train/lm_loss`, `train/z_loss`, `train/mtp_loss`, `train/ponder_cost`, `train/mean_loop_depth`,
-`train/expert_bias_spread`, `train/lr`, `val/loss`) plus a matching stdout line, periodic checkpointing to
+plus a matching stdout line (see [What gets logged](#what-gets-logged)), periodic checkpointing to
 `cfg.train.output_dir` (raw `torch.save` of state dict + config), and periodic `evaluate()` against validation.
 
 The stdout line matters more than it looks: W&B was previously the only place a loss ever appeared, so a run with
@@ -108,6 +107,28 @@ training projects one `(batch, seq, vocab_size)` tensor at a time. The heads are
 `num_active_parameters()`: they never run at inference, so counting them would inflate a `tokens_per_param`-derived
 `max_steps`. See `configs/tinystories_mtp.yaml`.
 
+## What gets logged
+
+Every `log_every` steps: `train/loss`, `train/lm_loss`, `train/z_loss`, `train/grad_norm` (pre-clip — a run whose
+norm sits at `grad_clip` is clipped every step, and its effective LR is not the configured one), `train/lr` plus
+`train/lr/<group>` for each named optimizer param group, `train/micro_chunk_size`, and `perf/tokens_per_sec`,
+`perf/step_time_s` and — when `train.peak_tflops` is set — `perf/mfu`. The loss terms that only a feature can make
+nonzero (`ponder_cost`/`mean_loop_depth` under the router, `moe_aux_loss`/`expert_bias_spread` under MoE,
+`mtp_loss` with `mtp_heads > 1`, `dpo_*` under DPO) are logged only when that feature is on (`logged_metrics`);
+V1 logged six of them at exactly 0.0 for its whole run.
+
+`ThroughputMeter` times each logging interval minus eval and checkpoint time, so tok/s describes training steps
+alone and matches the differenced s/step benchmarks in [results.md](results.md). The first interval of a process is
+not reported — it is `torch.compile` warmup. MFU uses `DenseTransformer.training_flops_per_token`, the PaLM
+convention (6 per active parameter per token plus `12 * d_model * seq_len` per executed block, the loop body counted
+once per pass). On V2's shape it reads **57.1k tok/s, 68.9% MFU** against the 5090's 209.5 dense BF16 TFLOPS.
+
+At each eval: `val/loss`, `val/loss_stderr` (the spread of per-batch losses — two readings closer than a couple of
+these apart are the same number), and for pretraining with a byte-level BPE tokenizer `val/bits_per_byte`, which does
+not change unit when the tokenizer does and so is what a tokenizer A/B must compare. Its byte table
+(`data.token_byte_lengths`) is exact rather than approximate — a non-byte-level tokenizer gets none —
+and `radiance-pretokenize` cross-checks it against the held-out text's real UTF-8 length (exact on fineweb/gpt2).
+
 ## LR schedule
 
 `build_lr_scheduler`'s warmup ramps over `(step + 1)`, because `LambdaLR` evaluates the lambda at step 0 to set the LR
@@ -122,6 +143,14 @@ shaped for a different horizon; cosine's shape is a function of `max_steps`, so 
 before the change. It stays off by default because it isn't a quality win and switching it would silently reshape
 every config whose `lr` was tuned against cosine.
 
+`wsd_decay_steps` fixes the decay length in steps (overriding the ratio), and `wsd_decay_start_ratio` (default 1.0)
+is the multiplier the decay starts from. Both exist for **decay branches**: `radiance-train --config <cfg>
+--decay-from <checkpoint> --decay-steps K` (`configure_decay_branch`) resumes a checkpoint's full state — optimizer,
+data position — and anneals it to `min_lr_ratio` over K steps into `<output_dir>/decay_from_<step>/`, without
+touching the main run. The start ratio is read off the checkpoint's own scheduler, so a cosine checkpoint (V1's
+`step_23000.pt`, at ~0.78) anneals from where it was rather than jumping back to full LR. Re-running the command
+after an interruption resumes the branch, not the source.
+
 ## Checkpoints and resume
 
 `save_checkpoint` writes the optimizer state, LR-scheduler state and `GradScaler` state alongside the
@@ -132,20 +161,31 @@ as this used to, meant a save killed mid-write (OOM kill, power loss, full disk)
 `resume_from: "auto"` then quietly restarted the run from step 0. The cost is a second checkpoint's worth of disk
 during each save.
 
+`train.keep_every` (opt-in) spares checkpoints at multiples of it from pruning — full checkpoints, since their use is
+as `--decay-from` branch points. Eval and checkpointing also fire on the **final step**, whatever `eval_every` and
+`save_every` say: V1's `max_steps` (68,688) is not a multiple of 500, so its last 188 steps would have been trained
+and never evaluated or saved.
+
 `cfg.train.resume_from` (opt-in, default `null`) restores all saved state. Set it to a checkpoint path, or to the
 literal `"auto"` to pick the single `step_*.pt` in `output_dir`, so an interrupted run can be relaunched with its
 config unchanged. Without the optimizer moments a "resumed" run restarts AdamW from zero momentum at warmup LR, which
 shows up as a loss spike. An explicit `resume_from` path that doesn't exist raises rather than silently starting from
 scratch; `"auto"` against an empty `output_dir` is just a fresh run.
 
-**The data position is restored only on the streaming disk-cache path** (`data.streaming` + `data.disk_cache_max_gb`,
+**The data position is restored exactly on the `data.pretokenized_dir` path** (see [data.md](data.md)), and on the
+**streaming disk-cache path** (`data.streaming` + `data.disk_cache_max_gb`,
 single dataset — V1's path). `train()` counts every batch it draws and the checkpoint records the total; on resume,
+`EpochPermutationSampler.set_resume_position` skips exactly those blocks, and
 `StreamingPackedDataset.set_resume_position` has each worker skip its share (the DataLoader hands batch *i* to worker
 *i* mod `num_workers`). Before this, a resume replayed the cache from the start, and since the cache holds everything
 trained so far, a restart at hour 30 would have spent the rest of the run re-training on the first 30 hours' data.
 The skip is exact per worker except for the shuffle buffer: it applies before shuffling, so up to
 `shuffle_buffer_size` blocks per worker can repeat, and the same number are skipped without being trained on.
 Every other streaming loader prints a warning on resume, because it restarts from the beginning of its stream.
+
+The loaded checkpoint dict is dropped once its state is copied out. It is loaded straight onto the GPU, and while
+it stayed referenced a resumed run carried a second copy of the weights and optimizer state for its whole length —
+19.25 GB reserved against 17.75 GB on V2's shape.
 
 RNG state is not restored. It trades off against data freshness: `train()` re-seeds off the resumed step, so a
 map-style loader draws a different shuffle order rather than replaying batches already trained on. A resumed run is

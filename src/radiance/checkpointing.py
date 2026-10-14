@@ -67,15 +67,83 @@ def save_checkpoint(
     os.replace(tmp_path, path)
 
 
-def prune_checkpoints(output_dir: Path, keep: Path) -> None:
+def _checkpoint_step(path: Path) -> int:
+    return int(path.name.split("_")[1].split(".")[0])
+
+
+def prune_checkpoints(output_dir: Path, keep: Path, keep_every: int | None = None) -> None:
     """Delete every step_*.pt in output_dir except `keep`, plus any .tmp a crashed save left.
 
     Called only after `keep` has been written, so there is never a moment with no complete
     checkpoint on disk; the cost is a second checkpoint's worth of disk space during the save.
+
+    `keep_every` (train.keep_every) also spares every checkpoint whose step is a multiple of it —
+    the branch points `radiance-train --decay-from` anneals from. A stale .tmp is never spared.
     """
-    for old in [*output_dir.glob("step_*.pt"), *output_dir.glob("step_*.pt.tmp")]:
-        if old != keep:
+    for old in output_dir.glob("step_*.pt"):
+        if old != keep and not (keep_every and _checkpoint_step(old) % keep_every == 0):
             old.unlink(missing_ok=True)
+    for stale in output_dir.glob("step_*.pt.tmp"):
+        stale.unlink(missing_ok=True)
+
+
+def configure_decay_branch(cfg: Config, checkpoint: str, decay_steps: int) -> None:
+    """Turn `cfg` into a WSD decay branch off `checkpoint`: resume it, then anneal for `decay_steps`.
+
+    This is what makes a WSD run's intermediate checkpoints usable models. The stable phase holds
+    full LR, so any checkpoint from it is an un-annealed model; a short decay from it gives the
+    model that run would have produced had it stopped there, without the main run having to stop.
+
+    The branch resumes the full training state — optimizer moments and the data position, so it
+    trains on data the checkpoint has not seen — and decays from the LR multiplier the checkpoint
+    was at. For a WSD stable-phase checkpoint that is 1.0; for a cosine checkpoint (V1's) it is
+    wherever the cosine had reached, so the branch continues from the LR the run was actually at
+    rather than jumping back up to full LR first.
+
+    It writes to its own directory, `<output_dir>/decay_from_<step>`, so its checkpoints never
+    prune or shadow the main run's, and re-running the same command after an interruption
+    resumes the branch rather than restarting it from the source checkpoint.
+    """
+    if decay_steps < 1:
+        raise ValueError(f"--decay-steps must be >= 1, got {decay_steps}")
+    source = Path(checkpoint)
+    if not source.exists():
+        raise FileNotFoundError(f"--decay-from {checkpoint!r} does not exist")
+    if is_export(source):
+        raise ValueError(
+            f"--decay-from {checkpoint!r} is a safetensors export, which has no optimizer state "
+            "to continue from. Point it at the run's .pt checkpoint."
+        )
+    # mmap: only the few small entries read here are paged in, not the whole multi-GB file,
+    # which train() loads again in full when it resumes.
+    ckpt = torch.load(source, map_location="cpu", weights_only=False, mmap=True)
+    step = ckpt["step"]
+    sched = ckpt["scheduler"]
+    # LambdaLR's _last_lr is base_lr * lambda(step) per group, and every group shares one lambda,
+    # so any group's ratio is the schedule multiplier the checkpoint was saved at.
+    start_ratio = sched["_last_lr"][0] / sched["base_lrs"][0]
+    del ckpt
+
+    branch_dir = Path(cfg.train.output_dir) / f"decay_from_{step}"
+    cfg.train.resume_from = "auto" if any(branch_dir.glob("step_*.pt")) else str(source)
+    cfg.train.output_dir = str(branch_dir)
+    cfg.train.tokens_per_param = None  # would re-derive max_steps and overwrite the one set here
+    cfg.train.max_steps = step + decay_steps
+    cfg.train.lr_schedule = "wsd"
+    cfg.train.wsd_decay_steps = decay_steps
+    cfg.train.wsd_decay_start_ratio = start_ratio
+    cfg.run_name = f"{cfg.run_name}-decay{step}"
+    if cfg.train.warmup_steps > step:
+        # decay_start is max(warmup_steps, ...), so the branch would hold at the start ratio
+        # through the rest of warmup and decay over fewer steps than asked for.
+        raise ValueError(
+            f"--decay-from checkpoint is at step {step}, inside this config's warmup "
+            f"({cfg.train.warmup_steps} steps at max_steps={cfg.train.max_steps}); nothing to anneal yet."
+        )
+    print(
+        f"[radiance] decay branch: from {source} (step {step:,}, lr multiplier {start_ratio:.4f}) "
+        f"annealing to {cfg.train.min_lr_ratio} over {decay_steps:,} steps -> {branch_dir}"
+    )
 
 
 def find_resume_checkpoint(cfg: Config) -> Path | None:
