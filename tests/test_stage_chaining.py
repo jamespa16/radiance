@@ -160,6 +160,16 @@ def test_string_fields_take_override_text_verbatim(tmp_path):
     assert cfg.dpo.eval_split is None and cfg.dpo.beta == 0.05
 
 
+def test_float_fields_take_dotless_scientific_notation(tmp_path):
+    # PyYAML (YAML 1.1) reads `1e-5` as a string; a float field must still land a float.
+    path = _write(tmp_path, {"train": {"max_steps": 10}})
+    cfg = load_config_with_overrides(path, ["train.lr=1e-5", "train.weight_decay=1e-2", "model.moe_expert_ffn_mult=null"])
+    assert cfg.train.lr == 1e-5 and isinstance(cfg.train.lr, float)
+    assert cfg.train.weight_decay == 0.01 and cfg.model.moe_expert_ffn_mult is None
+    with pytest.raises(ValueError, match="expects a number"):
+        load_config_with_overrides(path, ["train.lr=fast"])
+
+
 def test_set_is_repeatable(monkeypatch, capsys):
     from radiance import size
 

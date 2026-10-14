@@ -127,3 +127,56 @@ def test_dpo_train_loop_runs_end_to_end_and_loss_decreases(tmp_path, monkeypatch
     model, _ = load_transformer_from_checkpoint(str(ckpt_path), "cpu")
     logits = model(torch.randint(1, TINY_VOCAB, (2, 8))).logits
     assert logits.shape == (2, 8, TINY_VOCAB)
+
+
+def test_dpo_resume_keeps_its_reference_when_init_from_is_rewritten(tmp_path, monkeypatch):
+    # dpo.reference_checkpoint defaults to train.init_from. A resumed run must keep the reference
+    # its log-probs were computed against even when that path has been rewritten since (a chained
+    # RLAIF round): reuse the original cache, or — with that cache gone — refuse, rather than
+    # recompute the reference half-way through the run.
+    import os
+
+    import pytest
+
+    model_cfg = _model_cfg()
+    base_ckpt = _save_base_checkpoint(tmp_path, model_cfg, "policy.pt")
+    monkeypatch.setattr(sft_data_mod, "load_dataset", lambda name: _dpo_pairs(16))
+    tokenizer = WordTokenizer(vocab_size=TINY_VOCAB)
+    monkeypatch.setattr(train_mod, "build_tokenizer", lambda cfg: tokenizer)
+    monkeypatch.setattr(train_mod, "wandb", _FakeWandb())
+    cache_dir = tmp_path / "dpo_cache"
+
+    def cfg(max_steps: int) -> Config:
+        return Config(
+            run_name="test-dpo-resume",
+            data=DataConfig(tokenizer="unused", seq_len=16, num_workers=0),
+            model=model_cfg,
+            dpo=DPOConfig(enabled=True, dataset="unused", cache_dir=str(cache_dir)),  # reference = init_from
+            train=TrainConfig(
+                init_from=str(base_ckpt), resume_from="auto", batch_size=2, auto_batch_size=False, max_steps=max_steps,
+                eval_every=10_000, save_every=2, output_dir=str(tmp_path / "out"), device="cpu", compile=False,
+            ),
+            wandb=WandbConfig(mode="disabled"),
+        )
+
+    identity = dpo_data_mod.current_reference_identity(cfg(2))
+    train_mod.train(cfg(2))
+    ref_caches = sorted(cache_dir.rglob("ref-*"))
+    assert len(ref_caches) == 1
+    assert torch.load(tmp_path / "out" / "step_2.pt", weights_only=False)["dpo_reference"] == identity
+
+    # The next round rewrites the policy path: same name, new contents, new mtime.
+    _save_base_checkpoint(tmp_path, model_cfg, "policy.pt")
+    st = base_ckpt.stat()
+    os.utime(base_ckpt, (st.st_atime, st.st_mtime + 5))
+    assert dpo_data_mod.current_reference_identity(cfg(4)) != identity
+
+    train_mod.train(cfg(4))  # resumes from step_2.pt
+    assert sorted(cache_dir.rglob("ref-*")) == ref_caches, "resume recomputed the reference"
+    assert torch.load(tmp_path / "out" / "step_4.pt", weights_only=False)["dpo_reference"] == identity
+
+    import shutil
+
+    shutil.rmtree(ref_caches[0])
+    with pytest.raises(ValueError, match="has changed since"):
+        train_mod.train(cfg(6))

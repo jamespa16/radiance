@@ -247,19 +247,36 @@ def format_chat_messages(messages: list[dict], cfg: Config) -> str:
     """
     if not messages:
         raise ValueError("format_chat_messages requires at least one message")
-    if cfg.sft.enabled:
-        user_prefix, assistant_prefix = cfg.sft.user_prefix, cfg.sft.assistant_prefix
-    elif cfg.dpo.enabled:
-        user_prefix, assistant_prefix = cfg.dpo.user_prefix, cfg.dpo.assistant_prefix
-    else:
-        raise ValueError(
-            "format_chat_messages requires a checkpoint trained with sft.enabled: true or dpo.enabled: true"
-        )
+    user_prefix, assistant_prefix = _chat_prefixes(cfg, "format_chat_messages")
     parts = [
         (assistant_prefix if m["role"] == "assistant" else user_prefix) + m["content"] for m in messages
     ]
     parts.append(assistant_prefix)
     return "".join(parts)
+
+
+def _chat_prefixes(cfg: Config, caller: str) -> tuple[str, str]:
+    """(user_prefix, assistant_prefix) of whichever post-training mode the checkpoint's own config
+    has on — see format_chat_prompt for why a DPO checkpoint reads cfg.dpo's."""
+    if cfg.sft.enabled:
+        return cfg.sft.user_prefix, cfg.sft.assistant_prefix
+    if cfg.dpo.enabled:
+        return cfg.dpo.user_prefix, cfg.dpo.assistant_prefix
+    raise ValueError(f"{caller} requires a checkpoint trained with sft.enabled: true or dpo.enabled: true")
+
+
+def chat_prompt_ids(messages: list[dict], tokenizer: PreTrainedTokenizerBase, cfg: Config) -> list[int]:
+    """The ids to sample a chat reply after: tokenize_chat_prompt under the checkpoint's own turn
+    template. What `radiance-generate --chat` and radiance-serve's /v1/chat/completions prompt
+    with, so a served or sampled checkpoint sees the same prompt boundary radiance-rlaif's pairs
+    and judge evaluation do — tokenizing format_chat_messages' text whole would end the prompt in
+    the assistant prefix's merged-away trailing-space token (see tokenize_chat_prompt), a context
+    SFT never trained after."""
+    if not messages:
+        raise ValueError("chat_prompt_ids requires at least one message")
+    user_prefix, assistant_prefix = _chat_prefixes(cfg, "chat_prompt_ids")
+    ids, _ = tokenize_chat_prompt(messages, tokenizer, user_prefix, assistant_prefix)
+    return ids
 
 
 def _tokenize_and_pack_sft(dataset, tokenizer: PreTrainedTokenizerBase, cfg: Config):

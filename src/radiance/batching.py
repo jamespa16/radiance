@@ -23,7 +23,7 @@ def param_state_dtype_bytes(cfg: Config) -> int:
     return 2 if cfg.train.native_bf16 else 4
 
 
-def dpo_reference_reserve_bytes(cfg: Config) -> int:
+def dpo_reference_reserve_bytes(cfg: Config, pinned_reference: str | None = None) -> int:
     """VRAM estimate_batch_size should hold back for a DPO reference-checkpoint load that hasn't
     happened yet.
 
@@ -35,10 +35,11 @@ def dpo_reference_reserve_bytes(cfg: Config) -> int:
     the packed dataset (reference log-probs included) is already cached, so no second model will
     load. No 3x grad/optimizer multiplier is needed here, unlike the policy model's reservation
     below — the reference model runs once under torch.no_grad() and is never optimized.
+    `pinned_reference` is a resumed run's recorded reference (dpo_data.current_reference_identity).
     """
     if not (cfg.dpo.enabled and cfg.resolved_reference_checkpoint):
         return 0
-    if dpo_cache_exists(cfg):
+    if dpo_cache_exists(cfg, pinned_reference):
         return 0
     try:
         return checkpoint_param_bytes(cfg.resolved_reference_checkpoint)

@@ -919,6 +919,7 @@ def _inherit_model_config(raw: dict) -> dict:
 
 
 _STRING_FIELD_TYPES = ("str", "str | None")
+_FLOAT_FIELD_TYPES = ("float", "float | None")
 
 
 def _field_type(owner, field_name: str):
@@ -933,8 +934,11 @@ def _override_value(section: str | None, field_name: str, value: str):
     """An override's value: parsed as YAML, so `true`, `4.0` and `8` land typed — except for a
     string-typed field, which takes the text as written. YAML would turn `2026-10-14` into a date
     and cut `a #b` at the comment, and paths and dataset names are exactly what `--set` passes
-    when chaining stages. `null` (or nothing) still clears an optional string. `section` None is a
-    top-level Config field (run_name)."""
+    when chaining stages. `null` (or nothing) still clears an optional string. A float-typed
+    field's value goes through float() when YAML leaves it a string: PyYAML is YAML 1.1, which
+    reads `1e-5` (no dot) as text, and `--set train.lr=1e-5` would otherwise put a str into
+    train.lr and fail only later, inside optimizer construction. `section` None is a top-level
+    Config field (run_name)."""
     if section is None:
         field_type = _field_type(Config, field_name)
     else:
@@ -945,7 +949,13 @@ def _override_value(section: str | None, field_name: str, value: str):
         if field_type.endswith("None") and value.strip() in ("", "null", "~", "None"):
             return None
         return value
-    return yaml.safe_load(value)
+    parsed = yaml.safe_load(value)
+    if field_type in _FLOAT_FIELD_TYPES and isinstance(parsed, str):
+        try:
+            return float(parsed)
+        except ValueError:
+            raise ValueError(f"--set {section + '.' if section else ''}{field_name} expects a number, got {value!r}")
+    return parsed
 
 
 def apply_overrides(raw: dict, assignments: list[str]) -> dict:

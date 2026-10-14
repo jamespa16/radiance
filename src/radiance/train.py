@@ -24,7 +24,7 @@ from radiance.data import (
     build_tokenizer,
     token_byte_lengths,
 )
-from radiance.dpo_data import build_dpo_dataloaders
+from radiance.dpo_data import build_dpo_dataloaders, current_reference_identity
 from radiance.sft_data import build_sft_dataloaders
 from radiance.model import DenseTransformer, cast_params_to_native_bf16, padded_vocab_size
 from radiance.optim import build_optimizer, migrate_optimizer_to_cpu_offload
@@ -336,12 +336,24 @@ def train(cfg: Config) -> None:
         load_pretrained_weights(raw_model, cfg.train.init_from, cfg, vocab_size, device)
         print(f"[radiance] initialized model weights from {cfg.train.init_from} (fresh optimizer/scheduler/step)")
 
+    # DPO: the reference model this run's log-probs come from, pinned at its first start. A resume
+    # reuses the recorded identity (mmap read — no weights paged in) rather than re-statting the
+    # path, which defaults to train.init_from and may have been rewritten since; see
+    # dpo_data.current_reference_identity. None on a checkpoint that predates the field.
+    dpo_reference = None
+    if cfg.dpo.enabled:
+        if resume_path is not None:
+            dpo_reference = torch.load(
+                resume_path, map_location="cpu", weights_only=False, mmap=True
+            ).get("dpo_reference")
+        dpo_reference = dpo_reference or current_reference_identity(cfg)
+
     if cfg.train.auto_batch_size:
         if device_type == "cuda":
             if cfg.train.target_effective_batch_size is None:
                 cfg.train.target_effective_batch_size = cfg.train.effective_batch_size
             cfg.train.batch_size, cfg.train.grad_accum_steps = estimate_batch_size(
-                raw_model, cfg, device, device_type, reserve_bytes=dpo_reference_reserve_bytes(cfg)
+                raw_model, cfg, device, device_type, reserve_bytes=dpo_reference_reserve_bytes(cfg, dpo_reference)
             )
         else:
             print(
@@ -372,12 +384,11 @@ def train(cfg: Config) -> None:
 
     # batch_size must be finalized (auto_batch_size, if any, already ran) before the DataLoader is built.
     if cfg.dpo.enabled:
-        build_loader_fn = build_dpo_dataloaders
+        train_loader, val_loader = build_dpo_dataloaders(cfg, tokenizer, dpo_reference)
     elif cfg.sft.enabled:
-        build_loader_fn = build_sft_dataloaders
+        train_loader, val_loader = build_sft_dataloaders(cfg, tokenizer)
     else:
-        build_loader_fn = build_dataloaders
-    train_loader, val_loader = build_loader_fn(cfg, tokenizer)
+        train_loader, val_loader = build_dataloaders(cfg, tokenizer)
 
     if cfg.train.tokens_per_param is not None:
         # Same per-row unit `estimate_batch_size` uses above: respects any active sft.seq_len /
@@ -712,7 +723,7 @@ def train(cfg: Config) -> None:
                     ckpt_path = output_dir / f"step_{step}.pt"
                     save_checkpoint(
                         ckpt_path, raw_model, optimizer, scheduler, scaler, step, cfg,
-                        train_batches_drawn=train_batches_drawn,
+                        train_batches_drawn=train_batches_drawn, dpo_reference=dpo_reference,
                     )
                     prune_checkpoints(output_dir, keep=ckpt_path, keep_every=cfg.train.keep_every)
                     meter.exclude(time.perf_counter() - started)

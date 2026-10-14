@@ -159,6 +159,14 @@ path/mtime/size — **not** a content hash, since hashing a multi-GB checkpoint 
 point of a fast cache-hit path, and nothing else in this repo content-hashes checkpoint files. Changing the reference
 model invalidates the cache automatically.
 
+**A resume keeps its reference.** That invalidation is right for a new run and wrong for a resumed one: the reference
+defaults to `train.init_from`, a policy path a chained RLAIF round may rewrite while an earlier stage is still
+resumable, and re-statting it on resume would miss the cache and recompute the reference half-way through the run.
+So each checkpoint records the identity the run started with (`dpo_reference`, from
+`dpo_data.current_reference_identity`), and a resume looks the cache up by that instead of by the file. If the file
+has changed *and* that cache is gone, it raises rather than recompute against the new file. A checkpoint from before
+the field resumes as it used to.
+
 Splitting the levels matters for the archive case: the checkpoint is only needed to *compute* those log-probs, never
 afterwards, so if it is later archived or moved away, the single cache built while it was present is found by listing
 `ref-*` under the base digest and reused; with zero or several candidates there, which reference model's log-probs a
@@ -352,6 +360,9 @@ prefix's merged-away tail (found by tokenizing the prefix with a probe word afte
 `" Hello"` itself; a reply that genuinely starts with whitespace can still produce the bare token. Pairs sampled
 before this follow the old prompt ids, so the manifest records `prompt_ids_version` and the DPO pipeline refuses
 token-id pairs from an older version rather than splice them onto a prompt they were not sampled after.
+`radiance-generate --chat` and `radiance-serve`'s `/v1/chat/completions` prompt through the same construction
+(`sft_data.chat_prompt_ids`), not by tokenizing `format_chat_messages`' text whole, so a served checkpoint sees the
+prompt boundary its `radiance-rlaif eval` numbers were measured at.
 
 **Sampling prefills each prompt once.** `--batch-size` counts sequences, so a batch holds `batch_size // num_samples`
 prompts; `generate_tokens_batched(samples_per_item=K)` prefills each and expands its KV cache across its K samples,
@@ -398,7 +409,8 @@ reason: `generate.py` owns this logic and imports `data.py`, so `data.py` can't 
 checkpoint: since the two modes are mutually exclusive on any one run's config, a DPO checkpoint's own saved
 `cfg.sft.enabled` is always `False` even though it expects the same turn-template prompting it was (transitively)
 SFT'd with. It checks `cfg.sft.enabled` then `cfg.dpo.enabled` and picks the matching prefixes, raising if neither is
-set. `generate.py --chat` calls this instead of `format_sft_prompt`.
+set. `generate.py --chat` and the server's chat route use the token-level `sft_data.chat_prompt_ids` instead, which
+resolves the prefixes the same way (see "The open prompt ends where SFT's tokens do").
 
 ## Status
 

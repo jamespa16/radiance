@@ -10,7 +10,7 @@ from transformers import PreTrainedTokenizerBase
 
 from radiance.config import Config, resolve_device
 from radiance.data import build_tokenizer
-from radiance.sft_data import format_chat_prompt
+from radiance.sft_data import chat_prompt_ids
 from radiance.model import (
     DenseTransformer,
     load_transformer_from_checkpoint,
@@ -225,7 +225,7 @@ def generate_tokens_batched(
 def generate(
     model: DenseTransformer,
     tokenizer: PreTrainedTokenizerBase,
-    prompt: str,
+    prompt: str | list[int],
     max_new_tokens: int = 200,
     temperature: float = 0.8,
     top_k: int = 50,
@@ -237,8 +237,14 @@ def generate(
     string-concatenating — a BPE tokenizer's decode of a completion is not guaranteed to match its
     decode as a continuation of the prompt (e.g. leading-space merges at the boundary), so the ids
     must be joined before decoding, not the decoded strings.
+
+    `prompt` may be token ids instead of text, for a prompt whose boundary tokenizing text whole
+    gets wrong (chat_prompt_ids).
     """
-    input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
+    if isinstance(prompt, str):
+        input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
+    else:
+        input_ids = torch.tensor([prompt], dtype=torch.long, device=device)
     input_ids = input_ids[:, -model.cfg.max_seq_len :]
     new_ids = list(
         generate_tokens(model, tokenizer, input_ids, max_new_tokens, temperature, top_k, device, loops)
@@ -288,7 +294,7 @@ def main() -> None:
     model, cfg, tokenizer = load_checkpoint(args.checkpoint, device)
     prompt = args.prompt
     if args.chat:
-        prompt = format_chat_prompt(args.prompt, cfg)
+        prompt = chat_prompt_ids([{"role": "user", "content": args.prompt}], tokenizer, cfg)
 
     text = generate(
         model,

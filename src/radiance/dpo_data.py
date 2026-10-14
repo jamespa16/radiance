@@ -375,7 +375,24 @@ def _add_reference_logprobs(
     return DatasetDict(result)
 
 
-def _dpo_cache_path(cfg: Config) -> Path:
+def current_reference_identity(cfg: Config) -> str | None:
+    """The resolved reference checkpoint's identity (path+mtime+size) — what the `ref-*` cache
+    level digests — or None when the file is absent.
+
+    train() records it in every checkpoint and passes a resumed run's recorded value back in as
+    `pinned_reference` below, which pins the run to the reference its log-probs were computed
+    against: dpo.reference_checkpoint defaults to train.init_from, a policy path a chained RLAIF
+    round may well rewrite while an earlier stage is still resumable, and an unpinned resume would
+    see a new mtime, miss the cache, and silently recompute the reference half-way through.
+    """
+    try:
+        stat = Path(cfg.resolved_reference_checkpoint).stat()
+    except FileNotFoundError:
+        return None
+    return f"{cfg.resolved_reference_checkpoint}|{stat.st_mtime}|{stat.st_size}"
+
+
+def _dpo_cache_path(cfg: Config, pinned_reference: str | None = None) -> Path:
     """Where the packed DPO dataset (reference log-prob columns included) is cached on disk.
 
     Under `cache_dir`, keyed on every field this pipeline derives from, in two levels rather
@@ -394,6 +411,9 @@ def _dpo_cache_path(cfg: Config) -> Path:
     nothing to load and no checkpoint to rebuild from, and with several it is not knowable which
     reference model's log-probs a given cache holds — reusing the wrong one corrupts the DPO
     loss silently — so both raise.
+
+    `pinned_reference` (a resumed run's recorded current_reference_identity) replaces the stat,
+    so a resume finds the cache its first half trained on even if the file has changed since.
     """
     seq_len = cfg.dpo.seq_len or cfg.data.seq_len
     base_key = "|".join(
@@ -430,10 +450,8 @@ def _dpo_cache_path(cfg: Config) -> Path:
     )
     base_dir = Path(cfg.dpo.cache_dir) / hashlib.sha256(base_key.encode()).hexdigest()[:16]
 
-    ref_path = Path(cfg.resolved_reference_checkpoint)
-    try:
-        ref_stat = ref_path.stat()
-    except FileNotFoundError:
+    ref_key = pinned_reference or current_reference_identity(cfg)
+    if ref_key is None:
         candidates = (
             sorted(d for d in base_dir.iterdir() if d.is_dir() and d.name.startswith("ref-"))
             if base_dir.is_dir()
@@ -458,11 +476,10 @@ def _dpo_cache_path(cfg: Config) -> Path:
                 f"cache, or delete the ones you no longer need ({', '.join(c.name for c in candidates)})."
             )
         return candidates[0]
-    ref_key = f"{cfg.resolved_reference_checkpoint}|{ref_stat.st_mtime}|{ref_stat.st_size}"
     return base_dir / ("ref-" + hashlib.sha256(ref_key.encode()).hexdigest()[:16])
 
 
-def dpo_cache_exists(cfg: Config) -> bool:
+def dpo_cache_exists(cfg: Config, pinned_reference: str | None = None) -> bool:
     """Whether _load_or_build_dpo_packed will hit the disk cache rather than rebuild it.
 
     Lets a caller (train.py's batch-size estimate) know, before touching any GPU memory, whether a
@@ -473,7 +490,7 @@ def dpo_cache_exists(cfg: Config) -> bool:
     if not cfg.dpo.cache_dir:
         return False
     try:
-        return _dpo_cache_path(cfg).exists()
+        return _dpo_cache_path(cfg, pinned_reference).exists()
     except ValueError:
         return False
 
@@ -518,13 +535,24 @@ def check_rlaif_manifest(cfg: Config) -> None:
         )
 
 
-def _load_or_build_dpo_packed(cfg: Config, tokenizer: PreTrainedTokenizerBase):
+def _load_or_build_dpo_packed(
+    cfg: Config, tokenizer: PreTrainedTokenizerBase, pinned_reference: str | None = None
+):
     check_rlaif_manifest(cfg)
-    cache_path = _dpo_cache_path(cfg)
+    cache_path = _dpo_cache_path(cfg, pinned_reference)
     if cfg.dpo.cache_dir and cache_path.exists():
         packed = load_from_disk(str(cache_path))
         packed.set_format(type="torch")
         return packed
+    if pinned_reference is not None and pinned_reference != current_reference_identity(cfg):
+        raise ValueError(
+            f"this run computed its DPO reference log-probs against {pinned_reference!r} "
+            f"(path|mtime|size), but dpo.reference_checkpoint {cfg.resolved_reference_checkpoint!r} "
+            "has changed since (it defaults to train.init_from — was that policy path rewritten?) "
+            "and no cache of the original log-probs survives to resume from. Recomputing them "
+            "against the new file would switch the run's reference half-way through. Restore the "
+            "original checkpoint at that path, or start a fresh run (new train.output_dir)."
+        )
 
     raw = load_chat_dataset(cfg.dpo.dataset, cfg.dpo.subset)
     train_split, val_split = select_splits(
@@ -556,10 +584,13 @@ def _load_or_build_dpo_packed(cfg: Config, tokenizer: PreTrainedTokenizerBase):
     return packed
 
 
-def build_dpo_dataloaders(cfg: Config, tokenizer: PreTrainedTokenizerBase) -> tuple[DataLoader, DataLoader | None]:
+def build_dpo_dataloaders(
+    cfg: Config, tokenizer: PreTrainedTokenizerBase, pinned_reference: str | None = None
+) -> tuple[DataLoader, DataLoader | None]:
     """DPO analogue of build_sft_dataloaders: same (train_loader, val_loader) contract, but each
     batch carries chosen/rejected input_ids+loss_mask plus their cached reference log-probs (see
-    module docstring above)."""
+    module docstring above). `pinned_reference`: a resumed run's recorded reference identity,
+    which pins it to its original reference (see current_reference_identity)."""
     if not cfg.dpo.dataset:
         raise ValueError("dpo.enabled requires dpo.dataset to be set.")
     if not cfg.resolved_reference_checkpoint:
@@ -586,7 +617,7 @@ def build_dpo_dataloaders(cfg: Config, tokenizer: PreTrainedTokenizerBase) -> tu
         drop_last=True,
     )
 
-    packed = _load_or_build_dpo_packed(cfg, tokenizer)
+    packed = _load_or_build_dpo_packed(cfg, tokenizer, pinned_reference)
     train_ds = packed["train"]
     val_ds = packed.get("validation")
 
