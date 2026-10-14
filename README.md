@@ -13,7 +13,7 @@ No setup step — `uv run` creates and syncs the virtualenv on first use.
 
 ```bash
 # train
-WANDB_MODE=offline uv run radiance-train --config configs/tinystories.yaml
+uv run radiance-train --config configs/old_tests/tinystories.yaml --set wandb.mode=offline
 
 # sample from a checkpoint
 uv run radiance-generate --checkpoint checkpoints/tinystories/step_1000.pt --prompt "Once upon a time"
@@ -29,10 +29,11 @@ uv run --group dev pytest              # everything
 uv run --group dev pytest -m "not slow"  # skip the compiled-GPU tests
 ```
 
-`configs/tinystories.yaml` is the reference config, tuned for a quick first run on a single GPU. Copy it to start
-a new one. `configs/v1.yaml` is the shipping model: a 375M dense transformer trained on fineweb for ~9B tokens.
+`configs/old_tests/tinystories.yaml` is the reference config, tuned for a quick first run on a single GPU. Copy it
+to start a new one. `configs/v1.yaml` is the shipping model: a 375M dense transformer trained on fineweb for ~9B tokens.
 
-Drop `WANDB_MODE=offline` to log to your W&B account (or set `wandb.mode` in the config).
+Drop the `--set` to log to your W&B account. The config's `wandb.mode` overrides the `WANDB_MODE` env var, so
+change it in the config or with `--set`.
 
 ## What's in it
 
