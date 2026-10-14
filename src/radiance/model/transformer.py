@@ -985,6 +985,48 @@ class DenseTransformer(nn.Module):
         total -= sum(p.numel() for p in self.mtp_heads.parameters())
         return total
 
+    def training_flops_per_token(self, seq_len: int) -> float:
+        """Model FLOPs per trained token (forward + backward), for MFU.
+
+        The PaLM/nanoGPT convention, so the ratio is comparable with published MFU figures:
+        6 FLOPs per token per parameter that multiplies against it, plus 12 * d_model * seq_len per
+        executed block for the attention score and value matmuls (counted as full, not causal —
+        also the convention). Model FLOPs, not hardware FLOPs: grad_checkpoint's recompute and
+        ACT's halted positions are not credited, so MFU measures useful work.
+
+        What differs from `6 * num_active_parameters()` is what the loop and the extra heads do:
+        blocks[1:] runs `loop_count` times per forward on one set of weights (the mean of a
+        stochastic range; the full `max_loops` under the router, which computes every iteration
+        densely), and MTP heads — excluded from active parameters because they never serve —
+        still run in every training step, each re-projecting through the shared lm_head.
+        Norm gains and similar vectors are counted as if they were matmul weights; they are a
+        rounding error.
+        """
+        cfg = self.cfg
+        if cfg.use_router:
+            loops = float(cfg.max_loops)
+        elif cfg.loop_count_min is not None:
+            loops = (cfg.loop_count_min + (cfg.loop_count_max or cfg.loop_count)) / 2
+        else:
+            loops = float(cfg.loop_count)
+        inactive = {
+            id(moe_ffn): moe_ffn.per_expert_parameter_count() * (cfg.n_experts - cfg.moe_top_k)
+            for moe_ffn in self._moe_layers
+        }
+        body = sum(p.numel() for p in self.blocks[1:].parameters()) - sum(
+            inactive.get(id(m), 0) for m in self.blocks[1:].modules()
+        )
+        n_mtp = len(self.mtp_heads)
+        matmul_params = (
+            self.num_active_parameters()
+            + (loops - 1) * body
+            + sum(p.numel() for p in self.mtp_heads.parameters())
+            # token_emb, not lm_head: the two are tied, and lm_head may be an FP4Linear wrapper.
+            + n_mtp * self.token_emb.weight.numel()
+        )
+        executed_blocks = 1 + loops * (cfg.n_layers - 1) + n_mtp
+        return 6 * matmul_params + 12 * executed_blocks * cfg.d_model * seq_len
+
     def activation_bytes_per_token(self, activation_dtype_bytes: int) -> int:
         """Conservative (deliberately over-, not under-, estimated) activation memory per token,
         for sizing a training batch to available VRAM (see train.py's estimate_batch_size).

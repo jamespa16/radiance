@@ -52,10 +52,26 @@ Drop `WANDB_MODE=offline` to log to your W&B account (`wandb.mode` in the config
 `offline`, or `disabled`). `configs/tinystories.yaml` is the reference config, tuned for a quick first run against
 `roneneldan/TinyStories`. Copy it to start a new config.
 
+On a terminal the run shows a live HUD (progress, ETA, metrics, loss sparkline, best val loss) instead of a line per
+log step; redirected to a file or pipe it prints the plain `[radiance]` lines as before. `--no-hud` forces plain
+output. See [docs/train.md](docs/train.md).
+
 **Real training runs should use the GPU** (`train.device: auto`, the default, resolves to `cuda` when one's
 available — see `resolve_device` in `config.py`). Don't drop to `train.device: cpu` for an actual run just because the GPU is temporarily busy with another
 process; wait for it to free up or ask. CPU is fine only for the tiny pipeline sanity-checks below, which are
 explicitly cheap/throwaway, not for anything whose numbers you intend to keep.
+
+For a long run, tokenize the data to local disk first so the run never touches the network, then point
+`data.pretokenized_dir` at it (see [docs/data.md](docs/data.md)); `configs/v2.yaml` is set up this way:
+
+```bash
+uv run radiance-pretokenize --config configs/v2.yaml    # resumable; re-run the same command after an interruption
+WANDB_MODE=offline uv run radiance-train --config configs/v2.yaml
+```
+
+Under `lr_schedule: wsd`, any checkpoint can be annealed into a finished model on a side branch without stopping the
+run: `radiance-train --config <cfg> --decay-from <step_N.pt> --decay-steps K` writes to
+`<output_dir>/decay_from_N/`. `train.keep_every` keeps the branch points; see [docs/train.md](docs/train.md).
 
 ## Running inference
 
@@ -204,6 +220,8 @@ only the model package imports. `model/` and `nvfp4/` are packages whose `__init
   `losses.py`, batch sizing in `batching.py`, checkpoint save/load in `checkpointing.py`, evaluation in
   `evaluation.py`.
 - **`generate.py`** — checkpoint loading and KV-cached autoregressive sampling.
+- **`pretokenize.py`** — `radiance-pretokenize`: a config's corpus -> flat local token files for
+  `data.pretokenized_dir`, resumable, with the held-out carve split off.
 - **`export.py`** — checkpoint -> safetensors + `config.json` export (`radiance-export`) and its inverse `load_export`.
 - **`eval_harness.py`** — an lm-evaluation-harness `LM` backend (`RadianceLM`) plus the `radiance-eval` CLI; runs
   standard benchmarks in-process against a loaded checkpoint. `eval` dependency group, not core.

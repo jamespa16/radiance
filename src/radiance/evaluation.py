@@ -1,13 +1,37 @@
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
+
 import torch
 
 from radiance.model import DenseTransformer
 
 from .batching import chunk_reduction_units, split_micro_batch
 from .losses import compute_loss, forward_dpo_pair
+
+
+@dataclass
+class EvalResult:
+    loss: float
+    # Standard error of `loss`, from the spread of per-batch losses: the sampling noise of this
+    # validation set, i.e. how far apart two val/loss readings must be before the gap means
+    # anything. None with fewer than two batches.
+    loss_stderr: float | None = None
+    # Bits per UTF-8 byte of the scored targets: nats summed over every scored token, divided by
+    # ln 2 and by those tokens' byte length. Unlike val/loss it does not change unit when the
+    # tokenizer does, so it is what compares runs across tokenizers. None unless `token_bytes`
+    # was given (pretraining only).
+    bits_per_byte: float | None = None
+
+
+def evaluate(*args, **kwargs) -> float:
+    """Mean validation loss; see evaluate_detailed, whose .loss this returns."""
+    return evaluate_detailed(*args, **kwargs).loss
+
+
 @torch.no_grad()
-def evaluate(
+def evaluate_detailed(
     model: DenseTransformer,
     val_loader,
     device: str,
@@ -19,7 +43,8 @@ def evaluate(
     dpo: bool = False,
     dpo_beta: float | None = None,
     micro_chunk_size: int | None = None,
-) -> float:
+    token_bytes: torch.Tensor | None = None,
+) -> EvalResult:
     """Mean loss over the validation loader, capped at max_batches batches.
 
     The cap matters because this runs every eval_every steps: uncapped, a large validation split
@@ -53,9 +78,18 @@ def evaluate(
     terms into eval or need a second, eval-only mode threaded through it for no benefit. The DPO
     forward itself (concatenate chosen+rejected, split the logits back) is identical either way,
     so that much is shared via losses.forward_dpo_pair.
+
+    token_bytes (pretraining only; see data.token_byte_lengths) is each vocabulary id's UTF-8
+    byte length, and turns on bits_per_byte. The byte count is taken over exactly the targets
+    compute_loss scores — every token but each row's first — so the numerator and denominator
+    cover the same predictions.
     """
     model.eval()
     total, count = 0.0, 0
+    batch_losses: list[float] = []
+    nats, n_bytes = 0.0, 0
+    if token_bytes is not None and (sft or dpo):
+        raise ValueError("evaluate: token_bytes (bits/byte) is only defined for pretraining")
     for i, batch in enumerate(val_loader):
         if max_batches is not None and i >= max_batches:
             break
@@ -94,5 +128,18 @@ def evaluate(
             )
         total += loss
         count += 1
+        batch_losses.append(loss)
+        if token_bytes is not None:
+            # loss is a mean over this batch's scored tokens; turn it back into a sum.
+            nats += loss * sum(units)
+            n_bytes += int(token_bytes[batch["input_ids"][:, 1:]].sum())
     model.train()
-    return total / count if count else float("nan")
+    if not count:
+        return EvalResult(float("nan"))
+    mean = total / count
+    stderr = None
+    if count > 1:
+        var = sum((l - mean) ** 2 for l in batch_losses) / (count - 1)
+        stderr = math.sqrt(var / count)
+    bpb = nats / (math.log(2) * n_bytes) if token_bytes is not None and n_bytes else None
+    return EvalResult(mean, stderr, bpb)

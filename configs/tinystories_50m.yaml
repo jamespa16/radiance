@@ -74,7 +74,7 @@ train:
   log_every: 100
   eval_every: 6000
   eval_max_batches: 50
-  save_every: 54000  # train.py has no end-of-training save, so this must divide max_steps
+  save_every: 54000  # one save, at the end (the final step always saves too)
   output_dir: checkpoints/tinystories_50m
   seed: 42
   compile: true

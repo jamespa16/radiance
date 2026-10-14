@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import hashlib
 import itertools
 import json
@@ -10,6 +11,7 @@ import random
 import yaml
 from pathlib import Path
 
+import numpy as np
 import torch
 from datasets import DatasetDict, IterableDataset, interleave_datasets, load_dataset, load_from_disk
 from torch.utils.data import DataLoader
@@ -474,7 +476,15 @@ class StreamingPackedDataset(torch.utils.data.IterableDataset):
                     sum(s["n_bytes"] for s in manifest["shards"]),
                 )
 
-        yield from shuffled(source())
+        if self.split == "train":
+            yield from shuffled(source())
+        else:
+            # Never shuffle validation. evaluate() reads only the first eval_max_batches batches,
+            # and under persistent_workers each worker's `random` state carries across evals — so
+            # a shuffled val stream scored a *different* random subset on every eval. V1 did
+            # exactly this: 400 of ~2,000 held-out blocks, redrawn each time, which is what made
+            # its val/loss wobble by ~0.02 between evals with no change in the model.
+            yield from source()
 
 
 def _pretrain_collate(batch):
@@ -721,7 +731,172 @@ def _build_mixed_dataloaders(cfg: Config, tokenizer: PreTrainedTokenizerBase):
     return train_loader, val_loader
 
 
+# --- pretokenized data (radiance-pretokenize) --------------------------------------------------
+
+PRETOKENIZED_FORMAT = 1
+PRETOKENIZED_META = "meta.json"
+
+
+def read_pretokenized_meta(directory: str | Path) -> dict:
+    path = Path(directory) / PRETOKENIZED_META
+    if not path.exists():
+        raise FileNotFoundError(
+            f"data.pretokenized_dir={str(directory)!r} has no {PRETOKENIZED_META}: it was never "
+            "written, or radiance-pretokenize has not finished. Run radiance-pretokenize first."
+        )
+    meta = json.loads(path.read_text())
+    if meta.get("format") != PRETOKENIZED_FORMAT:
+        raise ValueError(f"{path}: unsupported pretokenized format {meta.get('format')!r}")
+    return meta
+
+
+class PretokenizedDataset(torch.utils.data.Dataset):
+    """Fixed seq_len blocks cut from flat token files, read through np.memmap.
+
+    Each file is one stream of documents joined by EOS — the same packing the other paths do —
+    cut into consecutive seq_len blocks, dropping each file's sub-block tail. seq_len is chosen
+    here, at read time, so one pretokenized directory serves any seq_len.
+
+    The memmaps are opened lazily in each process that reads, so the dataset pickles cheaply to
+    DataLoader workers and never shares a file handle across a fork.
+    """
+
+    def __init__(self, files: list[Path], seq_len: int, dtype: str):
+        self.files = [str(f) for f in files]
+        self.seq_len = seq_len
+        self.dtype = np.dtype(dtype)
+        itemsize = self.dtype.itemsize
+        blocks = [os.path.getsize(f) // itemsize // seq_len for f in self.files]
+        self._offsets = list(itertools.accumulate(blocks, initial=0))
+        self._maps: list[np.memmap] | None = None
+
+    def __len__(self) -> int:
+        return self._offsets[-1]
+
+    def __getitem__(self, idx: int) -> dict:
+        if self._maps is None:
+            self._maps = [np.memmap(f, dtype=self.dtype, mode="r") for f in self.files]
+        file_idx = bisect.bisect_right(self._offsets, idx) - 1
+        start = (idx - self._offsets[file_idx]) * self.seq_len
+        block = self._maps[file_idx][start : start + self.seq_len]
+        return {"input_ids": torch.from_numpy(block.astype(np.int64))}
+
+    def __getstate__(self):
+        return {**self.__dict__, "_maps": None}
+
+
+class EpochPermutationSampler(torch.utils.data.Sampler[int]):
+    """A fresh seeded permutation of every block per epoch, resumable to the exact block.
+
+    A permutation over the *whole* train set — not a shuffle buffer — so any two blocks are
+    equally likely to be neighbours, however far apart they were written. And because epoch e's
+    order is a pure function of (seed, e), a run's data position is fully described by how many
+    blocks it has drawn: set_resume_position skips exactly those, in the same order, so a resumed
+    run neither repeats nor skips a block. That is the guarantee the streaming disk-cache path can
+    only give up to its shuffle buffer.
+
+    An epoch is floor(n / batch_size) * batch_size blocks — what drop_last=True actually delivers
+    — so the draw count maps to a position with no drift across epochs. Each iter() continues from
+    where the last one ended, so train()'s restart-on-StopIteration walks into the next epoch.
+    """
+
+    def __init__(self, n_blocks: int, batch_size: int, seed: int):
+        self.n_blocks = n_blocks
+        self.epoch_len = (n_blocks // batch_size) * batch_size
+        if self.epoch_len == 0:
+            raise ValueError(f"{n_blocks} blocks is less than one batch of {batch_size}")
+        self.batch_size = batch_size
+        self.seed = seed
+        self._position = 0  # blocks drawn so far, across epochs
+
+    def set_resume_position(self, batches_drawn: int) -> None:
+        self._position = batches_drawn * self.batch_size
+
+    def __len__(self) -> int:
+        return self.epoch_len - self._position % self.epoch_len
+
+    def __iter__(self):
+        epoch, offset = divmod(self._position, self.epoch_len)
+        self._position = (epoch + 1) * self.epoch_len
+        if epoch > 0 and offset == 0:
+            logger.warning(
+                "[radiance] pretokenized train set exhausted; starting epoch %d (repeating data)", epoch
+            )
+        generator = torch.Generator().manual_seed(self.seed + epoch)
+        order = torch.randperm(self.n_blocks, generator=generator)[: self.epoch_len]
+        yield from order[offset:].tolist()
+
+
+def _build_pretokenized_dataloaders(cfg: Config, tokenizer: PreTrainedTokenizerBase):
+    directory = Path(cfg.data.pretokenized_dir)
+    meta = read_pretokenized_meta(directory)
+    # A directory tokenized with a different tokenizer trains without error on ids that mean
+    # something else entirely, so check the two things that would silently disagree.
+    if meta["tokenizer"] != cfg.data.tokenizer or meta["eos_id"] != tokenizer.eos_token_id:
+        raise ValueError(
+            f"{directory} was tokenized with {meta['tokenizer']!r} (eos {meta['eos_id']}), but this "
+            f"config uses {cfg.data.tokenizer!r} (eos {tokenizer.eos_token_id})"
+        )
+    seq_len = cfg.data.seq_len
+    train_ds = PretokenizedDataset([directory / f for f in meta["train"]["files"]], seq_len, meta["dtype"])
+    sampler = EpochPermutationSampler(len(train_ds), cfg.train.batch_size, cfg.train.seed)
+    loader_kwargs = _dataloader_kwargs(cfg)
+    train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size, sampler=sampler, **loader_kwargs)
+    val_loader = None
+    if meta.get("val"):
+        val_ds = PretokenizedDataset([directory / meta["val"]["file"]], seq_len, meta["dtype"])
+        # Unshuffled and drop_last=False: every eval scores the same blocks, and all of them.
+        val_loader = DataLoader(
+            val_ds, batch_size=cfg.train.batch_size, shuffle=False, **{**loader_kwargs, "drop_last": False}
+        )
+    print(
+        f"[radiance] pretokenized data: {len(train_ds):,} train blocks "
+        f"({len(train_ds) * seq_len / 1e9:.2f}B tokens), "
+        f"{len(val_loader.dataset) if val_loader else 0:,} val blocks from {directory}"
+    )
+    return train_loader, val_loader
+
+
+def _bytes_to_unicode() -> dict[int, str]:
+    """GPT-2's byte <-> printable-unicode table, which every byte-level BPE vocabulary is spelled in."""
+    bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
+    cs = bs[:]
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    return dict(zip(bs, map(chr, cs)))
+
+
+def token_byte_lengths(tokenizer: PreTrainedTokenizerBase, vocab_size: int) -> torch.Tensor | None:
+    """UTF-8 byte length of each vocabulary id, for bits/byte. None if it can't be exact.
+
+    Exact for byte-level BPE (gpt2 and its descendants), where each token *is* a byte string
+    spelled through _bytes_to_unicode, so summing a document's token lengths gives its UTF-8 size
+    exactly. Special tokens (EOS) and vocab padding count 0 bytes: they are not text.
+
+    Anything else returns None rather than an approximation — decoding a sentencepiece token on
+    its own drops the leading-space marker, and a bits/byte number that is quietly off by a few
+    percent is worse than none when its whole purpose is comparing tokenizers.
+    """
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    decoder = getattr(backend, "decoder", None) if backend is not None else None
+    if decoder is None or type(decoder).__name__ != "ByteLevel":
+        return None
+    byte_of = {c: b for b, c in _bytes_to_unicode().items()}
+    special = set(tokenizer.all_special_ids)
+    lengths = torch.zeros(vocab_size, dtype=torch.long)
+    for token, idx in tokenizer.get_vocab().items():
+        if idx < vocab_size and idx not in special and all(c in byte_of for c in token):
+            lengths[idx] = len(token)  # one printable char per byte
+    return lengths
+
+
 def build_dataloaders(cfg: Config, tokenizer: PreTrainedTokenizerBase) -> tuple[DataLoader, DataLoader | None]:
+    if cfg.data.pretokenized_dir:
+        return _build_pretokenized_dataloaders(cfg, tokenizer)
     # A data.dataset_mix drives the pipeline instead of the single data.dataset.
     if cfg.data.dataset_mix:
         return _build_mixed_dataloaders(cfg, tokenizer)

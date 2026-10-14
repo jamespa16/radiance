@@ -91,19 +91,19 @@ def build_param_groups(
         # hidden- or readout-like, i.e. all 1/m under muP. `no_decay` is 1-D gains and biases,
         # which muP leaves alone. The key is only set when the correction is non-trivial, so an
         # ordinary run's groups are untouched and inherit the optimizer's own lr as before.
-        {"params": decay, "weight_decay": weight_decay},
-        {"params": no_decay, "weight_decay": 0.0},
+        {"params": decay, "weight_decay": weight_decay, "name": "decay"},
+        {"params": no_decay, "weight_decay": 0.0, "name": "no_decay"},
     ]
     if mup:
         groups[0]["lr"] = lr / mup_width_mult
     if embed:
-        groups.append({"params": embed, "weight_decay": weight_decay, "lr": embed_lr})
+        groups.append({"params": embed, "weight_decay": weight_decay, "lr": embed_lr, "name": "embed"})
     # Appended last and only when non-empty, so the positional group zip in
     # migrate_optimizer_to_cpu_offload stays valid — both call sites pass the same arguments.
     if hyper_static:
-        groups.append({"params": hyper_static, "weight_decay": 0.0, "lr": hyper_conn_lr})
+        groups.append({"params": hyper_static, "weight_decay": 0.0, "lr": hyper_conn_lr, "name": "hyper_static"})
     if hyper_dyn:
-        groups.append({"params": hyper_dyn, "weight_decay": weight_decay, "lr": hyper_conn_lr})
+        groups.append({"params": hyper_dyn, "weight_decay": weight_decay, "lr": hyper_conn_lr, "name": "hyper_dyn"})
     return groups
 
 
@@ -232,6 +232,7 @@ def build_muon_param_groups(model: torch.nn.Module, cfg: Config) -> list[dict]:
     groups = [
         {
             "params": muon,
+            "name": "muon",
             "algorithm": "muon",
             "lr": cfg.train.muon_lr,
             "weight_decay": cfg.train.weight_decay,
@@ -239,6 +240,7 @@ def build_muon_param_groups(model: torch.nn.Module, cfg: Config) -> list[dict]:
         },
         {
             "params": adam_embed,
+            "name": "embed",
             "algorithm": "adamw",
             "lr": cfg.train.embed_lr_resolved,
             "weight_decay": cfg.train.weight_decay,
@@ -247,6 +249,7 @@ def build_muon_param_groups(model: torch.nn.Module, cfg: Config) -> list[dict]:
         },
         {
             "params": adam_decay,
+            "name": "adamw_decay",
             "algorithm": "adamw",
             "lr": cfg.train.lr,
             "weight_decay": cfg.train.weight_decay,
@@ -257,6 +260,7 @@ def build_muon_param_groups(model: torch.nn.Module, cfg: Config) -> list[dict]:
         },
         {
             "params": adam_no_decay,
+            "name": "adamw_no_decay",
             "algorithm": "adamw",
             "lr": cfg.train.lr,
             "weight_decay": 0.0,
@@ -264,6 +268,7 @@ def build_muon_param_groups(model: torch.nn.Module, cfg: Config) -> list[dict]:
         },
         {
             "params": hyper_static,
+            "name": "hyper_static",
             "algorithm": "adamw",
             "lr": cfg.train.hyper_conn_lr_resolved,
             # Undecayed: decaying a one-hot read or an identity depth mix drags the model off
@@ -273,6 +278,7 @@ def build_muon_param_groups(model: torch.nn.Module, cfg: Config) -> list[dict]:
         },
         {
             "params": hyper_dyn,
+            "name": "hyper_dyn",
             "algorithm": "adamw",
             "lr": cfg.train.hyper_conn_lr_resolved,
             "weight_decay": cfg.train.weight_decay,
