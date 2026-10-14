@@ -177,6 +177,72 @@ def test_hh_pair_shares_every_turn_but_the_last():
     assert c_ids[:n] == r_ids[:n]
 
 
+def test_shared_turns_are_left_out_of_the_loss_mask():
+    tok = _FakeTokenizer()
+    cfg = Config()
+    row = dpo_mod._tokenize_dpo_row({"chosen": _HH_CHOSEN, "rejected": _HH_REJECTED}, tok, cfg, 64)
+    chosen, _ = _format_dpo_pair({"chosen": _HH_CHOSEN, "rejected": _HH_REJECTED}, cfg)
+    shared, _ = dpo_mod.tokenize_sft_example(chosen[:-1], tok, cfg.dpo.user_prefix, cfg.dpo.assistant_prefix)
+    n = len(shared) - 1
+    for side in ("chosen", "rejected"):
+        mask = row[f"{side}_loss_mask"]
+        assert not any(mask[:n])  # the shared "4." assistant turn is not scored...
+        assert all(mask[n : mask.index(0, n)]) and mask.index(0, n) > n  # ...the final response is
+    # A single-turn pair loses nothing: its one shared turn was a user turn, never scored.
+    single = {
+        "chosen": [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a b"}],
+        "rejected": [{"role": "user", "content": "q"}, {"role": "assistant", "content": "c"}],
+    }
+    row = dpo_mod._tokenize_dpo_row(single, tok, cfg, 16)
+    assert sum(row["chosen_loss_mask"]) == 4 and sum(row["rejected_loss_mask"]) == 3  # Assistant: + words + EOS
+
+
+def test_ipo_ignores_turns_both_sides_share():
+    """IPO divides each side by its own token count, so a shared, scored turn would not cancel.
+    With the shared turn unscored, the loss must not move when only the shared turn changes."""
+    import torch
+
+    from radiance.losses import compute_dpo_loss_from_logits
+
+    tok = _FakeTokenizer()
+    cfg = Config()
+
+    def loss_for(shared_reply: str) -> torch.Tensor:
+        chosen = _HH_CHOSEN.replace("4.", shared_reply)
+        rejected = _HH_REJECTED.replace("4.", shared_reply)
+        row = dpo_mod._tokenize_dpo_row({"chosen": chosen, "rejected": rejected}, tok, cfg, 32)
+        ids = torch.tensor([row["chosen_input_ids"], row["rejected_input_ids"]]) % 50
+        mask = torch.tensor([row["chosen_loss_mask"], row["rejected_loss_mask"]])
+        # A "policy" whose logits are a fixed random function of the current token: the shared
+        # turn's per-token log-probs then vary and differ from the reference's (zero), as they do
+        # once training moves the policy. (Constant per-token log-probs would leave the per-token
+        # mean unchanged by the shared turn, and this test vacuous.)
+        logits = torch.randn(50, 50, generator=torch.Generator().manual_seed(0))[ids]
+        ref = torch.zeros(1)
+        return compute_dpo_loss_from_logits(
+            logits[:1], ids[:1], mask[:1], logits[1:], ids[1:], mask[1:], ref, ref, 0.1, loss_type="ipo"
+        )[0]
+
+    torch.testing.assert_close(loss_for("4."), loss_for("four, which is a long shared reply"))
+
+
+def test_an_empty_train_split_says_so():
+    with pytest.raises(ValueError, match="is empty"):
+        select_splits(DatasetDict({"train": _rows(0)}), "d", "train", None, (), 0, None)
+
+
+def test_rlaif_pairs_refuse_another_turn_template(tmp_path):
+    (tmp_path / "rlaif_manifest.json").write_text(
+        json.dumps({"turn_template": {"user_prefix": "<u>", "assistant_prefix": "<a>"}})
+    )
+    cfg = Config(dpo=DPOConfig(dataset=str(tmp_path)))
+    with pytest.raises(ValueError, match="turn template"):
+        dpo_mod.check_rlaif_turn_template(cfg)
+    cfg.dpo.user_prefix, cfg.dpo.assistant_prefix = "<u>", "<a>"
+    dpo_mod.check_rlaif_turn_template(cfg)
+    dpo_mod.check_rlaif_turn_template(Config(dpo=DPOConfig(dataset="hub/id")))  # no manifest: no check
+
+
 # --- score-margin filter, end to end through the packed DPO dataset ----------------------------
 
 

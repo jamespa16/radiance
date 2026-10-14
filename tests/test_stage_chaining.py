@@ -10,7 +10,7 @@ import torch
 import yaml
 
 from radiance.checkpointing import save_checkpoint
-from radiance.config import Config, DataConfig, ModelConfig, TrainConfig, load_config, load_config_with_overrides
+from radiance.config import Config, DataConfig, DPOConfig, ModelConfig, TrainConfig, load_config, load_config_with_overrides
 from radiance.export import export_checkpoint, read_checkpoint_config
 from radiance.losses import validate_post_training_config
 from radiance.model import DenseTransformer
@@ -82,6 +82,19 @@ def test_a_dpo_runs_resolved_doc_mask_is_not_inherited(tmp_path):
     cfg.dpo.enabled = False
     save_checkpoint(ckpt, model, opt, build_lr_scheduler(opt, cfg), torch.amp.GradScaler("cpu", enabled=False), 0, cfg)
     assert load_config(_write(tmp_path, raw)).model.doc_attention_mask is False
+    # ...and so is a DPO source's, once it recorded that the architecture itself had the mask off.
+    cfg.dpo.enabled = True
+    cfg.dpo.doc_attention_mask_before_resolve = False
+    save_checkpoint(ckpt, model, opt, build_lr_scheduler(opt, cfg), torch.amp.GradScaler("cpu", enabled=False), 0, cfg)
+    assert load_config(_write(tmp_path, raw)).model.doc_attention_mask is False
+
+
+def test_resolve_dpo_doc_mask_records_what_it_overrode():
+    from radiance.losses import resolve_dpo_doc_mask
+
+    cfg = Config(dpo=DPOConfig(enabled=True))
+    resolve_dpo_doc_mask(cfg)
+    assert cfg.model.doc_attention_mask is False and cfg.dpo.doc_attention_mask_before_resolve is True
 
 
 def test_inherit_requires_init_from(tmp_path):
@@ -127,3 +140,13 @@ def test_overrides_are_typed_and_validated(tmp_path):
         load_config_with_overrides(path, ["train.dtype=nvfp4", "model.fp4_linear=false"])
     # No temporary files left beside the config.
     assert sorted(p.name for p in tmp_path.iterdir()) == ["stage.yaml"]
+
+
+def test_overrides_fill_an_empty_section_and_need_no_writable_config_dir(tmp_path):
+    path = _write(tmp_path, {"sft": None, "train": {"max_steps": 10}})
+    tmp_path.chmod(0o500)
+    try:
+        cfg = load_config_with_overrides(path, ["sft.enabled=true", "train.max_steps=3"])
+    finally:
+        tmp_path.chmod(0o700)
+    assert cfg.sft.enabled and cfg.train.max_steps == 3

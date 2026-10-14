@@ -233,16 +233,25 @@ def build_loss_fn(cfg: Config):
     return torch.compile(fn) if cfg.train.compile else fn
 
 
-def build_dpo_loss_fn(cfg: Config):
+def dpo_loss_variant_configured(cfg: Config) -> bool:
+    """Whether dpo.loss_type/label_smoothing/sft_weight select anything but plain DPO."""
+    return cfg.dpo.loss_type != "sigmoid" or bool(cfg.dpo.label_smoothing) or bool(cfg.dpo.sft_weight)
+
+
+def build_dpo_loss_fn(cfg: Config, plain: bool = False):
     """compute_dpo_loss_from_logits, compiled when the run is compiled. DPO analogue of
     build_loss_fn — kept separate rather than folded into it because the two functions take
     different-shaped arguments (one logits tensor + input_ids/loss_mask vs. two logits tensors +
     two input_ids/loss_mask pairs + two cached reference log-probs).
 
     The loss variant (dpo.loss_type/label_smoothing/sft_weight) is bound here, once, so every call
-    site keeps passing the same nine positional arguments whichever objective the run optimizes —
-    and val/loss is therefore the configured objective, not always the plain DPO one."""
+    site keeps passing the same nine positional arguments whichever objective the run optimizes.
+    `plain=True` binds the defaults instead — train() evaluates with that, so val/loss is the plain
+    DPO objective on every run and stays comparable across variants (an sft_weight run's configured
+    loss carries a chosen-NLL term no other run's does)."""
     fn = torch.compile(compute_dpo_loss_from_logits) if cfg.train.compile else compute_dpo_loss_from_logits
+    if plain:
+        return fn
     return functools.partial(
         fn,
         loss_type=cfg.dpo.loss_type,
@@ -381,6 +390,9 @@ def resolve_dpo_doc_mask(cfg: Config) -> None:
     """
     if not (cfg.dpo.enabled and doc_mask_is_inert_for_dpo(cfg.model)):
         return
+    # Recorded for config._inherit_model_config, which otherwise cannot tell this resolution from
+    # an architecture that never had the mask.
+    cfg.dpo.doc_attention_mask_before_resolve = cfg.model.doc_attention_mask
     cfg.model.doc_attention_mask = False
     print(
         "[radiance] dpo.enabled: turning model.doc_attention_mask off — DPO packs one pair side "

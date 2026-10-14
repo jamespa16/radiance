@@ -48,6 +48,7 @@ from .losses import (
     build_dpo_loss_fn,
     build_loss_fn,
     chunk_loss_and_metrics,
+    dpo_loss_variant_configured,
     note_dpo_dropout,
     note_dpo_z_loss_omitted,
     resolve_dpo_doc_mask,
@@ -371,6 +372,11 @@ def train(cfg: Config) -> None:
     compile_mode = resolve_compile_mode(raw_model, cfg, device_type)
     model = torch.compile(raw_model, mode=compile_mode) if cfg.train.compile else raw_model
     loss_fn = build_dpo_loss_fn(cfg) if cfg.dpo.enabled else build_loss_fn(cfg)
+    # val/loss is plain DPO whatever variant trains (see build_dpo_loss_fn); the same function
+    # object when no variant is configured, so a default run compiles the loss once, as before.
+    eval_loss_fn = (
+        build_dpo_loss_fn(cfg, plain=True) if cfg.dpo.enabled and dpo_loss_variant_configured(cfg) else loss_fn
+    )
 
     # batch_size must be finalized (auto_batch_size, if any, already ran) before the DataLoader is built.
     if cfg.dpo.enabled:
@@ -669,7 +675,7 @@ def train(cfg: Config) -> None:
                         device_type,
                         dtype,
                         cfg.train.eval_max_batches,
-                        loss_fn,
+                        eval_loss_fn,
                         sft=cfg.sft.enabled,
                         dpo=cfg.dpo.enabled,
                         dpo_beta=cfg.dpo.beta if cfg.dpo.enabled else None,

@@ -90,6 +90,13 @@ def load_prompts(
     return prompts
 
 
+def turn_template(cfg: Config) -> dict:
+    """The (user_prefix, assistant_prefix) format_chat_messages prompts this config with —
+    recorded in the pair manifest so the DPO pipeline can refuse to train the pairs under another."""
+    section = cfg.sft if cfg.sft.enabled else cfg.dpo
+    return {"user_prefix": section.user_prefix, "assistant_prefix": section.assistant_prefix}
+
+
 def _chat_cfg(cfg: Config) -> Config:
     """The checkpoint's own config, for format_chat_messages — which needs sft or dpo enabled to
     know the turn template. A plain pretrained checkpoint has neither; it is prompted with the DPO
@@ -115,9 +122,14 @@ def sample_completions(
     device: str,
 ) -> list[list[Completion] | None]:
     """`num_samples` completions per prompt, batched through generate_tokens_batched. None for a
-    prompt whose formatted length leaves no room for max_new_tokens in the model's context."""
+    prompt whose formatted length leaves no room for max_new_tokens in the model's context.
+
+    Generates one token past max_new_tokens: generate_tokens_batched ends a row at its budget
+    without saying whether the token it sampled there was EOS, so a response that used exactly
+    max_new_tokens and then stopped would otherwise count as unfinished. A row that runs into the
+    extra token is unfinished, and is cut back to max_new_tokens."""
     chat_cfg = _chat_cfg(cfg)
-    budget = model.cfg.max_seq_len - max_new_tokens
+    budget = model.cfg.max_seq_len - (max_new_tokens + 1)
     formatted = [format_chat_messages([{"role": "user", "content": p}], chat_cfg) for p in prompts]
     prompt_ids = [tokenizer(text)["input_ids"] for text in formatted]
     work = [(i, s) for i, ids in enumerate(prompt_ids) if len(ids) <= budget for s in range(num_samples)]
@@ -136,7 +148,7 @@ def sample_completions(
         items = [
             BatchItem(
                 input_ids=torch.tensor([prompt_ids[i]], device=device),
-                max_new_tokens=max_new_tokens,
+                max_new_tokens=max_new_tokens + 1,
                 temperature=temperature,
                 top_k=top_k,
             )
@@ -149,7 +161,9 @@ def sample_completions(
                     if token is not None:
                         generated[row].append(token)
         for (i, _), gen in zip(chunk, generated):
-            results[i].append(Completion(_decode_completion(tokenizer, prompt_ids[i], gen), len(gen) < max_new_tokens))
+            finished = len(gen) <= max_new_tokens
+            text = _decode_completion(tokenizer, prompt_ids[i], gen[:max_new_tokens])
+            results[i].append(Completion(text, finished))
         print(f"[radiance] rlaif: sampled {min(start + batch_size, len(work))}/{len(work)} completions", flush=True)
     return results
 
@@ -285,6 +299,7 @@ def _mean_stderr(values: list[float]) -> tuple[float, float]:
 
 
 def _sample_from_checkpoint(path: str, prompts: list[str], args, num_samples: int, device: str):
+    """(completions, the turn template they were sampled under)."""
     model, cfg, tokenizer = load_checkpoint(path, device)
     completions = sample_completions(
         model, cfg, tokenizer, prompts, num_samples, args.max_new_tokens,
@@ -293,7 +308,7 @@ def _sample_from_checkpoint(path: str, prompts: list[str], args, num_samples: in
     del model
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
-    return completions
+    return completions, turn_template(cfg)
 
 
 def _seed(seed: int) -> None:
@@ -306,7 +321,7 @@ def run_pairs(args) -> None:
     _seed(args.seed)
     prompts = load_prompts(args.prompts, args.prompt_column, args.split, args.subset, args.max_prompts, args.seed)
     print(f"[radiance] rlaif: {len(prompts)} prompts from {args.prompts}:{args.split}")
-    completions = _sample_from_checkpoint(args.checkpoint, prompts, args, args.num_samples, device)
+    completions, template = _sample_from_checkpoint(args.checkpoint, prompts, args, args.num_samples, device)
 
     judge = RewardModelJudge(args.judge, device, args.judge_batch_size)
     scores = score_completions(judge, prompts, completions)
@@ -337,13 +352,15 @@ def run_pairs(args) -> None:
     }
     out = Path(args.output)
     DatasetDict({"train": Dataset.from_list(pairs)}).save_to_disk(str(out))
-    manifest = {"args": vars(args), "stats": stats}
+    manifest = {"args": vars(args), "stats": stats, "turn_template": template}
     (out / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2))
     print(f"[radiance] rlaif: wrote {len(pairs)} pairs to {out}")
     print(json.dumps(stats, indent=2))
     print(
         "[radiance] rlaif: train on them with a DPO config setting dpo.dataset: "
-        f"{out}, dpo.prompt_column: prompt (see configs/post_training/dpo_rlaif.yaml)"
+        f"{out}, dpo.prompt_column: prompt (see configs/post_training/dpo_rlaif.yaml), and "
+        f"dpo.user_prefix/assistant_prefix {template['user_prefix']!r}/{template['assistant_prefix']!r}, "
+        "the turn template these were sampled under"
     )
 
 
@@ -376,10 +393,15 @@ def run_eval(args) -> None:
     for path in args.checkpoint:
         # Same seed per checkpoint, so sampling noise is matched as closely as the models allow.
         _seed(args.seed)
-        per_ckpt.append(_sample_from_checkpoint(path, prompts, args, 1, device))
+        per_ckpt.append(_sample_from_checkpoint(path, prompts, args, 1, device)[0])
 
     # Only prompts every checkpoint produced a completion for, so the win rates compare like with like.
     keep = [i for i in range(len(prompts)) if all(c[i] is not None for c in per_ckpt)]
+    if not keep:
+        raise SystemExit(
+            "[radiance] rlaif eval: no prompt fits every checkpoint's context with room for "
+            f"--max-new-tokens={args.max_new_tokens}; see the skipped counts above, or lower it"
+        )
     judge = RewardModelJudge(args.judge, device, args.judge_batch_size)
     rewards = []
     for comps in per_ckpt:

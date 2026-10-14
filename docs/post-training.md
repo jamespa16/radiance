@@ -42,9 +42,11 @@ Three pieces make that work without hand-editing:
   from the one pretrained. Opt-in, because it is not inert — an existing config's *omitted* model keys would change
   from the dataclass defaults to the checkpoint's values. Resolved in `load_config` (only the raw YAML knows which
   keys were written down), and cheaply: `export.read_checkpoint_config` mmaps the `.pt`, or reads an export's
-  `config.json` alone. One field is deliberately *not* inherited from a DPO checkpoint: `doc_attention_mask: false`
-  there is `resolve_dpo_doc_mask`'s per-run resolution, and an SFT stage inheriting it would let its packed
-  conversations attend to each other.
+  `config.json` alone. One field is deliberately *not* inherited as saved from a DPO checkpoint: `doc_attention_mask:
+  false` there is `resolve_dpo_doc_mask`'s per-run resolution, and an SFT stage inheriting it would let its packed
+  conversations attend to each other. `resolve_dpo_doc_mask` records the value it overrode in
+  `dpo.doc_attention_mask_before_resolve`, and that is what is inherited — so an architecture that genuinely had the
+  mask off keeps it off. A DPO checkpoint saved before that field existed falls back to the default (on).
 - **`dpo.reference_checkpoint` defaults to `train.init_from`** (`Config.resolved_reference_checkpoint`) — a
   range-collapsed default: a config naming the reference is unaffected, and one naming neither still raises.
 
@@ -89,8 +91,11 @@ against the dataset's published schema/splits only:
 every turn but the last. With no `prompt_column`, a string-valued side is parsed into turns
 (`dpo_data.parse_hh_transcript`); before, it crashed iterating characters as turns, so no working config took that
 branch. Parsed, the shared turns tokenize identically on both sides (tokenization is per turn), and attention is
-causal, so their log-probabilities are equal and cancel in the log-ratio: only the final response carries the
-preference.
+causal, so their log-probabilities are equal and cancel in the summed log-ratio. They are nonetheless left out of
+the loss mask (`_tokenize_dpo_row`, for any pair whose sides share leading turns): IPO and `sft_weight` divide each
+side by its own token count, and with chosen and rejected of different lengths the shared turns would *not* cancel
+there, so the preference would leak onto turns both sides agree on. Only message-list/transcript data has shared
+assistant turns, so only its cache key changed (`prompt_column` data's one shared turn was never scored).
 
 **Score-margin filter.** `dpo.min_score_margin` with `score_chosen_column`/`score_rejected_column` drops pairs the
 judge barely separated. For AI-judged data the near-ties are where the labels are noisiest and carry the least
@@ -246,8 +251,9 @@ all on the same reference-relative margin `(policy_chosen - policy_rejected) - (
 | `sft_weight: w` | `+ w * NLL(chosen)`, per-token mean (RPO; Llama 3's DPO+NLL) | DPO constrains only the *gap*; on small models both log-probs commonly fall together, and this anchors the chosen side |
 
 They are bound into the loss once, in `build_dpo_loss_fn` (a `functools.partial` over the possibly-compiled
-`compute_dpo_loss_from_logits`), so every call site still passes the same nine positional arguments. Two
-consequences: `val/loss` is the *configured* objective, not always plain DPO; and at the defaults the code path is the
+`compute_dpo_loss_from_logits`), so every call site still passes the same nine positional arguments. `val/loss`
+is evaluated with `build_dpo_loss_fn(cfg, plain=True)` instead: always plain DPO, so it compares across variants (an
+`sft_weight` run's configured loss carries a chosen-NLL term no other run's does). At the defaults the code path is the
 original one operation for operation — `tests/test_preference_losses.py` checks it is bit-identical, and checks each
 variant by its defining property (cDPO's zero-gradient point, hinge's zero region, IPO's zero at its target) rather than
 against a re-typed formula. Token counts for the two length-normalized terms are the *shifted* mask's,
@@ -309,7 +315,8 @@ default judge: "Paris" for the capital of France scored 2.66, "Berlin" -4.41, "b
 **Pairing rules** (`rlaif.build_preference_pairs`), each for a reason:
 
 - **chosen is the best *finished* sample; rejected the worst other one.** An unfinished sample (cut at
-  `--max-new-tokens`) can be rejected but never chosen: the DPO tokenizer appends EOS to both sides, so a truncated
+  `--max-new-tokens`; sampling runs one token past the cap to tell "stopped exactly at the cap" from "cut off") can
+  be rejected but never chosen: the DPO tokenizer appends EOS to both sides, so a truncated
   "chosen" would teach the policy to stop mid-sentence. Best-vs-worst is the pair the judge is most sure of, and one
   pair per prompt keeps prompts equally weighted.
 - **identical sides are skipped** (common at low temperature): such a pair has exactly zero gradient and only dilutes
@@ -320,6 +327,9 @@ default judge: "Paris" for the capital of France scored 2.66, "Berlin" -4.41, "b
 
 Completions are decoded jointly with the prompt and split off it (`_decode_completion`), so `assistant_prefix +
 completion` — what the DPO pipeline rebuilds — is exactly the string the policy produced, leading space included.
+That holds only under the turn template the policy was prompted with (its own `sft.*`, or `dpo.*` for a DPO or plain
+checkpoint), so `pairs` records it in `rlaif_manifest.json` and the DPO pipeline refuses to train the pairs under
+different `dpo.user_prefix`/`assistant_prefix`.
 Re-tokenizing that string can still merge differently at the prefix boundary; that is the usual cost of a text-level
 handoff, and is why the pairs are text rather than ids (the DPO pipeline, its caching and its tests all take text).
 

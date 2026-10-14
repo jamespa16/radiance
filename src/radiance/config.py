@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-import tempfile
 from dataclasses import MISSING, dataclass, field, fields, is_dataclass
 from pathlib import Path
 
@@ -670,6 +668,10 @@ class DPOConfig:
     reference_batch_size: int = 32  # batch size for the one-time reference-logprob precompute pass.
     user_prefix: str = "\n\nUser: "  # same plain-text turn-marker convention as sft.user_prefix.
     assistant_prefix: str = "\n\nAssistant: "
+    doc_attention_mask_before_resolve: bool | None = None  # not a knob: losses.resolve_dpo_doc_mask
+    # records model.doc_attention_mask here before turning it off, so a later stage inheriting this
+    # checkpoint's model config (train.inherit_model_config) gets the architecture's own value back
+    # rather than DPO's per-run resolution. None on checkpoints saved before it existed.
 
 
 def _backfill_missing_fields(obj) -> None:
@@ -871,12 +873,17 @@ def _inherit_model_config(raw: dict) -> dict:
     source = read_checkpoint_config(init_from)
     inherited = {f.name: getattr(source.model, f.name) for f in fields(source.model)}
     if source.dpo.enabled and not source.model.doc_attention_mask and not source.model.loop_attn_windows:
-        # A DPO run's saved doc_attention_mask=False is train.resolve_dpo_doc_mask's per-run
+        # A DPO run's saved doc_attention_mask=False is losses.resolve_dpo_doc_mask's per-run
         # resolution (the mask is inert for one-pair-per-row packing), not an architecture choice.
         # Inherited into a stage that packs several examples per block — SFT after DPO — it would
-        # silently let them attend to each other. Leave the field to its default; a DPO stage
-        # resolves it off again by itself.
-        del inherited["doc_attention_mask"]
+        # silently let them attend to each other. Restore the value the run had before resolving
+        # it (an explicit false survives that way); a checkpoint saved before that was recorded
+        # leaves the field to its default. A DPO stage resolves it off again by itself.
+        before = source.dpo.doc_attention_mask_before_resolve
+        if before is None:
+            del inherited["doc_attention_mask"]
+        else:
+            inherited["doc_attention_mask"] = before
     raw = {**raw, "model": {**inherited, **(raw.get("model") or {})}}
     data = {**(raw.get("data") or {})}
     data.setdefault("tokenizer", source.data.tokenizer)
@@ -894,7 +901,9 @@ def apply_overrides(raw: dict, assignments: list[str]) -> dict:
         section, _, field_name = key.strip().partition(".")
         if not field_name:
             raise ValueError(f"--set key must name a section, e.g. model.d_model, got {key!r}")
-        raw.setdefault(section, {})[field_name] = yaml.safe_load(value)
+        # `or {}`: a bare `sft:` line in the YAML loads as None, not as an empty section.
+        raw[section] = raw.get(section) or {}
+        raw[section][field_name] = yaml.safe_load(value)
     return raw
 
 
@@ -904,8 +913,7 @@ def load_config_with_overrides(path: str | None, assignments: list[str]) -> Conf
     Round-trips through the raw dict rather than poking an already-resolved Config so the overrides
     go through load_config's own validation and resolution — a cross-field check (dtype/fp4_linear,
     dataset/dataset_mix) or train.inherit_model_config would never see an attribute set afterwards.
-    The temporary file is written next to the original so a relative data.dataset_mix still
-    resolves against the same directory.
+    A relative data.dataset_mix still resolves against the original config's directory.
     """
     if not assignments:
         return load_config(path) if path else Config()
@@ -914,13 +922,7 @@ def load_config_with_overrides(path: str | None, assignments: list[str]) -> Conf
         with open(path) as f:
             raw = yaml.safe_load(f) or {}
     raw = apply_overrides(raw, assignments)
-    config_dir = Path(path).parent if path else Path(".")
-    with tempfile.NamedTemporaryFile("w", suffix=".yaml", dir=config_dir, delete=False) as f:
-        yaml.safe_dump(raw, f)
-    try:
-        return load_config(f.name)
-    finally:
-        os.unlink(f.name)
+    return _config_from_raw(raw, Path(path).parent if path else Path("."))
 
 
 def _resolve_dataset_mix_path(mix_path: str, config_dir: Path) -> str:
@@ -933,7 +935,12 @@ def _resolve_dataset_mix_path(mix_path: str, config_dir: Path) -> str:
 def load_config(path: str) -> Config:
     with open(path) as f:
         raw = yaml.safe_load(f) or {}
+    return _config_from_raw(raw, Path(path).parent)
 
+
+def _config_from_raw(raw: dict, config_dir: Path) -> Config:
+    """load_config's body, on an already-parsed YAML dict; `config_dir` is what a relative
+    data.dataset_mix resolves against."""
     # Caught here rather than in `_apply_dtype_sugar` because only the raw YAML distinguishes
     # "fp4_linear was left at its default" from "fp4_linear: false was written down".
     if raw.get("train", {}).get("dtype") == "nvfp4" and raw.get("model", {}).get("fp4_linear") is False:
@@ -977,5 +984,5 @@ def load_config(path: str) -> Config:
     # Stored resolved so the data pipeline — which only sees cfg — can open it directly and the
     # checkpoint's embedded config is self-describing.
     if cfg.data.dataset_mix:
-        cfg.data.dataset_mix = _resolve_dataset_mix_path(cfg.data.dataset_mix, Path(path).parent)
+        cfg.data.dataset_mix = _resolve_dataset_mix_path(cfg.data.dataset_mix, config_dir)
     return cfg

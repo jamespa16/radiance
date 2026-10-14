@@ -4,8 +4,8 @@
 #
 # hh-rlhf ships chosen/rejected as whole "\n\nHuman: ...\n\nAssistant: ..." transcript strings
 # that share every turn but the final assistant one; the DPO pipeline parses them into turns
-# (dpo_data.parse_hh_transcript), so the shared turns cancel in the log-ratio and only the last
-# response carries the preference. Labels are human crowdworker preferences between two samples
+# (dpo_data.parse_hh_transcript) and leaves the shared turns out of the loss mask, so only the
+# last response carries the preference. Labels are human crowdworker preferences between two samples
 # from Anthropic's own (2022) models, over helpfulness and harmlessness — 160k train / 8.5k test.
 # Note it is partly red-teaming data: some prompts, and some *chosen* responses, are offensive.
 #

@@ -122,8 +122,24 @@ def test_sample_completions_shapes_and_finished_flags():
         for comp in row:
             n = len(comp.text.split())
             assert n <= 6
-            # finished iff EOS came before the cap; at the cap it is flagged unfinished.
-            assert comp.finished == (n < 6)
+            assert comp.finished or n == 6
+
+
+def test_a_completion_ending_exactly_at_the_cap_is_finished(monkeypatch):
+    model, cfg = _policy()
+    tok = _tokenizer()
+    # Row 0 samples EOS right after its 6th token; row 1 is still going at the 7th.
+    scripts = [[5] * 6, [5] * 7]
+
+    def fake_generate(model, tokenizer, items, device):
+        assert all(item.max_new_tokens == 7 for item in items)
+        for step in range(8):
+            yield [(row, s[step] if step < len(s) else None) for row, s in enumerate(scripts) if step <= len(s)]
+
+    monkeypatch.setattr(rlaif, "generate_tokens_batched", fake_generate)
+    out = sample_completions(model, cfg, tok, ["w1"], 2, 6, 1.0, 0, 4, "cpu")[0]
+    assert [c.finished for c in out] == [True, False]
+    assert [len(c.text.split()) for c in out] == [6, 6]  # the overrun is cut back to the cap
 
 
 def test_load_prompts_handles_strings_and_message_lists(tmp_path):
@@ -160,6 +176,22 @@ def test_eval_of_a_checkpoint_against_itself_is_an_exact_tie(tmp_path, monkeypat
     assert len(report["samples"]) == report["prompts"] == 8
 
 
+def test_eval_with_no_prompt_that_fits_is_a_clear_error(tmp_path, monkeypatch):
+    model, cfg = _policy()
+    tok = _tokenizer()
+    prompts_path = tmp_path / "prompts.jsonl"
+    prompts_path.write_text(json.dumps({"prompt": "w1"}))
+    monkeypatch.setattr(rlaif, "load_checkpoint", lambda path, device: (model, cfg, tok))
+    monkeypatch.setattr(rlaif, "RewardModelJudge", _LengthJudge)
+    args = argparse.Namespace(
+        checkpoint=["a.pt"], output=None, prompts=str(prompts_path), prompt_column="prompt",
+        split="train", subset=None, max_prompts=None, max_new_tokens=48, temperature=1.0, top_k=0,
+        batch_size=4, judge="fake", judge_batch_size=8, device="cpu", seed=0,
+    )
+    with pytest.raises(SystemExit, match="no prompt fits"):
+        rlaif.run_eval(args)
+
+
 # --- pairs -> DPO dataset, end to end ---------------------------------------------------------
 
 
@@ -182,6 +214,8 @@ def test_pairs_output_loads_as_a_dpo_dataset(tmp_path, monkeypatch):
     manifest = json.loads((out / rlaif.MANIFEST_NAME).read_text())
     n_pairs = manifest["stats"]["pairs"]
     assert n_pairs > 0 and manifest["args"]["num_samples"] == 4
+    # _policy() is SFT'd under the sft.* defaults, which the DPO config below also uses.
+    assert manifest["turn_template"] == {"user_prefix": cfg.sft.user_prefix, "assistant_prefix": cfg.sft.assistant_prefix}
 
     # The DPO stage configs/post_training/dpo_rlaif.yaml describes, minus the reference forward.
     monkeypatch.setattr(dpo_mod, "_add_reference_logprobs", lambda packed, cfg, tok, device: packed)

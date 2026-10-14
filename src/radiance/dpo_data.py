@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from pathlib import Path
 
@@ -44,8 +45,10 @@ def parse_hh_transcript(text: str) -> list[dict]:
     hh-rlhf (and datasets derived from it) ship chosen/rejected as whole transcripts that share
     every turn but the last assistant one. Parsed into turns, the shared turns tokenize identically
     on both sides (tokenize_sft_example works turn by turn), and attention is causal, so their
-    log-probabilities are equal under any model (to floating-point) and cancel in the DPO
-    log-ratio: only the final, differing response carries the preference, as it should. Text before the first marker, if any, is a user turn.
+    log-probabilities are equal under any model. _tokenize_dpo_row drops the shared assistant turns
+    from the loss mask: they would cancel in the summed DPO log-ratio, but not in the per-token
+    means IPO and sft_weight divide by, where they would leak in. Text before the first marker, if
+    any, is a user turn.
     """
     parts = _HH_TURN.split(text)
     if len(parts) < 3:
@@ -91,6 +94,16 @@ def _format_dpo_pair(example: dict, cfg: Config) -> tuple[list[dict], list[dict]
     return chosen, rejected
 
 
+def _shared_turn_count(chosen: list[dict], rejected: list[dict]) -> int:
+    """How many leading turns the two sides have in common, never counting either side's last turn
+    (that one is the response being compared, even if a degenerate pair repeats it)."""
+    limit = min(len(chosen), len(rejected)) - 1
+    n = 0
+    while n < limit and chosen[n] == rejected[n]:
+        n += 1
+    return n
+
+
 def _tokenize_dpo_row(
     example: dict, tokenizer: PreTrainedTokenizerBase, cfg: Config, seq_len: int
 ) -> dict | None:
@@ -113,6 +126,18 @@ def _tokenize_dpo_row(
     )
     if len(chosen_ids) > seq_len or len(rejected_ids) > seq_len:
         return None
+    n_shared = _shared_turn_count(chosen_msgs, rejected_msgs)
+    if n_shared:
+        # Turns both sides share (a multi-turn conversation's earlier exchanges) are not part of
+        # the preference. Their log-probs cancel in the summed log-ratio, but IPO and sft_weight
+        # divide each side by its own token count, and with chosen and rejected of different
+        # lengths the shared part no longer cancels there — so score only the turns that differ.
+        # tokenize_sft_example tokenizes turn by turn, so the shared turns are a common id prefix.
+        shared_len = len(
+            tokenize_sft_example(chosen_msgs[:n_shared], tokenizer, cfg.dpo.user_prefix, cfg.dpo.assistant_prefix)[0]
+        ) - 1  # its trailing EOS is not part of the conversation
+        chosen_mask[:shared_len] = [0] * shared_len
+        rejected_mask[:shared_len] = [0] * shared_len
 
     eos_id = tokenizer.eos_token_id
 
@@ -348,6 +373,11 @@ def _dpo_cache_path(cfg: Config) -> Path:
             cfg.dpo.assistant_prefix,
             str(cfg.dpo.eval_split_size),
             *split_key_extras(cfg.dpo),
+            # Leaving shared turns out of the loss mask (_tokenize_dpo_row) changes the cached masks
+            # and reference log-probs only for message-list/transcript data: with prompt_column
+            # set, the one shared turn is the user prompt, which was never scored, so those keys
+            # stay as they were.
+            *(["shared-turns-unscored"] if cfg.dpo.prompt_column is None else []),
             # Only when set, for the same keep-old-keys-stable reason as split_key_extras.
             *(
                 [f"min_score_margin={cfg.dpo.min_score_margin}|{cfg.dpo.score_chosen_column}"
@@ -407,7 +437,32 @@ def dpo_cache_exists(cfg: Config) -> bool:
         return False
 
 
+def check_rlaif_turn_template(cfg: Config) -> None:
+    """Refuse to train radiance-rlaif pairs under a turn template other than the one they were
+    sampled under (recorded in the pair directory's manifest). The pairs are on-policy only as
+    exact continuations of the prompt the policy saw; rebuilt under other turn markers they are
+    off-policy text, silently. A dataset without a manifest is not radiance-rlaif output."""
+    # Local import: rlaif imports the generation stack, which nothing else here needs.
+    from radiance.rlaif import MANIFEST_NAME
+
+    manifest_path = Path(cfg.dpo.dataset) / MANIFEST_NAME
+    if not manifest_path.is_file():
+        return
+    template = json.loads(manifest_path.read_text()).get("turn_template")
+    if template is None:  # written before the template was recorded
+        return
+    configured = {"user_prefix": cfg.dpo.user_prefix, "assistant_prefix": cfg.dpo.assistant_prefix}
+    if configured != template:
+        raise ValueError(
+            f"dpo.dataset {cfg.dpo.dataset!r} holds radiance-rlaif pairs sampled under the turn "
+            f"template {template}, but this config trains them under {configured}. Set "
+            "dpo.user_prefix/assistant_prefix to the sampled template, or the pairs are no longer "
+            "the policy's own completions."
+        )
+
+
 def _load_or_build_dpo_packed(cfg: Config, tokenizer: PreTrainedTokenizerBase):
+    check_rlaif_turn_template(cfg)
     cache_path = _dpo_cache_path(cfg)
     if cfg.dpo.cache_dir and cache_path.exists():
         packed = load_from_disk(str(cache_path))

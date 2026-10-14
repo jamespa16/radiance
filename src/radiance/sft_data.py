@@ -63,6 +63,8 @@ def select_splits(
             f"dataset {dataset!r} has no {train_split!r} split (it has: {available}). Set train_split."
         )
     train = raw[train_split]
+    if len(train) == 0:
+        raise ValueError(f"dataset {dataset!r}:{train_split} is empty.")
     if eval_split is not None:
         if eval_split not in raw:
             raise ValueError(f"dataset {dataset!r} has no {eval_split!r} split (it has: {available}).")
@@ -70,7 +72,7 @@ def select_splits(
     else:
         val = next((raw[s] for s in eval_fallbacks if s in raw and s != train_split), None)
         if val is None:
-            if eval_split_size >= len(train):
+            if eval_split_size > 0 and eval_split_size >= len(train):
                 # Small generated datasets (a radiance-rlaif round over few prompts) hit this; the
                 # alternative is an IndexError from inside datasets' take().
                 raise ValueError(
