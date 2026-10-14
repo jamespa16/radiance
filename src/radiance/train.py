@@ -260,7 +260,7 @@ def _group_lrs(optimizer: torch.optim.Optimizer) -> dict[str, float]:
     }
 
 
-def _restore_data_position(train_loader, ckpt: dict, cfg: Config) -> None:
+def _restore_data_position(train_loader, ckpt: dict, cfg: Config) -> tuple[int, int]:
     """Point a resumed run's train loader past the data the checkpoint already trained on.
 
     Two loaders can seek: the pretokenized one exactly (EpochPermutationSampler) and the streaming
@@ -269,28 +269,52 @@ def _restore_data_position(train_loader, ckpt: dict, cfg: Config) -> None:
     stream from the beginning with a fixed seed, so it replays already-trained data. Say so rather
     than let it pass silently: that is the failure this function exists to prevent on the paths
     that can prevent it.
+
+    Returns (train_batches_drawn, train_blocks_drawn) for the run to keep counting from. The
+    checkpoint's batch count is in units of the batch_size *it* drew at, which a resume need not
+    share (auto_batch_size re-estimates against whatever VRAM is free; a config may be edited), so
+    the seek goes through the block count and the recorded batch size rather than multiplying the
+    saved count by this run's batch_size, which would retrain or skip blocks with no warning. A
+    checkpoint predating train_batch_size is assumed to share this run's, as before.
     """
+    bs = cfg.train.batch_size
     batches_drawn = ckpt.get("train_batches_drawn")
+    drawn_bs = ckpt.get("train_batch_size") or bs
+    blocks_drawn = ckpt.get("train_blocks_drawn")
+    if blocks_drawn is None:
+        blocks_drawn = (batches_drawn or 0) * drawn_bs
     if isinstance(train_loader.sampler, EpochPermutationSampler):
-        train_loader.sampler.set_resume_position(batches_drawn or 0)
-        print(f"[radiance] resuming pretokenized data after {batches_drawn or 0:,} batches")
-    elif isinstance(train_loader.dataset, StreamingPackedDataset):
+        blocks = train_loader.sampler.set_resume_position(blocks_drawn, drawn_bs)
+        resized = f" (drawn at batch_size {drawn_bs}, now {bs})" if drawn_bs != bs else ""
+        print(f"[radiance] resuming pretokenized data after {blocks_drawn:,} blocks{resized}")
+        return blocks // bs, blocks
+    if isinstance(train_loader.dataset, StreamingPackedDataset):
         if batches_drawn is None:
             print(
                 "[radiance] WARNING: this checkpoint predates train_batches_drawn, so the data "
                 "position is unknown; the stream restarts from its beginning and replays data "
                 "this run has already trained on."
             )
-            return
+            return 0, 0
+        if drawn_bs != bs:
+            # The skip is per worker in whole batches; already exact only up to the shuffle buffer,
+            # so rounding to this run's batches loses less than one batch on top.
+            batches_drawn = round(blocks_drawn / bs)
+            print(
+                f"[radiance] batch_size changed since the checkpoint ({drawn_bs} -> {bs}); "
+                f"seeking the stream by blocks, to the nearest batch"
+            )
         train_loader.dataset.set_resume_position(batches_drawn)
         print(f"[radiance] resuming data stream after {batches_drawn:,} batches")
-    elif cfg.data.streaming:
+        return batches_drawn, blocks_drawn
+    if cfg.data.streaming:
         print(
             "[radiance] WARNING: only data.pretokenized_dir and the single-dataset streaming "
             "disk-cache loader (data.streaming + data.disk_cache_max_gb, no dataset_mix) can "
             "resume their data position. This loader restarts from the beginning of its stream and will replay "
             "data this run has already trained on."
         )
+    return batches_drawn or 0, blocks_drawn
 
 
 def train(cfg: Config, hud: bool | None = None) -> None:
@@ -474,6 +498,9 @@ def train(cfg: Config, hud: bool | None = None) -> None:
     # Counts draws rather than optimizer steps, so a micro-batch drawn and then lost to an OOM
     # retry is still counted — it left the stream, and a resume should not hand it out again.
     train_batches_drawn = 0
+    # The same position in blocks (rows), which unlike a batch count survives a resume that picks a
+    # different batch_size — see _restore_data_position.
+    train_blocks_drawn = 0
     if resume_path is not None:
         ckpt = torch.load(resume_path, map_location=device, weights_only=False)
         raw_model.load_state_dict(ckpt["model"])
@@ -495,8 +522,7 @@ def train(cfg: Config, hud: bool | None = None) -> None:
         scheduler.load_state_dict(ckpt["scheduler"])
         scaler.load_state_dict(ckpt["scaler"])
         step = ckpt["step"]
-        _restore_data_position(train_loader, ckpt, cfg)
-        train_batches_drawn = ckpt.get("train_batches_drawn") or 0
+        train_batches_drawn, train_blocks_drawn = _restore_data_position(train_loader, ckpt, cfg)
         # Everything is copied out of it now. Loaded with map_location=device, it otherwise stays
         # referenced for the whole run: a second copy of the weights and optimizer state on the
         # GPU. Measured on V2's shape: 19.25 GB reserved resumed without this, 17.75 GB with it.
@@ -578,6 +604,7 @@ def train(cfg: Config, hud: bool | None = None) -> None:
                             data_iter = iter(train_loader)
                             batch = next(data_iter)
                         train_batches_drawn += 1
+                        train_blocks_drawn += cfg.train.batch_size
 
                         # Which columns a batch carries and how a chunk's loss is built are the only
                         # things that differ between pretrain/SFT and DPO; everything the accumulation
@@ -730,7 +757,8 @@ def train(cfg: Config, hud: bool | None = None) -> None:
                         ckpt_path = output_dir / f"step_{step}.pt"
                         save_checkpoint(
                             ckpt_path, raw_model, optimizer, scheduler, scaler, step, cfg,
-                            train_batches_drawn=train_batches_drawn, dpo_reference=dpo_reference,
+                            train_batches_drawn=train_batches_drawn, train_blocks_drawn=train_blocks_drawn,
+                            dpo_reference=dpo_reference,
                         )
                         prune_checkpoints(output_dir, keep=ckpt_path, keep_every=cfg.train.keep_every)
                         display.on_checkpoint(step, ckpt_path)

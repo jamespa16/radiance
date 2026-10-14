@@ -221,3 +221,17 @@ def test_keep_every_unset_keeps_only_the_newest(tmp_path):
         (tmp_path / f"step_{step}.pt").write_bytes(b"x")
     prune_checkpoints(tmp_path, keep=tmp_path / "step_20.pt")
     assert [p.name for p in tmp_path.iterdir()] == ["step_20.pt"]
+
+
+def test_files_that_only_look_like_checkpoints_are_neither_parsed_nor_deleted(tmp_path):
+    # A hand-copied step_final.pt used to crash every save under keep_every (and resume_from:
+    # auto always): its "step" does not parse. It is not ours to delete or resume from either.
+    from radiance.checkpointing import find_resume_checkpoint
+    from radiance.config import Config, TrainConfig
+
+    for name in ("step_10.pt", "step_20.pt", "step_final.pt", "step_5000_backup.pt"):
+        (tmp_path / name).write_bytes(b"x")
+    cfg = Config(train=TrainConfig(output_dir=str(tmp_path), resume_from="auto"))
+    assert find_resume_checkpoint(cfg) == tmp_path / "step_20.pt"
+    prune_checkpoints(tmp_path, keep=tmp_path / "step_20.pt", keep_every=5000)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["step_20.pt", "step_5000_backup.pt", "step_final.pt"]

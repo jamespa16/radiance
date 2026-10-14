@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 import torch
@@ -18,6 +19,7 @@ def save_checkpoint(
     step: int,
     cfg: Config,
     train_batches_drawn: int = 0,
+    train_blocks_drawn: int | None = None,
     dpo_reference: str | None = None,
 ) -> None:
     """Write a resumable checkpoint, atomically.
@@ -30,7 +32,9 @@ def save_checkpoint(
     `train_batches_drawn` is the data position: how many batches the run has pulled from its
     train loader. A streaming disk-cache loader skips that many on resume (see
     StreamingPackedDataset.set_resume_position); no other loader can seek, so for them it is
-    recorded but unused.
+    recorded but unused. `train_blocks_drawn` (default: batches x batch_size) is the same position
+    in rows, saved with the `train_batch_size` it was drawn at, so a resume under a different
+    batch_size can still seek exactly (train._restore_data_position).
 
     `dpo_reference` is a DPO run's dpo_data.current_reference_identity as of its first start: a
     resume pins itself to it rather than to whatever the reference path holds by then.
@@ -62,6 +66,11 @@ def save_checkpoint(
                 "scaler": scaler.state_dict(),
                 "step": step,
                 "train_batches_drawn": train_batches_drawn,
+                "train_blocks_drawn": (
+                    train_blocks_drawn if train_blocks_drawn is not None
+                    else train_batches_drawn * cfg.train.batch_size
+                ),
+                "train_batch_size": cfg.train.batch_size,
                 "dpo_reference": dpo_reference,
                 "config": cfg,
             },
@@ -72,21 +81,36 @@ def save_checkpoint(
     os.replace(tmp_path, path)
 
 
-def _checkpoint_step(path: Path) -> int:
-    return int(path.name.split("_")[1].split(".")[0])
+_STEP_CHECKPOINT = re.compile(r"step_(\d+)\.pt")
+
+
+def _step_checkpoints(output_dir: Path) -> list[tuple[int, Path]]:
+    """(step, path) for each checkpoint save_checkpoint names, step_<N>.pt, in step order.
+
+    Only that exact shape: a `step_*.pt` glob also matches a hand-copied `step_final.pt` or
+    `step_5000_backup.pt`, whose step does not parse — and resume/prune would crash on it at every
+    save — and which this code did not write, so is not this code's to delete or resume from.
+    """
+    found = []
+    for path in output_dir.glob("step_*.pt"):
+        match = _STEP_CHECKPOINT.fullmatch(path.name)
+        if match:
+            found.append((int(match.group(1)), path))
+    return sorted(found)
 
 
 def prune_checkpoints(output_dir: Path, keep: Path, keep_every: int | None = None) -> None:
-    """Delete every step_*.pt in output_dir except `keep`, plus any .tmp a crashed save left.
+    """Delete every step_<N>.pt in output_dir except `keep`, plus any .tmp a crashed save left.
 
     Called only after `keep` has been written, so there is never a moment with no complete
     checkpoint on disk; the cost is a second checkpoint's worth of disk space during the save.
 
     `keep_every` (train.keep_every) also spares every checkpoint whose step is a multiple of it —
     the branch points `radiance-train --decay-from` anneals from. A stale .tmp is never spared.
+    Files that only resemble a checkpoint name are left alone (see _step_checkpoints).
     """
-    for old in output_dir.glob("step_*.pt"):
-        if old != keep and not (keep_every and _checkpoint_step(old) % keep_every == 0):
+    for step, old in _step_checkpoints(output_dir):
+        if old != keep and not (keep_every and step % keep_every == 0):
             old.unlink(missing_ok=True)
     for stale in output_dir.glob("step_*.pt.tmp"):
         stale.unlink(missing_ok=True)
@@ -127,10 +151,16 @@ def configure_decay_branch(cfg: Config, checkpoint: str, decay_steps: int) -> No
     # LambdaLR's _last_lr is base_lr * lambda(step) per group, and every group shares one lambda,
     # so any group's ratio is the schedule multiplier the checkpoint was saved at.
     start_ratio = sched["_last_lr"][0] / sched["base_lrs"][0]
+    # The source run's own warmup, from the config it saved (max_steps already resolved there, as
+    # tokens_per_param leaves it). warmup_steps is a property, round(max_steps * warmup_ratio), so
+    # reading it after max_steps is reassigned below gives the *branch's* warmup instead: a long
+    # --decay-steps would put a post-warmup checkpoint back inside warmup, a short one would pass
+    # a checkpoint that is really still warming up.
+    source_warmup = ckpt["config"].train.warmup_steps
     del ckpt
 
     branch_dir = Path(cfg.train.output_dir) / f"decay_from_{step}"
-    cfg.train.resume_from = "auto" if any(branch_dir.glob("step_*.pt")) else str(source)
+    cfg.train.resume_from = "auto" if _step_checkpoints(branch_dir) else str(source)
     cfg.train.output_dir = str(branch_dir)
     cfg.train.tokens_per_param = None  # would re-derive max_steps and overwrite the one set here
     cfg.train.max_steps = step + decay_steps
@@ -138,13 +168,16 @@ def configure_decay_branch(cfg: Config, checkpoint: str, decay_steps: int) -> No
     cfg.train.wsd_decay_steps = decay_steps
     cfg.train.wsd_decay_start_ratio = start_ratio
     cfg.run_name = f"{cfg.run_name}-decay{step}"
-    if cfg.train.warmup_steps > step:
+    if source_warmup > step:
         # decay_start is max(warmup_steps, ...), so the branch would hold at the start ratio
         # through the rest of warmup and decay over fewer steps than asked for.
         raise ValueError(
-            f"--decay-from checkpoint is at step {step}, inside this config's warmup "
-            f"({cfg.train.warmup_steps} steps at max_steps={cfg.train.max_steps}); nothing to anneal yet."
+            f"--decay-from checkpoint is at step {step}, inside its run's warmup "
+            f"({source_warmup} steps); nothing to anneal yet."
         )
+    # Keep the branch's schedule on the source run's warmup, whatever max_steps now is.
+    cfg.train.warmup_ratio = source_warmup / cfg.train.max_steps
+    assert cfg.train.warmup_steps == source_warmup
     print(
         f"[radiance] decay branch: from {source} (step {step:,}, lr multiplier {start_ratio:.4f}) "
         f"annealing to {cfg.train.min_lr_ratio} over {decay_steps:,} steps -> {branch_dir}"
@@ -177,11 +210,8 @@ def find_resume_checkpoint(cfg: Config) -> Path | None:
                 "a fresh run from its weights, or point resume_from at the run's .pt checkpoint."
             )
         return path
-    candidates = sorted(
-        Path(cfg.train.output_dir).glob("step_*.pt"),
-        key=lambda p: int(p.stem.split("_")[1]),
-    )
-    return candidates[-1] if candidates else None
+    candidates = _step_checkpoints(Path(cfg.train.output_dir))
+    return candidates[-1][1] if candidates else None
 
 
 def _loop_conditioning_signature(cfg: ModelConfig) -> tuple[str, int]:

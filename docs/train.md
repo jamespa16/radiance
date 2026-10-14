@@ -161,7 +161,10 @@ is the multiplier the decay starts from. Both exist for **decay branches**: `rad
 data position — and anneals it to `min_lr_ratio` over K steps into `<output_dir>/decay_from_<step>/`, without
 touching the main run. The start ratio is read off the checkpoint's own scheduler, so a cosine checkpoint (V1's
 `step_23000.pt`, at ~0.78) anneals from where it was rather than jumping back to full LR. Re-running the command
-after an interruption resumes the branch, not the source.
+after an interruption resumes the branch, not the source. The warmup is the source run's too, read off the config
+the checkpoint saved: `warmup_steps` is `round(max_steps * warmup_ratio)`, so re-derived after the branch sets
+`max_steps = step + K` it would move with K — a long branch off a post-warmup checkpoint refused as "inside warmup",
+a short one off a mid-warmup checkpoint let through.
 
 ## Checkpoints and resume
 
@@ -194,6 +197,14 @@ trained so far, a restart at hour 30 would have spent the rest of the run re-tra
 The skip is exact per worker except for the shuffle buffer: it applies before shuffling, so up to
 `shuffle_buffer_size` blocks per worker can repeat, and the same number are skipped without being trained on.
 Every other streaming loader prints a warning on resume, because it restarts from the beginning of its stream.
+
+The position is also saved in blocks (`train_blocks_drawn`) with the `train_batch_size` it was drawn at, because a
+resume need not share the checkpoint's batch size — `auto_batch_size` re-estimates against whatever VRAM is free —
+and the saved batch count times the *new* batch size retrains or skips blocks with no warning.
+`_restore_data_position` seeks the pretokenized sampler through (epoch, offset), which stays exact; the streaming
+loader rounds to the nearest new batch and says so. Only names of the exact form `step_<N>.pt` are resumed from or
+pruned: a hand-copied `step_final.pt` beside them used to crash every save under `keep_every`, and is not this
+code's to delete.
 
 The loaded checkpoint dict is dropped once its state is copied out. It is loaded straight onto the GPU, and while
 it stayed referenced a resumed run carried a second copy of the weights and optimizer state for its whole length —

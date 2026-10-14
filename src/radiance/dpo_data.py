@@ -593,10 +593,8 @@ def build_dpo_dataloaders(
     which pins it to its original reference (see current_reference_identity)."""
     if not cfg.dpo.dataset:
         raise ValueError("dpo.enabled requires dpo.dataset to be set.")
-    if not cfg.resolved_reference_checkpoint:
-        raise ValueError(
-            "dpo.enabled requires dpo.reference_checkpoint (or train.init_from, which it defaults to) to be set."
-        )
+    # A missing dpo.reference_checkpoint is caught once, by losses.validate_post_training_config,
+    # which train() runs before building any loader.
 
     def collate(batch):
         cols = [

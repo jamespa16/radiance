@@ -77,7 +77,11 @@ the tokens the config's run will draw (from `tokens_per_param` or `max_steps`) p
   removed from train by content hash, since the shuffled stream can reach them.
 - **Interruption.** Each worker fsyncs its file and then records its position in `train_NNN.json`; re-running the
   same command truncates each file to that position and continues. The seeded shuffle replays the same order, so
-  the result is byte-identical to an uninterrupted run (`tests/test_pretokenized.py` pins this).
+  the result is byte-identical to an uninterrupted run (`tests/test_pretokenized.py` pins this). A position is a
+  document count into one worker's shard, so it holds only under the partition it was recorded with: the first run
+  writes that partition (worker count, quota, seed, tokenizer, ...) to `plan.json`, and a re-run takes its worker
+  count from there whatever `--num-proc` says, and refuses any other change rather than append one partition's
+  documents to another's files.
 - **Workers hard-exit** (`os._exit`) once their output is durable. A worker stops at its quota partway through a live
   HF stream, and that stream's teardown is unbounded: in-flight parquet reads fail against closing sockets and
   retry with backoff (`'[Errno 9] Bad file descriptor' ... Retrying`). Measured at ~40 s per exit on a healthy
@@ -85,7 +89,11 @@ the tokens the config's run will draw (from `tokens_per_param` or `max_steps`) p
 - **Reading.** `PretokenizedDataset` cuts `seq_len` blocks through `np.memmap` at read time (so one directory serves
   any `seq_len`), and `EpochPermutationSampler` draws a seeded permutation over *every* block per epoch. An epoch's
   order is a pure function of `(seed, epoch)`, so the data position is one integer and resume is exact — no block
-  repeated, none skipped — where the streaming disk cache is exact only up to its shuffle buffer. The loader checks
+  repeated, none skipped — where the streaming disk cache is exact only up to its shuffle buffer. The checkpoint
+  records that integer in blocks together with the batch size it was drawn at, because an epoch is
+  `floor(n / batch_size) * batch_size` blocks: a resume that picks a different batch size (`auto_batch_size`
+  re-estimating against busier VRAM) maps through (epoch, offset) instead of multiplying a batch count by the new
+  size, which would retrain or skip blocks. The loader checks
   `meta.json`'s tokenizer and EOS id against the config and refuses a mismatch.
 
 `uint16` storage while the vocabulary fits (V2: ~18.5 GB for 9.2B tokens). `data.dataset_mix` is rejected alongside

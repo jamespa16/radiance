@@ -15,7 +15,8 @@ Layout of `data.pretokenized_dir`:
     val.bin              the held-out documents, in stream order
     train_NNN.bin        one file per worker: documents joined by EOS, same packing as data.py
     train_NNN.json       that worker's progress (documents consumed, tokens written)
-    meta.json            written last; its presence is what marks the directory complete
+    plan.json            the partition that progress is relative to (workers, quota, seed, ...)
+    meta.json           written last; its presence is what marks the directory complete
 
 Each worker reads a disjoint 1/P of the corpus's files (`IterableDataset.shard`) in a seeded
 shuffled order (`.shuffle`, which permutes files as well as buffering documents), so the tokens
@@ -26,7 +27,9 @@ documents are removed from training by content hash, since the shuffled stream c
 
 Interrupting it is safe. Progress is flushed with each worker's file, so re-running the same
 command truncates each file to its last recorded position and continues from there; the seeded
-shuffle replays the same order, so the result is identical to an uninterrupted run.
+shuffle replays the same order, so the result is identical to an uninterrupted run. That holds only
+under the partition the progress was recorded against, so the first run writes it to plan.json and
+a re-run adopts its worker count (whatever --num-proc says) and refuses any other change.
 
     radiance-pretokenize --config configs/v2.yaml
     radiance-pretokenize --config configs/v2.yaml --train-tokens 2e8   # a small test directory
@@ -101,6 +104,49 @@ def _write_json(path: Path, obj: dict) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(obj, indent=1))
     os.replace(tmp, path)
+
+
+_PLAN = "plan.json"
+
+
+def _resolve_plan(out: Path, requested: dict) -> dict:
+    """The partition this directory is built under: `requested` on a fresh directory (recorded to
+    plan.json before any worker starts), the recorded plan on a re-run.
+
+    A worker's progress is a document count into *its* shard of the stream, so it means something
+    only under the worker count, quota and stream order it was recorded with. Resumed under a
+    different --num-proc, worker i would stream a different file set, skip a count of documents
+    consumed from another, and append to the old train_i.bin: duplicated and mixed corpus
+    segments, files the new plan never finishes, and no error. So the worker count (a resource
+    choice) is taken from the recorded plan, and every other field (what the output contains) must
+    match.
+    """
+    path = out / _PLAN
+    if not path.exists():
+        stale = sorted(out.glob("train_*.json"))
+        if stale and len(stale) != requested["workers"]:
+            raise ValueError(
+                f"{out} holds progress for {len(stale)} workers from a run that predates {_PLAN}, "
+                f"but this run would use {requested['workers']}: their positions mean nothing under "
+                f"a different partition. Re-run with --num-proc {len(stale)}, or delete {out}."
+            )
+        _write_json(path, requested)
+        return requested
+    recorded = json.loads(path.read_text())
+    changed = [k for k in requested if k not in ("workers", "quota") and recorded.get(k) != requested[k]]
+    if changed:
+        diffs = ", ".join(f"{k}: {recorded.get(k)!r} -> {requested[k]!r}" for k in changed)
+        raise ValueError(
+            f"{out} was started under a different plan ({diffs}); the progress recorded there does "
+            f"not apply to this one. Restore the original settings to finish it, or delete {out}."
+        )
+    if recorded["workers"] != requested["workers"]:
+        print(
+            f"[radiance] resuming {out} with its recorded {recorded['workers']} workers, not "
+            f"{requested['workers']}: its progress is relative to that partition",
+            flush=True,
+        )
+    return recorded
 
 
 def _val_stream(cfg: Config):
@@ -230,7 +276,22 @@ def pretokenize(cfg: Config, train_tokens: int | None = None, num_proc: int | No
 
     n_files = load_dataset(cfg.data.dataset, split="train", streaming=True).num_shards
     workers = max(1, min(num_proc or cfg.data.num_workers or 1, n_files))
-    quota = math.ceil(target / workers)
+    plan = _resolve_plan(
+        out,
+        {
+            "dataset": cfg.data.dataset,
+            "text_column": cfg.data.text_column,
+            "tokenizer": cfg.data.tokenizer,
+            "eval_split_size": cfg.data.eval_split_size,
+            "seed": cfg.train.seed,
+            "shuffle_buffer_size": cfg.data.shuffle_buffer_size,
+            "dtype": dtype,
+            "target": target,
+            "workers": workers,
+            "quota": math.ceil(target / workers),
+        },
+    )
+    workers, quota = plan["workers"], plan["quota"]
     print(
         f"[radiance] {target / 1e9:.2f}B train tokens from {cfg.data.dataset} ({n_files:,} files) "
         f"with {workers} workers, {quota / 1e6:,.0f}M each -> {out}",
