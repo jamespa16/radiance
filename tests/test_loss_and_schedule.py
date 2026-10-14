@@ -191,3 +191,30 @@ def test_decay_branch_continues_from_the_checkpoint_multiplier():
     assert curve[0] == pytest.approx(0.78)
     assert all(a > b for a, b in zip(curve, curve[1:]))
     assert curve[-1] == pytest.approx(0.1)
+
+
+def _fake_source_checkpoint(path, step: int, max_steps: int, warmup_ratio: float):
+    # Only what configure_decay_branch reads: the step, the scheduler's multiplier, the saved config.
+    saved = Config(train=TrainConfig(max_steps=max_steps, warmup_ratio=warmup_ratio))
+    torch.save({"step": step, "scheduler": {"_last_lr": [1.0], "base_lrs": [1.0]}, "config": saved}, path)
+    return path
+
+
+def test_decay_branch_keeps_the_source_runs_warmup(tmp_path):
+    """warmup_steps is round(max_steps * warmup_ratio); the branch reassigns max_steps, so its
+    warmup guard and schedule must use the source run's warmup, not one re-derived from it."""
+    from radiance.checkpointing import configure_decay_branch
+
+    def branch(step, decay_steps):
+        src = _fake_source_checkpoint(tmp_path / f"step_{step}.pt", step, max_steps=10_000, warmup_ratio=0.04)
+        cfg = Config(train=TrainConfig(max_steps=10_000, warmup_ratio=0.04, output_dir=str(tmp_path / "out")))
+        configure_decay_branch(cfg, str(src), decay_steps)
+        return cfg
+
+    # Well past the source's 400-step warmup; a long decay must not pull it back inside warmup
+    # (re-derived, the branch's warmup would be round(62_000 * 0.04) = 2_480 > 2_000).
+    cfg = branch(2_000, 60_000)
+    assert cfg.train.max_steps == 62_000 and cfg.train.warmup_steps == 400
+    # Inside the source's warmup: refused however short the decay (re-derived: round(310 * 0.04) = 12).
+    with pytest.raises(ValueError, match=r"inside its run's warmup \(400 steps\)"):
+        branch(300, 10)

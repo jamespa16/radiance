@@ -134,6 +134,57 @@ def test_interrupted_pretokenize_resumes_to_identical_files(fake_corpus, tmp_pat
     assert (out / resumed["train"]["files"][0]).read_bytes() == ref_bytes
 
 
+def _interrupt(out, monkeypatch, **kwargs):
+    """Start a pretokenize into `out` and kill it after a few durable flushes."""
+    monkeypatch.setattr(pt, "_TOKENIZE_BATCH", 8)
+    monkeypatch.setattr(pt, "_FLUSH_EVERY_TOKENS", 5 * SEQ_LEN)
+    real_append = pt._append_docs
+    calls = {"n": 0}
+
+    def dies(f, tokenizer, texts, dtype):
+        calls["n"] += 1
+        if calls["n"] == 20:
+            raise ConnectionError("network went away")
+        return real_append(f, tokenizer, texts, dtype)
+
+    monkeypatch.setattr(pt, "_append_docs", dies)
+    with pytest.raises(ConnectionError):
+        pt.pretokenize(_cfg(out, **kwargs), train_tokens=10**9, num_proc=1)
+    monkeypatch.setattr(pt, "_append_docs", real_append)
+
+
+def test_resume_keeps_the_recorded_partition_whatever_num_proc_says(fake_corpus, tmp_path, monkeypatch):
+    # A worker's progress is a document count into its own shard: resumed under a different
+    # worker count it would skip the wrong documents and append to the wrong file.
+    ref = pt.pretokenize(_cfg(tmp_path / "ref"), train_tokens=10**9, num_proc=1)
+    ref_bytes = (tmp_path / "ref" / ref["train"]["files"][0]).read_bytes()
+    out = tmp_path / "resumed"
+    _interrupt(out, monkeypatch)
+    assert json.loads((out / "plan.json").read_text())["workers"] == 1
+
+    resumed = pt.pretokenize(_cfg(out), train_tokens=10**9, num_proc=4)
+    assert resumed["train"]["files"] == ["train_000.bin"]
+    assert (out / "train_000.bin").read_bytes() == ref_bytes
+
+
+def test_resume_refuses_a_plan_that_changes_the_output(fake_corpus, tmp_path, monkeypatch):
+    out = tmp_path / "resumed"
+    _interrupt(out, monkeypatch)
+    with pytest.raises(ValueError, match="seed: 42 -> 1"):
+        pt.pretokenize(_cfg(out, seed=1), train_tokens=10**9, num_proc=1)
+    with pytest.raises(ValueError, match="target"):
+        pt.pretokenize(_cfg(out), train_tokens=10**8, num_proc=1)
+
+
+def test_resume_without_a_plan_refuses_a_different_worker_count(fake_corpus, tmp_path, monkeypatch):
+    # A directory interrupted before plan.json existed: its worker count is the progress files'.
+    out = tmp_path / "resumed"
+    _interrupt(out, monkeypatch)
+    (out / "plan.json").unlink()
+    with pytest.raises(ValueError, match="--num-proc 1"):
+        pt.pretokenize(_cfg(out), train_tokens=10**9, num_proc=2)
+
+
 def test_sampler_resumes_at_the_exact_block_across_epochs():
     n, bs = 23, 4  # 23 blocks -> 5 full batches (20 blocks) per epoch
     reference = d.EpochPermutationSampler(n, bs, seed=3)
@@ -147,7 +198,7 @@ def test_sampler_resumes_at_the_exact_block_across_epochs():
 
     for drawn_batches in (0, 3, 5, 7, 12):
         resumed = d.EpochPermutationSampler(n, bs, seed=3)
-        resumed.set_resume_position(drawn_batches)
+        assert resumed.set_resume_position(drawn_batches * bs) == drawn_batches * bs
         got = [i for _ in range(2) for i in resumed]  # the rest of this epoch, then the next
         start = drawn_batches * bs
         assert got == stream[start : start + len(got)]
@@ -200,12 +251,66 @@ def test_train_resumes_the_pretokenized_position_exactly(fake_corpus, tmp_path, 
     first = list(seen)
     seen.clear()
     run(max_steps=60)
-    assert "resuming pretokenized data after 60 batches" in capsys.readouterr().out
+    assert "resuming pretokenized data after 240 blocks" in capsys.readouterr().out
     sampler = d.EpochPermutationSampler(N_DOCS - EVAL_DOCS, 4, seed=42)
     reference = [i for _ in range(2) for i in sampler]
     blocks_by_index = _blocks(data_dir / "train_000.bin")
     expected = [blocks_by_index[i] for i in reference[: 120 * 4]]
     assert first + seen == expected
+
+
+def test_sampler_resume_maps_epochs_across_a_batch_size_change():
+    n = 23
+    old = d.EpochPermutationSampler(n, 4, seed=3)  # 20-block epochs
+    stream = [list(old) for _ in range(3)]
+    new = d.EpochPermutationSampler(n, 6, seed=3)  # 18-block epochs
+    # 1 full epoch + 7 blocks drawn at batch_size 4 is epoch 1, offset 7 at any batch_size.
+    assert new.set_resume_position(27, drawn_batch_size=4) == 18 + 7
+    got = list(new)
+    assert got == stream[1][7:18], "the rest of epoch 1, in its own order"
+    # An offset past the new epoch's end lands at that end: the next iter() starts epoch 2.
+    assert new.set_resume_position(20 + 19, drawn_batch_size=4) == 18 + 18
+
+
+def test_train_resume_under_a_different_batch_size_neither_repeats_nor_skips(
+    fake_corpus, tmp_path, monkeypatch, capsys
+):
+    # auto_batch_size may re-estimate on resume; the old batch count times the new batch_size
+    # would land the seek on the wrong block.
+    data_dir = tmp_path / "data"
+    pt.pretokenize(_cfg(data_dir), train_tokens=10**9, num_proc=1)
+    monkeypatch.setattr(train_mod, "build_tokenizer", lambda cfg: _IndexTok())
+    seen: list[int] = []
+    real_getitem = d.PretokenizedDataset.__getitem__
+
+    def spy(self, idx):
+        item = real_getitem(self, idx)
+        if len(self) > EVAL_DOCS:
+            seen.append(_doc_id(int(item["input_ids"][0])))
+        return item
+
+    monkeypatch.setattr(d.PretokenizedDataset, "__getitem__", spy)
+
+    def run(max_steps: int, batch_size: int) -> None:
+        cfg = _cfg(
+            data_dir, max_steps=max_steps, grad_accum_steps=2, save_every=3, eval_every=10_000,
+            log_every=10_000, output_dir=str(tmp_path / "out"), resume_from="auto",
+        )
+        cfg.train.batch_size = batch_size
+        cfg.model = ModelConfig(d_model=32, head_dim=8, n_layers=2, max_seq_len=SEQ_LEN, vocab_pad_multiple=1)
+        cfg.wandb = WandbConfig(mode="disabled")
+        train_mod.train(cfg)
+
+    n = N_DOCS - EVAL_DOCS  # 380 blocks: 380-block epochs at batch_size 4, 378 at 6
+    blocks_by_index = _blocks(data_dir / "train_000.bin")
+    epoch = lambda e, length: [blocks_by_index[i] for i in torch.randperm(n, generator=torch.Generator().manual_seed(42 + e))[:length].tolist()]
+    run(max_steps=30, batch_size=4)  # 240 blocks
+    first = list(seen)
+    seen.clear()
+    run(max_steps=45, batch_size=6)  # 15 steps x 2 x 6 = 180 more: 138 to finish epoch 0, 42 of epoch 1
+    assert "drawn at batch_size 4, now 6" in capsys.readouterr().out
+    assert first == epoch(0, 380)[:240]
+    assert seen == epoch(0, 378)[240:] + epoch(1, 378)[:42]
 
 
 def test_decay_branch_anneals_a_kept_checkpoint_without_touching_the_main_run(

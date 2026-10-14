@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from datasets import DatasetDict, IterableDataset, interleave_datasets, load_dataset, load_from_disk
+from tokenizers.pre_tokenizers import ByteLevel
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
@@ -809,8 +810,23 @@ class EpochPermutationSampler(torch.utils.data.Sampler[int]):
         self.seed = seed
         self._position = 0  # blocks drawn so far, across epochs
 
-    def set_resume_position(self, batches_drawn: int) -> None:
-        self._position = batches_drawn * self.batch_size
+    def set_resume_position(self, blocks_drawn: int, drawn_batch_size: int | None = None) -> int:
+        """Resume after `blocks_drawn` blocks, drawn under batches of `drawn_batch_size` (default:
+        this sampler's). Returns the position in this sampler's terms, which the caller keeps
+        counting from.
+
+        The two differ when a resume picks a different batch_size (auto_batch_size re-estimating
+        against busier VRAM, an edited config): an epoch is floor(n / batch_size) * batch_size
+        blocks, so the same block count is a different (epoch, offset) under each. Mapping through
+        (epoch, offset) keeps the resume exact: an epoch's order is a pure function of (seed,
+        epoch), whatever its length, so only which few tail blocks each epoch drops can differ.
+        """
+        drawn_epoch_len = (
+            self.epoch_len if drawn_batch_size is None else (self.n_blocks // drawn_batch_size) * drawn_batch_size
+        )
+        epoch, offset = divmod(blocks_drawn, drawn_epoch_len)
+        self._position = epoch * self.epoch_len + min(offset, self.epoch_len)
+        return self._position
 
     def __len__(self) -> int:
         return self.epoch_len - self._position % self.epoch_len
@@ -857,25 +873,16 @@ def _build_pretokenized_dataloaders(cfg: Config, tokenizer: PreTrainedTokenizerB
     return train_loader, val_loader
 
 
-def _bytes_to_unicode() -> dict[int, str]:
-    """GPT-2's byte <-> printable-unicode table, which every byte-level BPE vocabulary is spelled in."""
-    bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
-    cs = bs[:]
-    n = 0
-    for b in range(256):
-        if b not in bs:
-            bs.append(b)
-            cs.append(256 + n)
-            n += 1
-    return dict(zip(bs, map(chr, cs)))
-
-
 def token_byte_lengths(tokenizer: PreTrainedTokenizerBase, vocab_size: int) -> torch.Tensor | None:
     """UTF-8 byte length of each vocabulary id, for bits/byte. None if it can't be exact.
 
     Exact for byte-level BPE (gpt2 and its descendants), where each token *is* a byte string
-    spelled through _bytes_to_unicode, so summing a document's token lengths gives its UTF-8 size
-    exactly. Special tokens (EOS) and vocab padding count 0 bytes: they are not text.
+    spelled one printable character per byte in GPT-2's 256-character alphabet (the tokenizers
+    library's own ByteLevel.alphabet(), not a hand copy of it), so summing a document's token
+    lengths gives its UTF-8 size exactly. Special tokens (EOS) and vocab padding count 0 bytes:
+    they are not text. EOS's *loss* still counts in bits/byte's numerator, deliberately: where a
+    document ends is part of what the model compresses, and every tokenizer pays for it exactly
+    once per document, so it does not tilt a cross-tokenizer comparison.
 
     Anything else returns None rather than an approximation — decoding a sentencepiece token on
     its own drops the leading-space marker, and a bits/byte number that is quietly off by a few
@@ -885,11 +892,11 @@ def token_byte_lengths(tokenizer: PreTrainedTokenizerBase, vocab_size: int) -> t
     decoder = getattr(backend, "decoder", None) if backend is not None else None
     if decoder is None or type(decoder).__name__ != "ByteLevel":
         return None
-    byte_of = {c: b for b, c in _bytes_to_unicode().items()}
+    alphabet = set(ByteLevel.alphabet())
     special = set(tokenizer.all_special_ids)
     lengths = torch.zeros(vocab_size, dtype=torch.long)
     for token, idx in tokenizer.get_vocab().items():
-        if idx < vocab_size and idx not in special and all(c in byte_of for c in token):
+        if idx < vocab_size and idx not in special and all(c in alphabet for c in token):
             lengths[idx] = len(token)  # one printable char per byte
     return lengths
 

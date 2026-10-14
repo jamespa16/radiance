@@ -382,8 +382,8 @@ def build_dpo_dataloaders(cfg: Config, tokenizer: PreTrainedTokenizerBase) -> tu
     module docstring above)."""
     if not cfg.dpo.dataset:
         raise ValueError("dpo.enabled requires dpo.dataset to be set.")
-    if not cfg.dpo.reference_checkpoint:
-        raise ValueError("dpo.enabled requires dpo.reference_checkpoint to be set.")
+    # A missing dpo.reference_checkpoint is caught once, by losses.validate_post_training_config,
+    # which train() runs before building any loader.
 
     def collate(batch):
         cols = [
