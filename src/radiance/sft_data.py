@@ -21,6 +21,120 @@ from .data import split_off_eval
 # pretraining documents is deliberate — see CLAUDE.md/the SFT design notes for why no model
 # change is needed for that.
 
+def load_chat_dataset(dataset: str, subset: str | None = None) -> DatasetDict:
+    """A post-training dataset by name: an HF hub id (with an optional config `subset`), a local
+    `save_to_disk` directory (what radiance-rlaif writes), or a local .json/.jsonl file.
+
+    Shared by the SFT and DPO pipelines. A local directory holding a single `Dataset` rather than a
+    `DatasetDict` is treated as its train split. Any other directory (raw data files, a cloned hub
+    repo) goes to `load_dataset` as it always did, as does a hub id — the no-subset call is the
+    bare `load_dataset(dataset)` it always was.
+    """
+    path = Path(dataset)
+    # save_to_disk writes exactly one of these at the top level: dataset_dict.json for a
+    # DatasetDict, state.json for a single Dataset.
+    if path.is_dir() and ((path / "dataset_dict.json").is_file() or (path / "state.json").is_file()):
+        loaded = load_from_disk(str(path))
+        return loaded if isinstance(loaded, DatasetDict) else DatasetDict({"train": loaded})
+    if path.is_file() and path.suffix in (".json", ".jsonl"):
+        return load_dataset("json", data_files=str(path))
+    if subset is not None:
+        return load_dataset(dataset, subset)
+    return load_dataset(dataset)
+
+
+def select_splits(
+    raw: DatasetDict,
+    dataset: str,
+    train_split: str,
+    eval_split: str | None,
+    eval_fallbacks: tuple[str, ...],
+    eval_split_size: int,
+    max_examples: int | None,
+):
+    """(train, eval-or-None) from a loaded DatasetDict, by the sft/dpo split fields.
+
+    An explicit eval_split must exist. Otherwise the first of `eval_fallbacks` the dataset has is
+    used, and failing that eval_split_size rows are carved off the train split. max_examples caps
+    the *train* side, after the eval carve (so the held-out rows are the same whatever the cap) and
+    after a fixed-seed shuffle (so a cap samples the split rather than its head — hub datasets are
+    often sorted by source).
+    """
+    available = ", ".join(sorted(raw.keys()))
+    if train_split not in raw:
+        raise ValueError(
+            f"dataset {dataset!r} has no {train_split!r} split (it has: {available}). Set train_split."
+        )
+    train = raw[train_split]
+    if len(train) == 0:
+        raise ValueError(f"dataset {dataset!r}:{train_split} is empty.")
+    if eval_split is not None:
+        if eval_split not in raw:
+            raise ValueError(f"dataset {dataset!r} has no {eval_split!r} split (it has: {available}).")
+        val = raw[eval_split]
+    else:
+        val = next((raw[s] for s in eval_fallbacks if s in raw and s != train_split), None)
+        if val is None:
+            if eval_split_size > 0 and eval_split_size >= len(train):
+                # Small generated datasets (a radiance-rlaif round over few prompts) hit this; the
+                # alternative is an IndexError from inside datasets' take().
+                raise ValueError(
+                    f"eval_split_size={eval_split_size} would carve all {len(train)} rows of "
+                    f"{dataset!r}:{train_split} off as validation, leaving nothing to train on."
+                )
+            train, val = split_off_eval(train, eval_split_size)
+    if max_examples is not None and len(train) > max_examples:
+        train = train.shuffle(seed=0).select(range(max_examples))
+    return train, val
+
+
+# radiance-rlaif's pair directories carry this manifest; defined here rather than in rlaif.py so
+# the data pipelines can recognise one without importing the generation stack.
+RLAIF_MANIFEST_NAME = "rlaif_manifest.json"
+# Bumped when tokenize_chat_prompt's prompt ids change, since radiance-rlaif pairs store sampled
+# ids that are only valid after the exact prompt they were sampled with. 2: the assistant prefix's
+# merged-away tail (gpt2's bare-space token) is left to the policy instead of ending the prompt.
+RLAIF_PROMPT_IDS_VERSION = 2
+
+
+def local_dataset_fingerprint(dataset: str) -> str | None:
+    """An identity for a radiance-rlaif pair directory's contents (latest mtime + total size over
+    its files), or None for anything else. Cache keys built from the path alone go stale the moment
+    the directory is rewritten — the normal case for radiance-rlaif, whose round-N output directory
+    is regenerated in place. Same path+mtime+size idea dpo_data uses for the reference checkpoint.
+
+    Limited to rlaif output (recognised by its manifest) so every other local dataset keeps the
+    path-only key it had before this existed: fingerprinting those too would orphan their caches,
+    and with them DPO reference log-probs that cannot be recomputed once the reference checkpoint
+    is gone. A hand-maintained local dataset rewritten in place still needs its cache cleared."""
+    path = Path(dataset)
+    if not (path / RLAIF_MANIFEST_NAME).is_file():
+        return None
+    files = [p for p in path.rglob("*") if p.is_file()]
+    stats = [p.stat() for p in files]
+    return f"{max((s.st_mtime for s in stats), default=0)}|{sum(s.st_size for s in stats)}"
+
+
+def split_key_extras(section) -> list[str]:
+    """Cache-key parts for the split/subset/max_examples fields, and a radiance-rlaif pair
+    directory's fingerprint — each included only when it differs from its default (or, for the
+    fingerprint, only for rlaif output), so every cache key built before these existed hashes
+    exactly as it did and those caches stay valid."""
+    extras = []
+    if section.subset is not None:
+        extras.append(f"subset={section.subset}")
+    if section.train_split != "train":
+        extras.append(f"train_split={section.train_split}")
+    if section.eval_split is not None:
+        extras.append(f"eval_split={section.eval_split}")
+    if section.max_examples is not None:
+        extras.append(f"max_examples={section.max_examples}")
+    fingerprint = local_dataset_fingerprint(section.dataset)
+    if fingerprint is not None:
+        extras.append(f"local={fingerprint}")
+    return extras
+
+
 def _format_sft_messages(example: dict, cfg: Config) -> list[dict]:
     """Normalize one dataset row to a [{"role": ..., "content": ...}, ...] turn list.
 
@@ -68,6 +182,35 @@ def tokenize_sft_example(
     return ids, mask
 
 
+def tokenize_chat_prompt(
+    messages: list[dict], tokenizer: PreTrainedTokenizerBase, user_prefix: str, assistant_prefix: str
+) -> tuple[list[int], list[int]]:
+    """A conversation plus an open assistant turn, as (ids, loss_mask): the token-level form of
+    format_chat_messages, built turn by turn exactly as tokenize_sft_example builds them (and with
+    its mask, so the open turn's prefix tokens are 1, as an assistant turn's are).
+
+    The open prefix stops at the last token a reply leaves alone. SFT tokenizes prefix and reply
+    together, and BPE merges the prefix's tail into the reply's first word: with gpt2,
+    "\\n\\nAssistant: " alone ends in a bare-space token (220), but "\\n\\nAssistant: Hello" ends
+    ":", " Hello" — so a prompt ending in 220 is one SFT never trained after. Dropping the
+    merged-away tail (found by tokenizing the prefix with a probe word after it) leaves the policy
+    to sample " Hello" itself, as it learned to; a reply that does start with whitespace can still
+    produce the bare token.
+
+    radiance-rlaif samples after these ids and the DPO pipeline rebuilds its pairs on them, which
+    is what makes a pair the policy's own token sequence rather than a re-tokenization of its text.
+    """
+    ids, mask = tokenize_sft_example(messages, tokenizer, user_prefix, assistant_prefix)
+    ids, mask = ids[:-1], mask[:-1]  # the conversation is not over: no EOS
+    prefix = tokenizer(assistant_prefix)["input_ids"]
+    probe = tokenizer(assistant_prefix + "Hello")["input_ids"]
+    keep = 0
+    while keep < len(prefix) and keep < len(probe) and prefix[keep] == probe[keep]:
+        keep += 1
+    prefix = prefix[:keep]
+    return ids + prefix, mask + [1] * len(prefix)
+
+
 def format_sft_prompt(user_message: str, cfg: Config) -> str:
     """The same turn-formatting tokenize_sft_example applies, for a single open user turn —
     used by generate.py so prompting an SFT checkpoint matches how it was trained."""
@@ -104,19 +247,36 @@ def format_chat_messages(messages: list[dict], cfg: Config) -> str:
     """
     if not messages:
         raise ValueError("format_chat_messages requires at least one message")
-    if cfg.sft.enabled:
-        user_prefix, assistant_prefix = cfg.sft.user_prefix, cfg.sft.assistant_prefix
-    elif cfg.dpo.enabled:
-        user_prefix, assistant_prefix = cfg.dpo.user_prefix, cfg.dpo.assistant_prefix
-    else:
-        raise ValueError(
-            "format_chat_messages requires a checkpoint trained with sft.enabled: true or dpo.enabled: true"
-        )
+    user_prefix, assistant_prefix = _chat_prefixes(cfg, "format_chat_messages")
     parts = [
         (assistant_prefix if m["role"] == "assistant" else user_prefix) + m["content"] for m in messages
     ]
     parts.append(assistant_prefix)
     return "".join(parts)
+
+
+def _chat_prefixes(cfg: Config, caller: str) -> tuple[str, str]:
+    """(user_prefix, assistant_prefix) of whichever post-training mode the checkpoint's own config
+    has on — see format_chat_prompt for why a DPO checkpoint reads cfg.dpo's."""
+    if cfg.sft.enabled:
+        return cfg.sft.user_prefix, cfg.sft.assistant_prefix
+    if cfg.dpo.enabled:
+        return cfg.dpo.user_prefix, cfg.dpo.assistant_prefix
+    raise ValueError(f"{caller} requires a checkpoint trained with sft.enabled: true or dpo.enabled: true")
+
+
+def chat_prompt_ids(messages: list[dict], tokenizer: PreTrainedTokenizerBase, cfg: Config) -> list[int]:
+    """The ids to sample a chat reply after: tokenize_chat_prompt under the checkpoint's own turn
+    template. What `radiance-generate --chat` and radiance-serve's /v1/chat/completions prompt
+    with, so a served or sampled checkpoint sees the same prompt boundary radiance-rlaif's pairs
+    and judge evaluation do — tokenizing format_chat_messages' text whole would end the prompt in
+    the assistant prefix's merged-away trailing-space token (see tokenize_chat_prompt), a context
+    SFT never trained after."""
+    if not messages:
+        raise ValueError("chat_prompt_ids requires at least one message")
+    user_prefix, assistant_prefix = _chat_prefixes(cfg, "chat_prompt_ids")
+    ids, _ = tokenize_chat_prompt(messages, tokenizer, user_prefix, assistant_prefix)
+    return ids
 
 
 def _tokenize_and_pack_sft(dataset, tokenizer: PreTrainedTokenizerBase, cfg: Config):
@@ -179,6 +339,7 @@ def _sft_cache_path(cfg: Config) -> Path:
             cfg.sft.user_prefix,
             cfg.sft.assistant_prefix,
             str(cfg.sft.eval_split_size),
+            *split_key_extras(cfg.sft),
         ]
     )
     digest = hashlib.sha256(key.encode()).hexdigest()[:16]
@@ -192,11 +353,16 @@ def _load_or_build_sft_packed(cfg: Config, tokenizer: PreTrainedTokenizerBase):
         packed.set_format(type="torch", columns=["input_ids", "loss_mask"])
         return packed
 
-    raw = load_dataset(cfg.sft.dataset)
-    train_split = raw["train"]
-    val_split = raw.get("validation")
-    if val_split is None:
-        train_split, val_split = split_off_eval(train_split, cfg.sft.eval_split_size)
+    raw = load_chat_dataset(cfg.sft.dataset, cfg.sft.subset)
+    train_split, val_split = select_splits(
+        raw,
+        cfg.sft.dataset,
+        cfg.sft.train_split,
+        cfg.sft.eval_split,
+        ("validation",),
+        cfg.sft.eval_split_size,
+        cfg.sft.max_examples,
+    )
 
     packed = DatasetDict({"train": _tokenize_and_pack_sft(train_split, tokenizer, cfg)})
     if val_split is not None:

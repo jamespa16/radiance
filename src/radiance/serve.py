@@ -21,7 +21,7 @@ from transformers import PreTrainedTokenizerBase
 from radiance.config import Config, resolve_device
 from radiance.generate import BatchItem, generate_tokens_batched, load_checkpoint
 from radiance.model import DenseTransformer
-from radiance.sft_data import format_chat_messages
+from radiance.sft_data import chat_prompt_ids
 
 logger = logging.getLogger("radiance.serve")
 
@@ -41,7 +41,7 @@ def _require_chat_enabled(cfg: Config) -> None:
     if not (cfg.sft.enabled or cfg.dpo.enabled):
         raise ValueError(
             "/v1/chat/completions requires a checkpoint trained with sft.enabled: true or "
-            "dpo.enabled: true, since it formats requests with format_chat_messages. Use "
+            "dpo.enabled: true, since it formats requests with chat_prompt_ids. Use "
             "/v1/completions for a base checkpoint."
         )
 
@@ -609,8 +609,12 @@ def create_app(
         # budget without either is "length".
         return "length" if completion_tokens >= max_tokens and not stopped_on_sequence else "stop"
 
-    def _tokenize_and_check(prompt: str) -> tuple[torch.Tensor, int]:
-        prompt_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
+    def _tokenize_and_check(prompt: str | list[int]) -> tuple[torch.Tensor, int]:
+        # A list is already ids (chat_prompt_ids), whose prompt boundary tokenizing text whole gets wrong.
+        if isinstance(prompt, str):
+            prompt_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
+        else:
+            prompt_ids = torch.tensor([prompt], dtype=torch.long, device=device)
         prompt_tokens = prompt_ids.shape[1]
         if prompt_tokens >= model.cfg.max_seq_len:
             raise HTTPException(
@@ -747,7 +751,7 @@ def create_app(
         if not req.messages:
             raise HTTPException(status_code=400, detail="messages must not be empty")
 
-        prompt = format_chat_messages([m.model_dump() for m in req.messages], cfg)
+        prompt = chat_prompt_ids([m.model_dump() for m in req.messages], tokenizer, cfg)
         prompt_ids, prompt_tokens = _tokenize_and_check(prompt)
         stop_seqs = _stop_sequences(req.stop)
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"

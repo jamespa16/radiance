@@ -16,7 +16,7 @@ import torch
 from radiance.config import Config, DPOConfig, ModelConfig
 from radiance.dpo_data import _tokenize_dpo_row
 from radiance.model import DenseTransformer, document_ids, sequence_logprob_sum
-from radiance.losses import resolve_dpo_doc_mask
+from radiance.losses import dpo_model_config
 from tests.conftest import TINY_VOCAB
 
 
@@ -62,30 +62,28 @@ def _dpo_cfg(seq_len: int = 32, **model_kwargs) -> Config:
 def test_doc_mask_skipped_for_a_plain_dpo_run():
     cfg = _dpo_cfg()
     assert cfg.model.doc_attention_mask is True
-    resolve_dpo_doc_mask(cfg)
-    assert cfg.model.doc_attention_mask is False
+    assert dpo_model_config(cfg).doc_attention_mask is False
+    # A copy: the config the checkpoint saves keeps the architecture's own value.
+    assert cfg.model.doc_attention_mask is True
 
 
 def test_doc_mask_untouched_when_not_a_dpo_run():
     """Pretrain and SFT pack genuinely-multi-document blocks, where the mask is load-bearing."""
     cfg = _dpo_cfg()
     cfg.dpo.enabled = False
-    resolve_dpo_doc_mask(cfg)
-    assert cfg.model.doc_attention_mask is True
+    assert dpo_model_config(cfg) is cfg.model
 
 
 def test_doc_mask_kept_for_dpo_when_loop_attn_windows_are_configured():
     """Windows ride the same BlockMask, and a sliding window restricts attention *within* a
     document — which real DPO content, all of it document 0, genuinely feels. Not inert."""
     cfg = _dpo_cfg(loop_count=3, loop_attn_windows=[4, 8, 32])
-    resolve_dpo_doc_mask(cfg)
-    assert cfg.model.doc_attention_mask is True
+    assert dpo_model_config(cfg).doc_attention_mask is True
 
 
 def test_resolving_an_already_off_doc_mask_is_a_no_op():
     cfg = _dpo_cfg(doc_attention_mask=False)
-    resolve_dpo_doc_mask(cfg)
-    assert cfg.model.doc_attention_mask is False
+    assert dpo_model_config(cfg) is cfg.model
 
 
 # --- the structural claim (device-independent) -------------------------------------------------
@@ -185,5 +183,5 @@ def test_skipping_the_mask_restores_cuda_graphs_for_a_dpo_run():
         return resolve_compile_mode(model, config, "cuda")
 
     assert _mode(cfg) is None
-    resolve_dpo_doc_mask(cfg)
+    cfg.model = dpo_model_config(cfg)
     assert _mode(cfg) == "reduce-overhead"

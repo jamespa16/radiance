@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import dataclasses
+import functools
+
 import torch
 import torch.nn.functional as F
 
-from radiance.config import Config, doc_mask_is_inert_for_dpo
+from radiance.config import Config, ModelConfig, doc_mask_is_inert_for_dpo
 from radiance.model import DenseTransformer, ModelOutput, sequence_logprob_sum, target_logit_and_logz
 def compute_mtp_loss(
     model: DenseTransformer, mtp_hidden: tuple[torch.Tensor, ...] | None, input_ids: torch.Tensor
@@ -122,11 +125,22 @@ def compute_dpo_loss(
     ref_chosen_logp: torch.Tensor,
     ref_rejected_logp: torch.Tensor,
     beta: float,
+    loss_type: str = "sigmoid",
+    label_smoothing: float = 0.0,
+    sft_weight: float = 0.0,
+    chosen_tokens: torch.Tensor | None = None,
+    rejected_tokens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """The standard DPO objective (Rafailov et al. 2023): -E[logsigmoid(beta * (policy_logratio -
     ref_logratio))], mean over the batch. Each *_logp is a per-row (batch,) sequence-summed
     log-probability (see model.sequence_logprob_sum), not a mean, and the reference values are read
     from data.py's precomputed cache rather than a second live model.
+
+    The keyword arguments select the variants DPOConfig documents — `loss_type` "ipo"/"hinge",
+    cDPO's `label_smoothing`, RPO's `sft_weight` — and at their defaults the code path is the
+    original one, operation for operation, so the default loss is bit-identical to what it was
+    before they existed. `chosen_tokens`/`rejected_tokens` are each row's scored-token count, needed
+    only by the two length-normalized terms (IPO and the NLL term); the caller supplies them.
 
     Also returns three no_grad diagnostics, logged but not optimized:
     - margin: the mean implicit reward margin (how much more the policy separates chosen from
@@ -142,7 +156,26 @@ def compute_dpo_loss(
     policy_logratio = policy_chosen_logp - policy_rejected_logp
     ref_logratio = ref_chosen_logp - ref_rejected_logp
     logits = beta * (policy_logratio - ref_logratio)
-    loss = -F.logsigmoid(logits).mean()
+    if loss_type == "sigmoid":
+        if label_smoothing:
+            loss = (
+                -(1 - label_smoothing) * F.logsigmoid(logits) - label_smoothing * F.logsigmoid(-logits)
+            ).mean()
+        else:
+            loss = -F.logsigmoid(logits).mean()
+    elif loss_type == "hinge":
+        loss = F.relu(1 - logits).mean()
+    elif loss_type == "ipo":
+        # IPO regresses the margin of *per-token-mean* log-probs onto 1/(2*beta) (Azar et al. 2023,
+        # and TRL's implementation): with sums, the target margin would scale with response length.
+        normalized = (policy_chosen_logp - ref_chosen_logp) / chosen_tokens - (
+            policy_rejected_logp - ref_rejected_logp
+        ) / rejected_tokens
+        loss = ((normalized - 1 / (2 * beta)) ** 2).mean()
+    else:
+        raise ValueError(f"unknown dpo.loss_type {loss_type!r}, expected 'sigmoid', 'ipo' or 'hinge'")
+    if sft_weight:
+        loss = loss + sft_weight * (-policy_chosen_logp / chosen_tokens).mean()
     with torch.no_grad():
         margin_accuracy = (logits > 0).float().mean()
         reward_accuracy = (policy_chosen_logp > policy_rejected_logp).float().mean()
@@ -162,13 +195,27 @@ def compute_dpo_loss_from_logits(
     ref_chosen_logp: torch.Tensor,
     ref_rejected_logp: torch.Tensor,
     beta: float,
+    loss_type: str = "sigmoid",
+    label_smoothing: float = 0.0,
+    sft_weight: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fuses sequence_logprob_sum (x2) + compute_dpo_loss into one function so build_dpo_loss_fn
     can torch.compile it as a single unit — the same reasoning build_loss_fn already applies to
     compute_loss/compute_sft_loss."""
     policy_chosen_logp = sequence_logprob_sum(chosen_logits, chosen_ids, chosen_mask)
     policy_rejected_logp = sequence_logprob_sum(rejected_logits, rejected_ids, rejected_mask)
-    return compute_dpo_loss(policy_chosen_logp, policy_rejected_logp, ref_chosen_logp, ref_rejected_logp, beta)
+    chosen_tokens = rejected_tokens = None
+    if loss_type == "ipo" or sft_weight:
+        # The scored positions are the *shifted* mask, exactly as sequence_logprob_sum counts them.
+        # clamp: a row whose response is empty still scores its EOS, so this only guards a
+        # degenerate all-zero mask against a 0/0.
+        chosen_tokens = chosen_mask[:, 1:].sum(dim=1).clamp_min(1)
+        rejected_tokens = rejected_mask[:, 1:].sum(dim=1).clamp_min(1)
+    return compute_dpo_loss(
+        policy_chosen_logp, policy_rejected_logp, ref_chosen_logp, ref_rejected_logp, beta,
+        loss_type=loss_type, label_smoothing=label_smoothing, sft_weight=sft_weight,
+        chosen_tokens=chosen_tokens, rejected_tokens=rejected_tokens,
+    )
 
 
 def build_loss_fn(cfg: Config):
@@ -187,12 +234,31 @@ def build_loss_fn(cfg: Config):
     return torch.compile(fn) if cfg.train.compile else fn
 
 
-def build_dpo_loss_fn(cfg: Config):
+def dpo_loss_variant_configured(cfg: Config) -> bool:
+    """Whether dpo.loss_type/label_smoothing/sft_weight select anything but plain DPO."""
+    return cfg.dpo.loss_type != "sigmoid" or bool(cfg.dpo.label_smoothing) or bool(cfg.dpo.sft_weight)
+
+
+def build_dpo_loss_fn(cfg: Config, plain: bool = False):
     """compute_dpo_loss_from_logits, compiled when the run is compiled. DPO analogue of
     build_loss_fn — kept separate rather than folded into it because the two functions take
     different-shaped arguments (one logits tensor + input_ids/loss_mask vs. two logits tensors +
-    two input_ids/loss_mask pairs + two cached reference log-probs)."""
-    return torch.compile(compute_dpo_loss_from_logits) if cfg.train.compile else compute_dpo_loss_from_logits
+    two input_ids/loss_mask pairs + two cached reference log-probs).
+
+    The loss variant (dpo.loss_type/label_smoothing/sft_weight) is bound here, once, so every call
+    site keeps passing the same nine positional arguments whichever objective the run optimizes.
+    `plain=True` binds the defaults instead — train() evaluates with that, so val/loss is the plain
+    DPO objective on every run and stays comparable across variants (an sft_weight run's configured
+    loss carries a chosen-NLL term no other run's does)."""
+    fn = torch.compile(compute_dpo_loss_from_logits) if cfg.train.compile else compute_dpo_loss_from_logits
+    if plain:
+        return fn
+    return functools.partial(
+        fn,
+        loss_type=cfg.dpo.loss_type,
+        label_smoothing=cfg.dpo.label_smoothing,
+        sft_weight=cfg.dpo.sft_weight,
+    )
 
 
 def forward_dpo_pair(model, chunk: dict) -> tuple[ModelOutput, torch.Tensor, torch.Tensor]:
@@ -291,12 +357,27 @@ def validate_post_training_config(cfg: Config) -> None:
         # built for either. Raise rather than silently score prompt/rejected tokens through the
         # auxiliary heads.
         raise ValueError("sft.enabled/dpo.enabled do not support model.mtp_heads > 1 yet — set mtp_heads: 1.")
-    if cfg.dpo.enabled and not cfg.dpo.reference_checkpoint:
-        raise ValueError("dpo.enabled requires dpo.reference_checkpoint to be set.")
+    if cfg.dpo.enabled and not cfg.resolved_reference_checkpoint:
+        raise ValueError(
+            "dpo.enabled requires dpo.reference_checkpoint (or train.init_from, which it defaults to) to be set."
+        )
+    dpo = cfg.dpo
+    if dpo.loss_type not in ("sigmoid", "ipo", "hinge"):
+        raise ValueError(f"dpo.loss_type must be 'sigmoid', 'ipo' or 'hinge', got {dpo.loss_type!r}")
+    if not 0.0 <= dpo.label_smoothing < 0.5:
+        # At 0.5 the two labels are equally likely and the loss has no preferred direction at all.
+        raise ValueError(f"dpo.label_smoothing must be in [0, 0.5), got {dpo.label_smoothing}")
+    if dpo.label_smoothing and dpo.loss_type != "sigmoid":
+        raise ValueError("dpo.label_smoothing is defined for loss_type: sigmoid only (cDPO).")
+    if dpo.sft_weight < 0:
+        raise ValueError(f"dpo.sft_weight must be >= 0, got {dpo.sft_weight}")
+    if dpo.min_score_margin is not None and not (dpo.score_chosen_column and dpo.score_rejected_column):
+        raise ValueError("dpo.min_score_margin needs dpo.score_chosen_column and dpo.score_rejected_column.")
 
 
-def resolve_dpo_doc_mask(cfg: Config) -> None:
-    """Turn model.doc_attention_mask off for a DPO run whose packing makes it a no-op.
+def dpo_model_config(cfg: Config) -> ModelConfig:
+    """The model config to build this run's model from: cfg.model, except with doc_attention_mask
+    off for a DPO run whose packing makes it a no-op.
 
     See config.doc_mask_is_inert_for_dpo for why it is a no-op (and for the loop_attn_windows
     exception that keeps it on). Worth doing for two reasons, the second larger than the first:
@@ -305,18 +386,18 @@ def resolve_dpo_doc_mask(cfg: Config) -> None:
     things that force resolve_compile_mode down to mode=None — so a DPO run that skips it gets
     CUDA graphs back.
 
-    Mutates cfg rather than branching at each use, the same idiom auto_batch_size and
-    tokens_per_param already use here, which also means the value saved into the checkpoint is
-    the one the run actually trained with.
+    A copy rather than a mutation of cfg.model, so the config saved into the checkpoint keeps the
+    architecture's own value: the skip is this run's packing, not a property of the weights, and
+    a later stage that packs several examples per block (SFT after DPO) needs the mask back.
     """
     if not (cfg.dpo.enabled and doc_mask_is_inert_for_dpo(cfg.model)):
-        return
-    cfg.model.doc_attention_mask = False
+        return cfg.model
     print(
-        "[radiance] dpo.enabled: turning model.doc_attention_mask off — DPO packs one pair side "
-        "per row, so the document mask cannot change any scored logit, and building it every "
-        "step is pure overhead (see config.doc_mask_is_inert_for_dpo)."
+        "[radiance] dpo.enabled: building the model with doc_attention_mask off — DPO packs one "
+        "pair side per row, so the document mask cannot change any scored logit, and building it "
+        "every step is pure overhead (see config.doc_mask_is_inert_for_dpo)."
     )
+    return dataclasses.replace(cfg.model, doc_attention_mask=False)
 
 
 def note_dpo_z_loss_omitted(cfg: Config) -> None:
@@ -334,4 +415,23 @@ def note_dpo_z_loss_omitted(cfg: Config) -> None:
             f"[radiance] dpo.enabled: model.z_loss_weight={cfg.model.z_loss_weight} has no effect — "
             "z_loss is deliberately omitted from the DPO loss (see docs/post-training.md) and its "
             "metric logs a flat 0. Set model.z_loss_weight: 0 to silence this note."
+        )
+
+
+def note_dpo_dropout(cfg: Config) -> None:
+    """Surface that dropout biases the DPO loss: the reference log-probs were computed once, in
+    eval mode (no dropout), while the policy's are computed in train mode, with it.
+
+    So even at step 1, where the policy *is* the reference, policy_logratio - ref_logratio is
+    dropout noise rather than 0, and the loss does not start at log(2) (measured: 0.661 at
+    dropout 0.1 on a one-pair smoke run, exactly 0.6931 at 0.0). TRL disables dropout for DPO by
+    default for this reason. A note rather than an automatic override, because silently changing
+    model.dropout would change what an existing DPO config trains; the configs in
+    configs/post_training/ pin model.dropout: 0.0 instead.
+    """
+    if cfg.dpo.enabled and cfg.model.dropout > 0:
+        print(
+            f"[radiance] dpo.enabled: model.dropout={cfg.model.dropout} noises the policy's "
+            "log-probs but not the (eval-mode) reference's, so the DPO loss is biased from step 1 "
+            "and does not start at log(2). Set model.dropout: 0.0 for a DPO run."
         )

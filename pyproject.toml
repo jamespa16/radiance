@@ -5,7 +5,7 @@ description = "Experimental LLM training framework"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.5",
-    "transformers>=4.40",
+    "transformers>=4.56",  # from_pretrained(dtype=...) (rlaif.RewardModelJudge); older releases spell it torch_dtype
     "datasets>=2.19",
     "wandb>=0.17",
     "safetensors>=0.4",
@@ -36,6 +36,7 @@ radiance-eval = "radiance.eval_harness:main"
 radiance-size = "radiance.size:main"
 radiance-export = "radiance.export:main"
 radiance-pretokenize = "radiance.pretokenize:main"
+radiance-rlaif = "radiance.rlaif:main"
 
 [build-system]
 requires = ["setuptools>=68"]

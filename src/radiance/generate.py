@@ -10,7 +10,7 @@ from transformers import PreTrainedTokenizerBase
 
 from radiance.config import Config, resolve_device
 from radiance.data import build_tokenizer
-from radiance.sft_data import format_chat_prompt
+from radiance.sft_data import chat_prompt_ids
 from radiance.model import (
     DenseTransformer,
     load_transformer_from_checkpoint,
@@ -119,6 +119,7 @@ def generate_tokens_batched(
     items: list[BatchItem],
     device: str = "cpu",
     loops: int | None = None,
+    samples_per_item: int = 1,
 ) -> Iterator[list[tuple[int, int | None]]]:
     """Batched counterpart to generate_tokens: runs `items` (right-padded prompts of possibly
     different lengths, one shared KVCache) through a single forward pass per step instead of one
@@ -133,6 +134,11 @@ def generate_tokens_batched(
     the batch's tensor shapes stay uniform until every row finishes (this repo's "idle to
     completion" batching design), but since attention is masked per row, it can never influence any
     other row's output, and no further sampling work is spent on it.
+
+    `samples_per_item` > 1 decodes each item as that many independent samples: row
+    `i * samples_per_item + s` is sample `s` of item `i`. Each prompt is prefilled once and its KV
+    cache and last-position logits are then expanded across its samples, so the prefill — the
+    whole prompt, against one token per decode step — is not paid once per sample.
     """
     batch = len(items)
     prompts = [item.input_ids[:, -model.cfg.max_seq_len :] for item in items]
@@ -164,6 +170,15 @@ def generate_tokens_batched(
     mask_vocab_padding(logits, tokenizer)
     last_idx = torch.tensor([plen - 1 for plen in prompt_lens], device=device)
     next_logits = logits[torch.arange(batch, device=device), last_idx, :]
+    if samples_per_item > 1:
+        n = samples_per_item
+        kv_cache.repeat_interleave(n)
+        next_logits = next_logits.repeat_interleave(n, dim=0)
+        key_padding_mask = key_padding_mask.repeat_interleave(n, dim=0)
+        key_positions = key_positions.repeat_interleave(n, dim=0)
+        real_len = [length for length in real_len for _ in range(n)]
+        items = [item for item in items for _ in range(n)]
+        batch *= n
 
     done = [False] * batch
     yielded_count = [0] * batch
@@ -210,7 +225,7 @@ def generate_tokens_batched(
 def generate(
     model: DenseTransformer,
     tokenizer: PreTrainedTokenizerBase,
-    prompt: str,
+    prompt: str | list[int],
     max_new_tokens: int = 200,
     temperature: float = 0.8,
     top_k: int = 50,
@@ -222,8 +237,14 @@ def generate(
     string-concatenating — a BPE tokenizer's decode of a completion is not guaranteed to match its
     decode as a continuation of the prompt (e.g. leading-space merges at the boundary), so the ids
     must be joined before decoding, not the decoded strings.
+
+    `prompt` may be token ids instead of text, for a prompt whose boundary tokenizing text whole
+    gets wrong (chat_prompt_ids).
     """
-    input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
+    if isinstance(prompt, str):
+        input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
+    else:
+        input_ids = torch.tensor([prompt], dtype=torch.long, device=device)
     input_ids = input_ids[:, -model.cfg.max_seq_len :]
     new_ids = list(
         generate_tokens(model, tokenizer, input_ids, max_new_tokens, temperature, top_k, device, loops)
@@ -273,7 +294,7 @@ def main() -> None:
     model, cfg, tokenizer = load_checkpoint(args.checkpoint, device)
     prompt = args.prompt
     if args.chat:
-        prompt = format_chat_prompt(args.prompt, cfg)
+        prompt = chat_prompt_ids([{"role": "user", "content": args.prompt}], tokenizer, cfg)
 
     text = generate(
         model,

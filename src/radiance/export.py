@@ -283,6 +283,19 @@ def read_checkpoint(path: str | Path, map_location: str = "cpu") -> dict[str, An
     return torch.load(str(path), map_location=map_location, weights_only=False)
 
 
+def read_checkpoint_config(path: str | Path) -> Config:
+    """Just the `Config` a `.pt` checkpoint or export directory was saved with, without paging in
+    its weights (mmap for a `.pt`, config.json alone for an export) — cheap enough for
+    load_config to call (`train.inherit_model_config`)."""
+    path = Path(path)
+    if is_export(path):
+        if path.is_file():
+            path = path.parent
+        with open(path / CONFIG_NAME) as f:
+            return _config_from_json(json.load(f)["config"])
+    return torch.load(str(path), map_location="cpu", weights_only=False, mmap=True)["config"]
+
+
 def load_export(output_dir: str | Path, device: str = "cpu") -> tuple["DenseTransformer", Config]:
     """Rebuild a `DenseTransformer` + `Config` from an export directory — the inverse of
     `export_checkpoint`.

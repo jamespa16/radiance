@@ -20,6 +20,7 @@ def save_checkpoint(
     cfg: Config,
     train_batches_drawn: int = 0,
     train_blocks_drawn: int | None = None,
+    dpo_reference: str | None = None,
 ) -> None:
     """Write a resumable checkpoint, atomically.
 
@@ -34,6 +35,9 @@ def save_checkpoint(
     recorded but unused. `train_blocks_drawn` (default: batches x batch_size) is the same position
     in rows, saved with the `train_batch_size` it was drawn at, so a resume under a different
     batch_size can still seek exactly (train._restore_data_position).
+
+    `dpo_reference` is a DPO run's dpo_data.current_reference_identity as of its first start: a
+    resume pins itself to it rather than to whatever the reference path holds by then.
 
     Not captured: RNG state. It trades off against data freshness, and the resolution here favours
     freshness — train() re-seeds off the resumed step, so a map-style loader draws a *different*
@@ -67,6 +71,7 @@ def save_checkpoint(
                     else train_batches_drawn * cfg.train.batch_size
                 ),
                 "train_batch_size": cfg.train.batch_size,
+                "dpo_reference": dpo_reference,
                 "config": cfg,
             },
             f,

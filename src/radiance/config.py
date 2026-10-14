@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import random
 from dataclasses import MISSING, dataclass, field, fields, is_dataclass
 from pathlib import Path
 
+import numpy as np
 import torch
 import yaml
 
@@ -491,6 +493,15 @@ class TrainConfig:
     # the optimizer/scheduler/step are NOT restored — this run gets a fresh optimizer/scheduler
     # from its own TrainConfig and starts at step 0. Ignored whenever resume_from finds a
     # checkpoint (resuming an interrupted run of *this* config takes priority). None = fresh init.
+    inherit_model_config: bool = False  # opt-in: take the `model:` section (and data.tokenizer)
+    # from init_from's own saved config, with only the keys this YAML's `model:` section spells out
+    # applied on top. Resolved in load_config, so the checkpoint this run writes records the merged
+    # values. Exists because init_from otherwise needs a hand-copied `model:` block, and
+    # load_pretrained_weights only checks the *shape* fields — a copy that drops a behavioral field
+    # (loop_count, rope settings, qk_norm, ...) loads cleanly and silently fine-tunes a different
+    # model from the one that was pretrained. Off by default (not the usual default-on-but-inert)
+    # because it is not inert: an existing config's omitted model keys would change from the
+    # dataclass defaults to the checkpoint's values. Requires init_from.
     seed: int = 42
     device: str = "auto"
     compile: bool = True
@@ -572,7 +583,14 @@ class SFTConfig:
     """
 
     enabled: bool = False
-    dataset: str | None = None  # HF `user/dataset`-style instruction dataset. Required when enabled.
+    dataset: str | None = None  # HF `user/dataset`-style instruction dataset, or a local dataset
+    # (a `save_to_disk` directory, or a .json/.jsonl file). Required when enabled.
+    subset: str | None = None  # HF dataset config name (e.g. "all" for HuggingFaceTB/smoltalk).
+    train_split: str = "train"  # e.g. "train_sft" for HuggingFaceH4/ultrachat_200k.
+    eval_split: str | None = None  # None (default): "validation" if the dataset has one, else carve
+    # eval_split_size rows off the train split. Set (e.g. "test_sft") to use that split instead.
+    max_examples: int | None = None  # cap on train-split rows, taken after a fixed-seed shuffle so the
+    # cap samples the whole split rather than its head. None = every row.
     messages_column: str = "messages"  # list[{"role": ..., "content": ...}] per example — the
     # standard shape for chat-formatted HF datasets (e.g. HuggingFaceH4/no_robots). Ignored if
     # instruction_column is set instead.
@@ -604,24 +622,51 @@ class DPOConfig:
     """
 
     enabled: bool = False
-    dataset: str | None = None  # HF `user/dataset`-style preference dataset. Required when enabled.
+    dataset: str | None = None  # HF `user/dataset`-style preference dataset, or a local dataset (a
+    # `save_to_disk` directory — what radiance-rlaif writes — or a .json/.jsonl file). Required.
+    subset: str | None = None  # same as sft.subset.
+    train_split: str = "train"  # e.g. "train_prefs" for HuggingFaceH4/ultrafeedback_binarized.
+    eval_split: str | None = None  # None (default): "validation", else "test", else carve
+    # eval_split_size rows off train. Set (e.g. "test_prefs") to use that split instead.
+    max_examples: int | None = None  # same as sft.max_examples, counted before the seq_len and
+    # min_score_margin filters drop anything.
     prompt_column: str | None = None  # None (default): chosen_column/rejected_column are full
     # [{"role", "content"}, ...] message lists that already include the prompt turn (e.g.
     # argilla/dpo-mix-7k). Set: chosen_column/rejected_column are plain completion strings, combined
     # with prompt_column (+ optional system_column) into a shared 1-turn user prompt (e.g.
     # Intel/orca_dpo_pairs). Mirrors sft.instruction_column's fallback precedent.
     system_column: str | None = None  # only consulted when prompt_column is set.
-    chosen_column: str = "chosen"
-    rejected_column: str = "rejected"
+    chosen_column: str = "chosen"  # a message list, a plain completion string (with prompt_column),
+    rejected_column: str = "rejected"  # or an Anthropic/hh-rlhf-style "\n\nHuman: ...\n\nAssistant:
+    # ..." transcript string (without prompt_column), parsed into turns by parse_hh_transcript.
+    score_chosen_column: str | None = None  # opt-in pair filter: per-row quality scores (e.g.
+    score_rejected_column: str | None = None  # ultrafeedback_binarized's score_chosen/score_rejected,
+    # or radiance-rlaif's chosen_score/rejected_score). Only read when min_score_margin is set.
+    min_score_margin: float | None = None  # drop pairs whose score_chosen - score_rejected is below
+    # this. AI-judged preference data is noisiest where the judge barely separated the two sides —
+    # ties and near-ties carry label noise and little signal. None (default) keeps every pair.
     seq_len: int | None = None  # None (default) resolves to data.seq_len, same range-collapsed
     # inert default convention as sft.seq_len.
     cache_dir: str = ".cache/radiance/dpo"
     eval_split_size: int = 0  # same semantics as data.eval_split_size, applied to the DPO dataset.
     beta: float = 0.1  # DPO temperature / KL-regularization strength (Rafailov et al. 2023).
+    loss_type: str = "sigmoid"  # the preference loss on the reference-relative log-ratio margin:
+    # "sigmoid" (DPO), "ipo" (Azar et al. 2023 — squared loss toward a fixed margin of 1/(2*beta),
+    # on per-token-mean log-probs; it does not saturate, so it stops pushing apart a pair the policy
+    # already separates by that margin), or "hinge" (SLiC, Zhao et al. 2023 — relu(1 - beta *
+    # margin)). Each is a different objective, not a refinement, hence one string, not three flags.
+    label_smoothing: float = 0.0  # "sigmoid" only: the assumed probability that a pair's label is
+    # flipped (cDPO, Mitchell 2023). The loss becomes (1-e)*DPO(chosen>rejected) +
+    # e*DPO(rejected>chosen), whose optimum is a finite margin instead of an infinite one — the
+    # point for AI-judged data, where some fraction of labels are wrong. 0.0 (default) is exactly DPO.
+    sft_weight: float = 0.0  # weight on a per-token-mean NLL term over the chosen response (RPO,
+    # Pang et al. 2024; the "DPO + NLL" regularizer Llama 3 used). DPO constrains only the *gap*
+    # between chosen and rejected, and on small models both log-probs commonly fall together; this
+    # anchors the chosen side's likelihood. 0.0 (default) is inert.
     reference_checkpoint: str | None = None  # path to a frozen checkpoint whose log-probs anchor
-    # the DPO loss. Required when enabled. Often, but not necessarily, the same checkpoint
-    # train.init_from seeds the policy from — kept as a separate field since data prep (which needs
-    # this) and the train() call (which needs init_from) are different code paths.
+    # the DPO loss. None (default) resolves to train.init_from (Config.resolved_reference_checkpoint)
+    # — the common case, where the policy starts from the reference — and must resolve to
+    # *something*. A separate field because the two need not be the same checkpoint.
     reference_batch_size: int = 32  # batch size for the one-time reference-logprob precompute pass.
     user_prefix: str = "\n\nUser: "  # same plain-text turn-marker convention as sft.user_prefix.
     assistant_prefix: str = "\n\nAssistant: "
@@ -685,6 +730,13 @@ class Config:
         return self.data.seq_len
 
     @property
+    def resolved_reference_checkpoint(self) -> str | None:
+        """dpo.reference_checkpoint, falling back to train.init_from when unset — the
+        range-collapsed default: a config that names the reference explicitly is unaffected, and
+        one that names neither still raises (validate_post_training_config)."""
+        return self.dpo.reference_checkpoint or self.train.init_from
+
+    @property
     def train_width_multiplier(self) -> int:
         """How many packed rows one logical batch row forwards at once.
 
@@ -742,6 +794,15 @@ def resolve_device(device: str) -> str:
     if torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+def set_seed(seed: int) -> None:
+    """Seed every RNG a run draws from. Here rather than in train.py so radiance-rlaif, which never
+    trains, seeds the same way without importing the training stack."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 _DTYPES = {
@@ -802,6 +863,144 @@ def _apply_dtype_sugar(cfg: Config) -> Config:
     return cfg
 
 
+# ModelConfig fields that are how a run trains, not what its weights compute: loss weights, numeric
+# format, memory/regularisation switches, and doc_attention_mask (how *this* run's packed batches
+# attend; it holds no weights). train.inherit_model_config leaves these to the stage's own YAML, or
+# their defaults. Inherited, they would carry one stage's choices silently into the next: the fp4_*
+# set comes from train.dtype: nvfp4 and would put a bf16 SFT stage on FP4 GEMMs, and a DPO
+# checkpoint saved before the doc mask stopped being written back holds doc_attention_mask=False,
+# which would let an SFT stage's packed conversations attend to each other.
+_RUN_TIME_MODEL_FIELDS = frozenset(
+    {
+        "fp4_linear", "fp4_grad_gemms", "fp4_stochastic_rounding", "fp4_hadamard",
+        "fp4_save_activations", "fp4_keep_bf16_blocks", "fp4_keep_bf16_first", "fp4_lm_head",
+        "dropout", "z_loss_weight", "mtp_weight", "ponder_weight", "moe_aux_loss_weight",
+        "moe_bias_update_rate", "moe_balance_signal", "moe_counterfactual_weight",
+        "grad_checkpoint", "loop_bptt_window", "doc_attention_mask",
+    }
+)
+
+
+def _inherit_model_config(raw: dict) -> dict:
+    """Resolve `train.inherit_model_config`: `train.init_from`'s saved model architecture (and
+    data.tokenizer) — or, when the run is resuming, the resume checkpoint's — overlaid with the
+    keys this raw YAML spells out explicitly. Architecture only: _RUN_TIME_MODEL_FIELDS are left to
+    this stage.
+
+    Raw-level for the same reason load_config's other cross-field checks are: only the raw dict
+    distinguishes "this key was written down" from "this key is at its default", and it is exactly
+    the written-down keys that must win over the checkpoint's.
+    """
+    # Local imports: both modules import this one.
+    from radiance.checkpointing import find_resume_checkpoint
+    from radiance.export import read_checkpoint_config
+
+    train_raw = raw.get("train") or {}
+    init_from = train_raw.get("init_from")
+    if not init_from:
+        raise ValueError("train.inherit_model_config requires train.init_from to be set.")
+    # A resumed stage takes its architecture from the checkpoint it resumes, which already holds
+    # the inherited config: init_from may since have been rotated away or overwritten (an RLAIF
+    # round reusing its policy path), and re-reading it would fail, or silently change the model
+    # under a run that is half trained.
+    resume_keys = {k: train_raw[k] for k in ("resume_from", "output_dir") if k in train_raw}
+    resume = find_resume_checkpoint(Config(train=TrainConfig(**resume_keys)))
+    source = read_checkpoint_config(resume if resume is not None else init_from)
+    inherited = {
+        f.name: getattr(source.model, f.name)
+        for f in fields(source.model)
+        if f.name not in _RUN_TIME_MODEL_FIELDS
+    }
+    raw = {**raw, "model": {**inherited, **(raw.get("model") or {})}}
+    data = {**(raw.get("data") or {})}
+    data.setdefault("tokenizer", source.data.tokenizer)
+    raw["data"] = data
+    return raw
+
+
+_STRING_FIELD_TYPES = ("str", "str | None")
+_FLOAT_FIELD_TYPES = ("float", "float | None")
+
+
+def _field_type(owner, field_name: str):
+    """The annotated type of `owner.field_name` (a string, under this module's postponed
+    annotations), or None when `owner` is not a dataclass or has no such field."""
+    if owner is None or not is_dataclass(owner):
+        return None
+    return next((f.type for f in fields(owner) if f.name == field_name), None)
+
+
+def _override_value(section: str | None, field_name: str, value: str):
+    """An override's value: parsed as YAML, so `true`, `4.0` and `8` land typed — except for a
+    string-typed field, which takes the text as written. YAML would turn `2026-10-14` into a date
+    and cut `a #b` at the comment, and paths and dataset names are exactly what `--set` passes
+    when chaining stages. `null` (or nothing) still clears an optional string. A float-typed
+    field's value goes through float() when YAML leaves it a string: PyYAML is YAML 1.1, which
+    reads `1e-5` (no dot) as text, and `--set train.lr=1e-5` would otherwise put a str into
+    train.lr and fail only later, inside optimizer construction. `section` None is a top-level
+    Config field (run_name)."""
+    if section is None:
+        field_type = _field_type(Config, field_name)
+    else:
+        section_type = _field_type(Config, section)
+        section_cls = globals().get(section_type) if isinstance(section_type, str) else section_type
+        field_type = _field_type(section_cls, field_name)
+    if field_type in _STRING_FIELD_TYPES:
+        if field_type.endswith("None") and value.strip() in ("", "null", "~", "None"):
+            return None
+        return value
+    parsed = yaml.safe_load(value)
+    if field_type in _FLOAT_FIELD_TYPES and isinstance(parsed, str):
+        try:
+            return float(parsed)
+        except ValueError:
+            raise ValueError(f"--set {section + '.' if section else ''}{field_name} expects a number, got {value!r}")
+    return parsed
+
+
+def apply_overrides(raw: dict, assignments: list[str]) -> dict:
+    """Apply `section.field=value` assignments (`--set` on radiance-train / radiance-size) to a raw
+    config dict, or `field=value` for a top-level field such as run_name — which is what gives each
+    chained RLAIF round its own W&B run without editing the YAML. See _override_value for how each
+    value is typed."""
+    sections = {f.name for f in fields(Config) if is_dataclass(globals().get(f.type, f.type))}
+    for assignment in assignments:
+        if "=" not in assignment:
+            raise ValueError(f"--set expects dotted.key=value, got {assignment!r}")
+        key, _, value = assignment.partition("=")
+        section, _, field_name = key.strip().partition(".")
+        if not field_name:
+            if section in sections or _field_type(Config, section) is None:
+                raise ValueError(
+                    f"--set key must name a section field (e.g. model.d_model) or a top-level "
+                    f"field (e.g. run_name), got {key!r}"
+                )
+            raw[section] = _override_value(None, section, value)
+            continue
+        # `or {}`: a bare `sft:` line in the YAML loads as None, not as an empty section.
+        raw[section] = raw.get(section) or {}
+        raw[section][field_name] = _override_value(section, field_name, value)
+    return raw
+
+
+def load_config_with_overrides(path: str | None, assignments: list[str]) -> Config:
+    """load_config, with `--set` assignments applied to the raw YAML first.
+
+    Round-trips through the raw dict rather than poking an already-resolved Config so the overrides
+    go through load_config's own validation and resolution — a cross-field check (dtype/fp4_linear,
+    dataset/dataset_mix) or train.inherit_model_config would never see an attribute set afterwards.
+    A relative data.dataset_mix still resolves against the original config's directory.
+    """
+    if not assignments:
+        return load_config(path) if path else Config()
+    raw = {}
+    if path:
+        with open(path) as f:
+            raw = yaml.safe_load(f) or {}
+    raw = apply_overrides(raw, assignments)
+    return _config_from_raw(raw, Path(path).parent if path else Path("."))
+
+
 def _resolve_dataset_mix_path(mix_path: str, config_dir: Path) -> str:
     """Resolve a `data.dataset_mix` path against the config file's directory so the mix file can
     live next to the config (configs/dataset_mix.yaml) and be referenced by a bare filename."""
@@ -812,7 +1011,12 @@ def _resolve_dataset_mix_path(mix_path: str, config_dir: Path) -> str:
 def load_config(path: str) -> Config:
     with open(path) as f:
         raw = yaml.safe_load(f) or {}
+    return _config_from_raw(raw, Path(path).parent)
 
+
+def _config_from_raw(raw: dict, config_dir: Path) -> Config:
+    """load_config's body, on an already-parsed YAML dict; `config_dir` is what a relative
+    data.dataset_mix resolves against."""
     # Caught here rather than in `_apply_dtype_sugar` because only the raw YAML distinguishes
     # "fp4_linear was left at its default" from "fp4_linear: false was written down".
     if raw.get("train", {}).get("dtype") == "nvfp4" and raw.get("model", {}).get("fp4_linear") is False:
@@ -840,6 +1044,9 @@ def load_config(path: str) -> Config:
             "holds a single corpus and takes precedence, so the mix would be silently ignored."
         )
 
+    if raw.get("train", {}).get("inherit_model_config"):
+        raw = _inherit_model_config(raw)
+
     cfg = _apply_dtype_sugar(Config(
         run_name=raw.get("run_name", Config.run_name),
         data=DataConfig(**raw.get("data", {})),
@@ -853,5 +1060,5 @@ def load_config(path: str) -> Config:
     # Stored resolved so the data pipeline — which only sees cfg — can open it directly and the
     # checkpoint's embedded config is self-describing.
     if cfg.data.dataset_mix:
-        cfg.data.dataset_mix = _resolve_dataset_mix_path(cfg.data.dataset_mix, Path(path).parent)
+        cfg.data.dataset_mix = _resolve_dataset_mix_path(cfg.data.dataset_mix, config_dir)
     return cfg

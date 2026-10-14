@@ -90,3 +90,27 @@ def test_format_chat_messages_raises_on_empty_messages():
 
     with pytest.raises(ValueError, match="at least one message"):
         format_chat_messages([], cfg)
+
+
+def test_chat_prompt_ids_is_the_rlaif_prompt_under_the_checkpoints_template():
+    # generate --chat and serve prompt with the same ids radiance-rlaif samples and judges after,
+    # under whichever mode's prefixes the checkpoint's own config has on.
+    from transformers import AutoTokenizer
+
+    from radiance.sft_data import chat_prompt_ids, tokenize_chat_prompt
+
+    try:
+        tok = AutoTokenizer.from_pretrained("gpt2", local_files_only=True)
+    except OSError:
+        pytest.skip("gpt2 tokenizer not in the local HF cache")
+    messages = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hi"}]
+    for cfg, (user, assistant) in (
+        (Config(sft=SFTConfig(enabled=True)), (SFTConfig.user_prefix, SFTConfig.assistant_prefix)),
+        (Config(dpo=DPOConfig(enabled=True, user_prefix="\n\nQ: ", assistant_prefix="\n\nA: ")), ("\n\nQ: ", "\n\nA: ")),
+    ):
+        ids = chat_prompt_ids(messages, tok, cfg)
+        assert ids == tokenize_chat_prompt(messages, tok, user, assistant)[0]
+        assert ids[-1] != 220  # not the bare-space token tokenizing the text whole ends in
+        assert tok.decode(ids) == format_chat_messages(messages, cfg).rstrip(" ")
+    with pytest.raises(ValueError, match="sft.enabled|dpo.enabled"):
+        chat_prompt_ids(messages, tok, Config())
