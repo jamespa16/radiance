@@ -5,7 +5,7 @@ Every A/B run in this repo, and the methodology cautions that came out of them. 
 
 ## The core three
 
-A/B on `configs/tinystories.yaml` (400 steps, RTX 5090, `val/loss` at step 400), each changing one thing:
+A/B on `configs/old_tests/tinystories.yaml` (400 steps, RTX 5090, `val/loss` at step 400), each changing one thing:
 
 | change | baseline | with change |
 |---|---|---|
@@ -197,7 +197,7 @@ is where the trade could plausibly flip.
 
 ## Counterfactual routing and `moe_balance_signal` — negative, and the diagnostic is worth more than the A/B
 
-Arms off `configs/tinystories.yaml`'s shape with MoE (`n_layers: 6`, `loop_count: 1`, `n_experts: 8`,
+Arms off `configs/old_tests/tinystories.yaml`'s shape with MoE (`n_layers: 6`, `loop_count: 1`, `n_experts: 8`,
 `moe_top_k: 2`, batch 32 pinned, `auto_batch_size: false`, `lr: 1.0e-2`, `dropout: 0.0`), `val/loss` at 1500 steps:
 
 | arm | @1500 |
@@ -301,7 +301,7 @@ difference would otherwise hand them different batches.
 ## Throughput work
 
 Recorded separately from quality work, because it is supposed to change wall-clock and nothing else. A/B on
-`configs/tinystories.yaml`'s shape (400 steps, pinned `batch_size: 32`, `auto_batch_size: false`, `lr: 1.0e-2`,
+`configs/old_tests/tinystories.yaml`'s shape (400 steps, pinned `batch_size: 32`, `auto_batch_size: false`, `lr: 1.0e-2`,
 `dropout: 0.0`), single-pass loss + batched Muon vs the two-pass loss + per-parameter Muon:
 
 | | wall clock | `val/loss` @400 | reserved VRAM |

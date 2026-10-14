@@ -68,7 +68,7 @@ once someone configures it or training moves its weights. In practice that means
    under which the feature is a mathematical no-op; no configuration quantizes every hidden matmul to 4 bits and
    still produces bit-identical logits, so the inertness question doesn't arise. That puts it in `use_diff_attn`'s
    category structurally, and the cost argument then applies on top: FP4 measures **0.34x at `d_model: 256`**, so
-   defaulting it on would make `configs/tinystories.yaml` three times *slower*. Consequence for testing:
+   defaulting it on would make `configs/old_tests/tinystories.yaml` three times *slower*. Consequence for testing:
    `tests/test_inert_defaults.py`'s pattern does not apply, so the contract `tests/test_nvfp4.py` pins is
    *structural* — with the flag off, no `FP4Linear` exists anywhere in the tree.
 

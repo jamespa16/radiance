@@ -468,7 +468,7 @@ while making `dL/dp[t,e] = -weight * adv[t,e]`. Three properties fall out free. 
 other gradient including under fp16's `GradScaler`, because it *is* an ordinary gradient rather than a
 separately-scaled loss. `weight` has a natural unit — at `1.0` a probe's push is exactly as strong per unit of
 utility as the true gradient on a chosen expert's gate weight, which measured as 22% of the router's own gradient
-norm at `configs/tinystories.yaml`'s shape. And it is training-only, since a term that exists only to carry a
+norm at `configs/old_tests/tinystories.yaml`'s shape. And it is training-only, since a term that exists only to carry a
 gradient is pure overhead where there is no backward.
 
 **Verify the compiled behaviour, not just the eager behaviour, if this is ever changed**: a term that is identically

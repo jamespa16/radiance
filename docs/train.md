@@ -101,7 +101,7 @@ that builds its batches on the device.
 slicing `logits[:, :-1]`. The slice is a non-contiguous view whose `.contiguous()`/`.view()` forces a full copy of the
 `(batch, seq, vocab_size)` logits — the largest activation in the model — on every forward; shifting labels instead
 makes `logits.view(-1, vocab_size)` a free reshape over exactly the same targets. Worth ~7% of step time at
-`configs/tinystories.yaml`'s size.
+`configs/old_tests/tinystories.yaml`'s size.
 
 It returns `(lm_loss, z_loss)`: the second is the log-Z regulariser `mean(logsumexp(logits)^2)`
 (`cfg.model.z_loss_weight`, default `1e-4`), which keeps logit scale from drifting and matters more here than in a
@@ -122,7 +122,7 @@ model's *output*), which lets inductor fuse the whole thing into a single pass a
 ever materialising an fp32 copy.
 
 Measured standalone at batch 32 x seq 512 x vocab 50304, fwd+bwd: **22.7 ms and +8.2 GB** for the two-pass version,
-17.0 ms eager on the new path, **5.5 ms and +5.0 GB compiled**. End-to-end on `configs/tinystories.yaml` the step went
+17.0 ms eager on the new path, **5.5 ms and +5.0 GB compiled**. End-to-end on `configs/old_tests/tinystories.yaml` the step went
 **82.4 -> 37.5 ms and peak memory 22.5 -> 7.7 GB**. It is also *more* accurate: `F.cross_entropy` under autocast
 returned a bf16-rounded loss, so against an fp32 reference the compiled single-pass version is off by 2.5e-5 where
 the original was off by 3.4e-3.
@@ -304,7 +304,7 @@ needs the hub or a warm cache; the weights are written first, so a network failu
 
 `cfg.train.eval_max_batches` (default `50`) caps how many batches each `evaluate()` call consumes. Uncapped — the
 previous behavior, restored with `null` — every eval walks the *entire* validation split, which is unbounded for a
-streaming one and, at `configs/tinystories.yaml`'s settings, cost more wall-clock than all 1000 training steps
+streaming one and, at `configs/old_tests/tinystories.yaml`'s settings, cost more wall-clock than all 1000 training steps
 combined. A fixed batch count also keeps `val/loss` comparable across configs whose validation splits differ in size.
 
 `cfg.train.tokens_per_param` (opt-in, default `null`) derives `max_steps` from model size instead of pinning it:

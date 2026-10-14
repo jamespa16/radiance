@@ -49,7 +49,7 @@ generator, left for whenever `generate_until` throughput on those tasks is actua
 
 Wiring a task doesn't mean its score means anything at this repo's scale. Most of the commonly-cited
 suite — MMLU/MMLU-Pro, MATH, HumanEval, MBPP, IFEval, BBH — needs either instruction-tuned models or
-enough scale to be above chance; at the sizes trained here (`configs/tinystories.yaml`,
+enough scale to be above chance; at the sizes trained here (`configs/old_tests/tinystories.yaml`,
 `configs/fineweb_500m.yaml`) they score at or near chance/zero and don't discriminate between
 configs. The subset that actually moves and is worth A/Bing is short-context, 0-shot loglikelihood:
 **HellaSwag, PIQA, WinoGrande, ARC-Easy, ARC-Challenge, BoolQ, OpenBookQA, SIQA, CommonsenseQA**
@@ -60,7 +60,7 @@ larger — treat a nonzero score there as a real signal, not a zero score as a b
 
 **Check `model.max_seq_len` before picking tasks.** `_loglikelihood_tokens` truncates from the left
 when `context + continuation` overflows it (same as lm-eval's own `HFLM`), so a 5-shot MMLU prompt
-(1-2k tokens) against `configs/tinystories.yaml`'s `max_seq_len: 512` silently scores a mutilated
+(1-2k tokens) against `configs/old_tests/tinystories.yaml`'s `max_seq_len: 512` silently scores a mutilated
 prompt rather than erroring. The 0-shot tasks above have short enough contexts to fit comfortably at
 512-1024.
 

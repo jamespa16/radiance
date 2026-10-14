@@ -37,7 +37,7 @@ The arithmetic is per-parameter but issuing it per-parameter is what costs: Newt
 three matmuls, so a 42-tensor group is 630 matmuls, none large enough to saturate the GPU. A transformer has very few
 distinct weight shapes (one per projection role, repeated per layer), so stacking same-shaped updates into a leading
 batch dimension collapses that to 630 / (tensors per shape) launches. Momentum and weight decay use
-`torch._foreach_*` for the same reason, as does `_step_adamw`'s update. Measured on `configs/tinystories.yaml`:
+`torch._foreach_*` for the same reason, as does `_step_adamw`'s update. Measured on `configs/old_tests/tinystories.yaml`:
 optimizer step **8.2 -> 4.4 ms**, of which the Muon groups are 6.7 -> 3.8 and the AdamW groups 1.4 -> 0.6.
 
 This is a launch-overhead fix, so it pays where the tensors are small. It is numerically neutral, verified rather
@@ -178,7 +178,7 @@ silently stopped being an AdamW no-decay tensor: on the Muon path it became a **
 drives its singular values to 1 (a norm gain *is* its scale, so that erases the conditioning rather than refining
 it), and on the AdamW path it started being decayed toward zero from its 1.0 init. `configs/fineweb_500m.yaml` had 44
 gain banks in the Muon group. Nothing raises, nothing shows up as a dead parameter, and `loop_count: 1` configs are
-unaffected — which is why `configs/tinystories.yaml` never saw it and every looped config did.
+unaffected — which is why `configs/old_tests/tinystories.yaml` never saw it and every looped config did.
 
 **Measured, and it is a correctness fix rather than a quality win:** on a looped A/B (`d_model: 256`, `n_layers: 4`,
 `loop_count: 6`, batch 16 pinned, `lr: 1.0e-2`, 1000 steps) `val/loss` at step 1000 was **1.9581 gains-to-Muon vs
@@ -197,7 +197,7 @@ both hit this.
 The classification decision above left `lr` badly mistuned. Keeping `lr` fixed across the Muon switch preserved its
 *value* but silently changed its *job*: it was tuned when AdamW trained every tensor, and afterwards it governed only
 what Muon doesn't own — overwhelmingly the tied `token_emb`/`lm_head` matrix. At `3e-4` that embedding became the
-bottleneck of the whole model. Sweeping it on `configs/tinystories.yaml` (400 steps, batch pinned at 32,
+bottleneck of the whole model. Sweeping it on `configs/old_tests/tinystories.yaml` (400 steps, batch pinned at 32,
 `auto_batch_size: false`) gives a clean bowl with its minimum **30-100x above the old default**:
 
 | `train.lr` | 3e-4 (old default) | 1e-3 | 3e-3 | 1e-2 | 3e-2 | 1e-1 |

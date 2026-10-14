@@ -40,7 +40,7 @@ looping-with-conditioning against looping-without.
 
 ## Design
 
-Three arms off `configs/tinystories.yaml`'s reference shape (d_model 256, head_dim 64,
+Three arms off `configs/old_tests/tinystories.yaml`'s reference shape (d_model 256, head_dim 64,
 ffn_mult 4.0, ffn_depth 3, seq_len 512):
 
 | arm | `n_layers` | `loop_count` | executed blocks | params | FLOPs |
