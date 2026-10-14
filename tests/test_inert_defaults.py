@@ -108,3 +108,38 @@ def test_attn_out_gate_changes_output_once_weights_move(tiny_ids):
             torch.nn.init.normal_(block.attn.out_gate.weight, std=0.02)
         after = model(ids).logits
     assert (before - after).abs().max() > 1e-5
+
+
+_PROJECT_DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+
+
+@pytest.mark.parametrize("device", _PROJECT_DEVICES)
+@pytest.mark.parametrize("base", [8, 16])
+def test_mup_multiplier_on_lm_head_input_is_bit_identical(device, base):
+    """_project_logits applies a power-of-two muP multiplier to lm_head's input rather than to its
+    output. That is a throughput change and must be nothing else: logits and both gradients
+    (into the hidden state and into the tied weight) bit-identical to the logits-side multiply,
+    under bf16 autocast on CUDA as well as fp32 — the autocast cast and the bf16 output rounding
+    are where a non-power-of-two scale would stop commuting.
+
+    base 8 (d_model 32 -> mult 0.25) and 16 (0.5) are both powers of two; the non-power-of-two
+    case keeps the logits-side multiply and needs no test of its own."""
+    cfg = ModelConfig(d_model=32, head_dim=8, n_layers=3, ffn_mult=2.0, ffn_depth=1, dropout=0.0,
+                      max_seq_len=32, mup_base_d_model=base)
+    torch.manual_seed(0)
+    model = DenseTransformer(cfg, vocab_size=TINY_VOCAB).to(device)
+    assert model._mup_mult_exact_on_input
+    autocast = torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=device == "cuda")
+
+    def run(exact_on_input: bool):
+        model._mup_mult_exact_on_input = exact_on_input
+        model.zero_grad(set_to_none=True)
+        x = torch.randn(2, 16, cfg.d_model, device=device, generator=torch.Generator(device).manual_seed(5))
+        x.requires_grad_(True)
+        with autocast:
+            logits = model._project_logits(x)
+        logits.float().square().mean().backward()
+        return logits.detach(), x.grad, model.lm_head.weight.grad.clone()
+
+    for got, want in zip(run(True), run(False)):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)

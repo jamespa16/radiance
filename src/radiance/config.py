@@ -494,6 +494,12 @@ class TrainConfig:
     seed: int = 42
     device: str = "auto"
     compile: bool = True
+    compile_max_autotune: bool = False  # opt-in: compile with inductor's max-autotune, which
+    # benchmarks Triton GEMM templates against cuBLAS per shape and fuses SiLU/mul/cast epilogues
+    # into the winners. A throughput setting, not a model change — but not bit-identical either
+    # (a fused epilogue rounds once where cuBLAS-then-pointwise rounds twice), and it adds a
+    # minute or more of startup autotuning, so it is off by default and on where measured:
+    # configs/v2.yaml, -3.0% step time. See docs/train.md's resolve_compile_mode section.
     peak_tflops: float | None = None  # opt-in: the device's dense peak TFLOPS at the compute dtype,
     # for logging train/mfu. None (default) logs throughput but not MFU — a guessed peak would
     # make the ratio look authoritative when it isn't. See DenseTransformer.training_flops_per_token.

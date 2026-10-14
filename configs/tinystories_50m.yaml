@@ -78,6 +78,7 @@ train:
   output_dir: checkpoints/tinystories_50m
   seed: 42
   compile: true
+  compile_max_autotune: true  # +9.5% tok/s at this shape, quality-neutral (docs/results.md)
   dtype: bf16
 
 wandb:

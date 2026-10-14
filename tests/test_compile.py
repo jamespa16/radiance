@@ -215,6 +215,25 @@ def test_cuda_graphs_kept_when_nothing_rules_them_out(tiny_cfg):
     assert _mode(tiny_cfg, d_model=64, head_dim=16, doc_attention_mask=True, device_type="cpu") == "reduce-overhead"
 
 
+def test_max_autotune_maps_the_cuda_graph_decision_without_overriding_it(tiny_cfg):
+    """train.compile_max_autotune swaps in inductor's autotuning modes, and must keep whichever
+    CUDA-graph decision the run already got: "max-autotune" captures CUDA graphs exactly like
+    "reduce-overhead" does, so mapping a doc-masked run to it would bring the leak above back."""
+    from radiance.train import resolve_compile_mode
+
+    def mode(**overrides):
+        cfg = tiny_cfg()
+        cfg.train.compile = True
+        cfg.train.compile_max_autotune = True
+        for field, value in overrides.items():
+            setattr(cfg.model, field, value)
+        return resolve_compile_mode(DenseTransformer(cfg.model, vocab_size=TINY_VOCAB, eos_id=5), cfg, "cuda")
+
+    assert mode(d_model=64, head_dim=16, doc_attention_mask=True) == "max-autotune-no-cudagraphs"
+    assert mode(doc_attention_mask=False, grad_checkpoint=True) == "max-autotune-no-cudagraphs"
+    assert mode(doc_attention_mask=False) == "max-autotune"
+
+
 def test_compile_disabled_means_no_mode(tiny_cfg):
     from radiance.train import resolve_compile_mode
 

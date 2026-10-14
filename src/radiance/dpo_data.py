@@ -11,7 +11,7 @@ from transformers import PreTrainedTokenizerBase
 from radiance.config import Config, doc_mask_is_inert_for_dpo, resolve_device, resolve_dtype
 from radiance.model import load_transformer_from_checkpoint, sequence_logprob_sum
 
-from .data import split_off_eval
+from .data import pin_memory_for, split_off_eval
 from .sft_data import tokenize_sft_example
 
 # DPO (preference post-training): different packing strategy from SFT's above, deliberately.
@@ -402,6 +402,7 @@ def build_dpo_dataloaders(cfg: Config, tokenizer: PreTrainedTokenizerBase) -> tu
         prefetch_factor=cfg.data.prefetch_factor if cfg.data.num_workers > 0 else None,
         collate_fn=collate,
         drop_last=True,
+        pin_memory=pin_memory_for(cfg),
     )
 
     packed = _load_or_build_dpo_packed(cfg, tokenizer)

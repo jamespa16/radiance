@@ -379,6 +379,52 @@ tok/param@48h rather than the 13.8 recorded, and the compute-optimal shape at th
 plateau](#the-combination-and-the-iso-compute-controls-that-reversed-its-reading) and overtraining is deliberate — but the
 table argues the case more strongly than its numbers support.
 
+### Throughput pass, 2026-10-13
+
+Three changes, none of which changes the model. End-to-end through `radiance-train` on `configs/v2.yaml`'s exact
+shape (375M, batch 8 x ga 16, doc masking on), against synthetic pretokenized data with fineweb-like EOS density
+(mean document ~700 tokens), 80 steps per run, the six post-warmup 10-step tok/s readings per run:
+
+| | tok/s (two runs each, interleaved) | |
+|---|---|---|
+| `main` | 59.1k / 59.1k | |
+| `main` + pinned memory only | 60.1k / 60.1k | +1.7% |
+| this pass (all three) | 62.9k / 63.0k | **+6.6%** |
+
+Decomposed on a synthetic-batch step benchmark (minimum step over 10, interleaved arms; the two further rows are what
+was tried and dropped):
+
+| change | step | effect | exact? |
+|---|---|---|---|
+| muP output multiplier on `lm_head`'s input (power of two) | 2191 -> 2159 ms | -1.5% | bit-identical (eager; pinned by a test) |
+| `train.compile_max_autotune` | 2151 -> 2088 ms | -3.0% | rounding-level (fused epilogues) |
+| pinned DataLoader memory + `non_blocking` copy | (loop-only) | +1.7% tok/s | identical |
+| `set_to_none` grads between steps (no CUDA graphs) | 2165 -> 2172 ms | none | — |
+| compiled autograd | 2150 -> 2153 ms | none | — |
+| `coordinate_descent_tuning` on top of max-autotune | 2070 -> 2067 ms | noise | — |
+
+**Quality check for max-autotune**, the one change that is not bit-identical: `configs/tinystories_50m.yaml`,
+1500 steps, same seed, three runs per arm. Final `val/loss` default 1.6654 / 1.6643 / 1.6684 (mean 1.6660),
+autotune 1.6669 / 1.6676 / 1.6653 (mean 1.6666) — a 0.0006 difference inside a ~0.004 within-arm range, where the
+within-arm spread is pure compile nondeterminism (the compiled backward is not bit-reproducible run to run). The same
+runs measured **243k -> 266k tok/s (+9.5%)** at that shape, so the win is larger at small width, not smaller.
+
+Where the remaining time goes, profiled after the pass (one 16-micro-batch step): GEMMs ~71%, at ~202 TFLOPS against
+a measured ~230 TFLOPS bf16 ceiling; flex attention ~7%; Muon ~4.5%; fp32 gradient accumulation ~2.4%; the rest
+inductor-fused norms/RoPE/SiLU/bias-grad reductions. Levers measured and **not** taken, each with its reason:
+
+- **Micro-batch 16 x ga 8** (same effective batch): -3.0% step time, but peak allocated 28.3 GB on a 32 GB card that
+  also drives the desktop. `activation_memory_budget` brings it to 20.2 GB and spends the entire gain on recompute
+  at every budget tried (0.6-0.95). Worth taking on a dedicated card.
+- **Compiled Newton-Schulz**: 90 -> 72 ms per optimizer step (~0.8% end-to-end at ga 16), but it changes bf16
+  rounding inside the iteration — an optimizer change wanting its own A/B, not a throughput tweak.
+- **Varlen FlashAttention** in place of flex for doc masking: ~10% faster attention (0.42 vs 0.46 ms fwd+bwd per call)
+  = <1% of the step, and it needs a host sync per step to build `cu_seqlens`.
+
+**Methodology warning that cost an hour here.** This GPU also drives the desktop, and other sessions on the machine
+run their own jobs; a 17-core CPU job from one of them made unchanged code measure 54.4k instead of 59.1k tok/s and
+made max-autotune look 3% *slower*. See caution 8.
+
 ## Startup compile cost
 
 Measured on the first forward/backward with `mode=None` (`d_model: 256`, `n_layers: 4`, `loop_count: 6`, batch 8 x
@@ -584,6 +630,10 @@ So `cosine` stays the default. WSD's case remains operational (extendable runs, 
 7. **Benchmark the step, not a short run**, when judging a throughput change — at TinyStories size, 400 steps is
    mostly compile, data loading and eval. And decompose the step before judging: FP4's end-to-end number was
    dominated by an optimizer cost it never touched.
+8. **Check the host is quiet, and interleave.** The CPU launches every kernel, so CPU contention from an unrelated
+   process shows up as *GPU* step time: 54.4k vs 59.1k tok/s on identical code, and a real 3% win read as a 3% loss.
+   Check `uptime`/`top` and `nvidia-smi` before and after; alternate arms rather than running one then the other; and
+   for a small effect compare the *minimum* step time, which contention can only inflate.
 
 ### Historical note on wall-clock numbers
 
