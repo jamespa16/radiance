@@ -90,6 +90,7 @@ train:
   seed: 42
   device: auto
   compile: true
+  compile_max_autotune: true # -3.0% step time at this shape, quality-neutral (docs/results.md)
   dtype: bf16
   peak_tflops: 209.5 # RTX 5090 dense BF16 tensor peak (NVIDIA's published spec), for train/mfu
 

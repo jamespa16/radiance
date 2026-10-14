@@ -68,6 +68,33 @@ card fills up. There is no cheap runtime assertion for that, so what gets tested
 `"reduce-overhead"` control case matters as much as the three `None` cases: without it they would all pass against a
 function that returned `None` unconditionally, i.e. against "never use CUDA graphs at all" as an accidental fix.
 
+### `train.compile_max_autotune` (opt-in)
+
+Maps the decision above onto inductor's autotuning modes — `"reduce-overhead"` -> `"max-autotune"` (which captures
+CUDA graphs too), anything else -> `"max-autotune-no-cudagraphs"` — so it can never hand CUDA graphs back to a run
+the three rules above took them from; a fifth fast test pins that mapping. What it buys is per-shape GEMM autotuning
+against cuBLAS, and on the winners a fused epilogue: on `configs/v2.yaml` roughly 60% of GEMM time moves to Triton
+templates with the following SiLU/mul/cast folded in (`triton_tem_fused_mm_mul_silu_*`), saving a full read+write of
+each FFN activation. **-3.0% step time at V2's shape, +9.5% tok/s at `configs/tinystories_50m.yaml`'s**, and
+quality-neutral (see [results.md](results.md#throughput-pass-2026-10-13)).
+
+It stays off by default for two of [config.md](config.md)'s reasons: it costs time while inert — a minute or more of
+autotuning at startup, every process, which is most of a short run — and it is not bit-identical, since a fused
+epilogue rounds once where cuBLAS-then-pointwise rounds twice. It is on in the two configs where it was measured.
+**An earlier measurement read it as 3% *slower*.** That run shared the card's CPU with another process's 17-core CPU
+job; see the noise note in results.md before trusting any single wall-clock figure on this machine.
+
+## Feeding the GPU
+
+Every DataLoader is built with `pin_memory=True` on a CUDA run (`data.pin_memory_for`), and `split_micro_batch`
+copies with `non_blocking=True`. This is a throughput fix, not a style point: a copy out of *pageable* memory is
+synchronous on the host — it waits for every kernel already queued — so each micro-batch drained the CPU's launch
+lead, and the GPU then idled while the next forward's first kernels were issued. At V2's 16 micro-batches per step
+that is **59.15k -> 60.15k tok/s (+1.7%)** end-to-end on a quiet machine, measured as `main` plus only this change,
+interleaved. It is worth more when the host is busy: the first pair measured 54.4k -> 58.9k while another process
+held 17 CPU cores, which is a statement about contention rather than a number to carry. Invisible to any benchmark
+that builds its batches on the device.
+
 ## The loss
 
 `compute_loss` applies the causal-LM one-position shift to the *labels* (padding them with `ignore_index`), not by
@@ -105,6 +132,14 @@ vocab the logits are `196 x d_model` wide, so anything that walks them twice cos
 Expect the win to shrink as `d_model` grows — at `configs/fineweb_500m.yaml`'s `d_model: 1280` it is ~1.5% of step
 time and 15% of peak memory rather than 2.2x.
 
+The same logic applies to muP's output multiplier (`1 / mup_width_mult`, 0.25 on V1/V2). It used to scale the
+*logits*, which was a separate full read+write of the vocab-wide tensor in the forward and again in the backward —
+the model and the loss are separately compiled graphs, so nothing could fuse it into the loss's single pass.
+`_project_logits` now scales `lm_head`'s *input* instead whenever the multiplier is a power of two, where scaling
+commutes exactly with every rounding on the way (bf16 cast, fp32 partial sums, bf16 output): logits and both
+gradients are bit-identical (`test_mup_multiplier_on_lm_head_input_is_bit_identical`), for **-1.5% step time on
+V2**. A non-power-of-two multiplier keeps the logits-side multiply rather than change rounding.
+
 The training loss is `lm_loss + ponder_weight * ponder_cost + moe_aux_loss_weight * moe_aux_loss` (the latter two are
 zero unless their feature is on).
 
@@ -133,7 +168,10 @@ V1 logged six of them at exactly 0.0 for its whole run.
 alone and matches the differenced s/step benchmarks in [results.md](results.md). The first interval of a process is
 not reported — it is `torch.compile` warmup. MFU uses `DenseTransformer.training_flops_per_token`, the PaLM
 convention (6 per active parameter per token plus `12 * d_model * seq_len` per executed block, the loop body counted
-once per pass). On V2's shape it reads **57.1k tok/s, 68.9% MFU** against the 5090's 209.5 dense BF16 TFLOPS.
+once per pass). On V2's shape it read **57.1k tok/s, 68.9% MFU** against the 5090's 209.5 dense BF16 TFLOPS before
+the 2026-10-13 throughput pass, and **63.0k tok/s (~76% MFU)** after it, measured through `radiance-train` on
+synthetic pretokenized data where the pre-pass code reads 59.1k. The card boosts past its spec clock — a large
+bf16 GEMM measures ~230 TFLOPS — so read MFU against 209.5 as a relative number, not a fraction of a hard ceiling.
 
 At each eval: `val/loss`, `val/loss_stderr` (the spread of per-batch losses — two readings closer than a couple of
 these apart are the same number), and for pretraining with a byte-level BPE tokenizer `val/bits_per_byte`, which does

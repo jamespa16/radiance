@@ -136,7 +136,7 @@ def split_micro_batch(batch: dict, dpo: bool, sft: bool, device: str, micro_chun
         columns = ("input_ids", "loss_mask")
     else:
         columns = ("input_ids",)
-    chunked = {c: batch[c].to(device).split(micro_chunk_size, dim=0) for c in columns}
+    chunked = {c: batch[c].to(device, non_blocking=True).split(micro_chunk_size, dim=0) for c in columns}
     return [dict(zip(columns, rows)) for rows in zip(*chunked.values())]
 
 

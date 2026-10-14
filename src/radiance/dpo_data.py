@@ -13,6 +13,7 @@ from transformers import PreTrainedTokenizerBase
 from radiance.config import Config, doc_mask_is_inert_for_dpo, resolve_device, resolve_dtype
 from radiance.model import load_transformer_from_checkpoint, sequence_logprob_sum
 
+from .data import pin_memory_for
 from .sft_data import (
     RLAIF_MANIFEST_NAME,
     RLAIF_PROMPT_IDS_VERSION,
@@ -613,6 +614,7 @@ def build_dpo_dataloaders(
         prefetch_factor=cfg.data.prefetch_factor if cfg.data.num_workers > 0 else None,
         collate_fn=collate,
         drop_last=True,
+        pin_memory=pin_memory_for(cfg),
     )
 
     packed = _load_or_build_dpo_packed(cfg, tokenizer, pinned_reference)

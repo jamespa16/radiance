@@ -103,6 +103,7 @@ Only the fields you need to change — everything else falls back to the datacla
 - **`seed`** — random seed.
 - **`device`** — `"auto"` (CUDA > MPS > CPU), `"cuda"`, `"mps"`, or `"cpu"`.
 - **`compile`** — enable `torch.compile` on the model.
+- **`compile_max_autotune`** — compile with inductor's max-autotune (per-shape GEMM autotuning plus fused SiLU/mul/cast epilogues). Off by default: it adds a minute or more of startup and is not bit-identical. Measured -3.0% step time on `v2.yaml` and +9.5% tok/s on `tinystories_50m.yaml`, quality-neutral; never re-enables CUDA graphs for a run that rules them out.
 - **`dtype`** — precision: `"fp32"`, `"fp16"`, or `"bf16"`. Forward runs under `torch.autocast`; master weights and optimizer stay fp32. `GradScaler` is enabled only for `fp16`.
 
 ## sft

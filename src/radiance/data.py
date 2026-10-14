@@ -18,7 +18,7 @@ from tokenizers.pre_tokenizers import ByteLevel
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from radiance.config import Config, MixDatasetConfig
+from radiance.config import Config, MixDatasetConfig, resolve_device
 logger = logging.getLogger(__name__)
 
 
@@ -493,6 +493,19 @@ def _pretrain_collate(batch):
     return {"input_ids": input_ids}
 
 
+def pin_memory_for(cfg: Config) -> bool:
+    """Whether a DataLoader for this run should hand out page-locked batches.
+
+    Not a tuning knob — it is what lets the step loop's `.to(device, non_blocking=True)` (see
+    `split_micro_batch`) actually be asynchronous. A copy out of pageable memory is synchronous on
+    the host: the CPU waits for every kernel already queued on the stream before the copy runs, so
+    each micro-batch drained the CPU's launch lead and the GPU sat idle while the next forward's
+    first kernels were issued. Measured on configs/v2.yaml's shape (16 micro-batches per step):
+    +1.7% tok/s on a quiet machine, more when the host CPU is contended; data and arithmetic unchanged.
+    """
+    return resolve_device(cfg.train.device).startswith("cuda")
+
+
 def _dataloader_kwargs(cfg: Config) -> dict:
     return dict(
         num_workers=cfg.data.num_workers,
@@ -500,6 +513,7 @@ def _dataloader_kwargs(cfg: Config) -> dict:
         prefetch_factor=cfg.data.prefetch_factor if cfg.data.num_workers > 0 else None,
         collate_fn=_pretrain_collate,
         drop_last=True,
+        pin_memory=pin_memory_for(cfg),
     )
 
 

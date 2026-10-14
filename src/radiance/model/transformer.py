@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import math
 from typing import Any
 
 import torch
@@ -314,6 +315,10 @@ class DenseTransformer(nn.Module):
         # muP output multiplier: logits are scaled by 1/width_mult so their scale is invariant to
         # d_model. Exactly 1.0 (and skipped entirely in forward) unless cfg.mup_base_d_model is set.
         self.mup_output_mult = 1.0 / cfg.mup_width_mult
+        # Whether that multiply can move onto lm_head's *input* without changing a bit — see
+        # _project_logits. True for every power-of-two width ratio (configs/v1.yaml and v2.yaml's
+        # 1024 / 256 included).
+        self._mup_mult_exact_on_input = math.frexp(self.mup_output_mult)[0] == 0.5
 
         # Before _init_weights, so the swapped-in modules are the ones it initialises. FP4Linear
         # subclasses nn.Linear and the swap transplants the existing Parameter objects, so both
@@ -636,11 +641,22 @@ class DenseTransformer(nn.Module):
         The multiply is skipped rather than performed against 1.0 so a non-muP model's forward is
         bit-identical to one without this method — `logits * 1.0` is still a real kernel that
         rounds, and it would show up as a difference in the inert-default tests.
+
+        When the multiplier is a power of two it is applied to `x` (batch, seq, d_model) instead of
+        to the logits (batch, seq, vocab_size), which is the same arithmetic ~50x narrower. Scaling
+        by 2^k commutes exactly with every rounding on the way — the bf16 cast, each fp32 partial
+        sum, the bf16 output — so the logits and both gradients are bit-identical to the logits-side
+        multiply (pinned by tests/test_inert_defaults.py). It is worth ~1.5% of step time on
+        configs/v2.yaml: the logits-side version was a separate full read+write of the largest
+        tensor in the model in the forward and again in the backward, because the model and the
+        loss are compiled as separate graphs and nothing could fuse it. Any other multiplier keeps
+        the logits-side multiply, where moving it would change rounding.
         """
-        logits = self.lm_head(x)
-        if self.mup_output_mult != 1.0:
-            logits = logits * self.mup_output_mult
-        return logits
+        if self.mup_output_mult == 1.0:
+            return self.lm_head(x)
+        if self._mup_mult_exact_on_input:
+            return self.lm_head(x * self.mup_output_mult)
+        return self.lm_head(x) * self.mup_output_mult
 
     def _expand_streams(self, x: torch.Tensor) -> torch.Tensor:
         """(batch, seq, d_model) -> (batch, seq, n_streams, d_model), n identical copies.

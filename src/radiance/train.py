@@ -100,7 +100,11 @@ def build_lr_scheduler(optimizer: torch.optim.Optimizer, cfg: Config) -> LambdaL
 
 
 def resolve_compile_mode(raw_model: DenseTransformer, cfg: Config, device_type: str) -> str | None:
-    """Which torch.compile mode this run gets: "reduce-overhead" (CUDA graphs) or None.
+    """Which torch.compile mode this run gets: "reduce-overhead" (CUDA graphs) or None — or, under
+    cfg.train.compile_max_autotune, their autotuning counterparts "max-autotune" (which also
+    captures CUDA graphs) and "max-autotune-no-cudagraphs". The CUDA-graph decision below is made
+    first and the autotune flag only maps it, so nothing here can turn CUDA graphs back on for a
+    run that rules them out.
 
     mode="reduce-overhead" captures each graph as a CUDA graph sharing one memory pool, which
     assumes a *static* execution graph. Three independent things give that up:
@@ -134,7 +138,14 @@ def resolve_compile_mode(raw_model: DenseTransformer, cfg: Config, device_type: 
     """
     if not cfg.train.compile:
         return None
+    mode = _cuda_graph_mode(raw_model, cfg, device_type)
+    if cfg.train.compile_max_autotune:
+        return "max-autotune" if mode == "reduce-overhead" else "max-autotune-no-cudagraphs"
+    return mode
 
+
+def _cuda_graph_mode(raw_model: DenseTransformer, cfg: Config, device_type: str) -> str | None:
+    """resolve_compile_mode's CUDA-graph decision, before the autotune mapping."""
     stochastic_depth = cfg.model.loop_count_min is not None
     if stochastic_depth:
         # Stochastic loop depth means the Python `for` over the loop body runs a different number

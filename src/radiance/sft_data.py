@@ -10,7 +10,7 @@ from transformers import PreTrainedTokenizerBase
 
 from radiance.config import Config
 
-from .data import split_off_eval
+from .data import pin_memory_for, split_off_eval
 
 # SFT (post-training): same overall shape as the pretrain path (tokenize -> pack into fixed
 # seq_len blocks -> cache to disk -> collate), with two differences carried alongside input_ids at
@@ -401,6 +401,7 @@ def build_sft_dataloaders(cfg: Config, tokenizer: PreTrainedTokenizerBase) -> tu
         prefetch_factor=cfg.data.prefetch_factor if cfg.data.num_workers > 0 else None,
         collate_fn=collate,
         drop_last=True,
+        pin_memory=pin_memory_for(cfg),
     )
 
     packed = _load_or_build_sft_packed(cfg, tokenizer)
