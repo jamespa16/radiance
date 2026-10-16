@@ -30,6 +30,26 @@ radiance-train --config configs/post_training/dpo_rlaif.yaml \
 radiance-rlaif eval --checkpoint $SFT --checkpoint checkpoints/post_training/dpo_ultrafeedback/step_1000.pt
 ```
 
+**Or all of it in one command.** `radiance-posttrain` (`posttrain.py`) runs a stage list from
+`configs/post_training/pipeline.yaml`: each stage names a stage config above and the stage it starts `from`, and the
+pipeline supplies the `--set` hand-off (`train.init_from`, `train.output_dir: <output_dir>/<name>`,
+`run_name: <run_name>-<name>`, `train.resume_from: auto`, and for a stage with a `pairs:` block `dpo.dataset`) —
+so the stage configs are used unchanged. The shipped list is the first A/B under [Status](#status).
+
+```bash
+radiance-posttrain --config configs/post_training/pipeline.yaml --set base=$BASE --dry-run   # the plan
+radiance-posttrain --config configs/post_training/pipeline.yaml --set base=$BASE
+```
+
+Each step is its own `radiance-train`/`radiance-rlaif` subprocess, not a call into `train()`, so every stage starts
+with a clean CUDA allocator, no `torch.compile` caches holding the previous stage's graphs, and fresh W&B state.
+Re-running the same command continues: a stage with a checkpoint at its `max_steps` is skipped, an interrupted one
+resumes, and an RLAIF round whose `rlaif_manifest.json` exists is not resampled (a pairs directory without one is a
+crashed run, and is deleted and resampled). A stage that *ends* short of `max_steps` — `train()` stops early on an
+unrecoverable OOM — stops the pipeline, since the next stage would otherwise fine-tune from a half-trained checkpoint.
+`--set` routes by key: `base=`/`output_dir=`/`run_name=` set the pipeline's fields, `<stage>.section.field=value`
+overrides one stage, and anything else (`wandb.mode=offline`) every stage. `tests/test_posttrain.py`.
+
 Three pieces make that work without hand-editing:
 
 - **`radiance-train --set section.field=value`** — the same override syntax `radiance-size` already had (now shared as
