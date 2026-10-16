@@ -1,0 +1,58 @@
+# The whole post-training chain in one command:
+#
+#   radiance-posttrain --config configs/post_training/pipelines/default.yaml --set base=<annealed V2 base.pt>
+#   radiance-posttrain --config configs/post_training/pipelines/default.yaml --set base=... --dry-run   # the plan
+#
+# Each stage names one of the ordinary stage configs (paths relative to this file, so ../) and the stage
+# whose final checkpoint it starts `from` (`base` for the first). The pipeline fills in each stage's
+# train.init_from, train.output_dir (<output_dir>/<name>), run_name (<run_name>-<name>) and
+# resume_from: auto, so the stage configs are used unchanged. A stage with a `pairs:` block is an
+# on-policy RLAIF round: `radiance-rlaif pairs` (those flags) from its starting policy, then DPO on
+# the result. Re-run the same command after an interruption: finished stages are skipped, an
+# interrupted one resumes. A stage whose inputs changed since it ran (overrides, base, upstream
+# checkpoint, pairs flags) is refused instead; delete its directory to retrain it.
+#
+# `--set` on the command line: `base=`/`output_dir=`/`run_name=` set the fields below;
+# `<stage>.section.field=value` (three parts) overrides one stage (`--set sft.train.max_steps=100`);
+# anything else goes to every stage (`--set wandb.mode=offline`, `--set sft.seq_len=1024`).
+#
+# The stage list below is the first A/B docs/post-training.md proposes: SFT alone vs. offline DPO on
+# UltraFeedback vs. one on-policy RLAIF round over the same prompt pool, all from the same SFT
+# checkpoint, judged against SFT at the end. Delete stages to run less; uncomment to run more.
+
+base: null # --set base=<annealed base checkpoint>
+output_dir: checkpoints/post_training
+run_name: post-training
+set: [] # overrides every stage gets, e.g. ["wandb.mode=offline"]
+
+stages:
+  - name: sft
+    config: ../sft.yaml
+    from: base
+
+  - name: dpo_ultrafeedback
+    config: ../dpo_ultrafeedback.yaml
+    from: sft
+
+  # - name: dpo_hh_rlhf
+  #   config: ../dpo_hh_rlhf.yaml
+  #   from: sft
+
+  - name: rlaif_round1
+    config: ../dpo_rlaif.yaml
+    from: sft
+    pairs: # radiance-rlaif pairs flags (underscores for dashes)
+      prompts: HuggingFaceH4/ultrafeedback_binarized
+      split: train_prefs
+      max_prompts: 8000
+
+  # A second round starts from the first round's policy; a different seed draws different prompts.
+  # - name: rlaif_round2
+  #   config: ../dpo_rlaif.yaml
+  #   from: rlaif_round1
+  #   pairs: {prompts: HuggingFaceH4/ultrafeedback_binarized, split: train_prefs, max_prompts: 8000, seed: 1}
+
+eval: # radiance-rlaif eval: mean judge reward + win rate of each `compare` stage against `baseline`
+  baseline: sft
+  compare: [dpo_ultrafeedback, rlaif_round1]
+  args: {} # radiance-rlaif eval flags, e.g. {judge: OpenAssistant/reward-model-deberta-v3-large-v2}

@@ -81,6 +81,7 @@ radiance-train --config configs/post_training/sft.yaml --set train.init_from=<ba
 radiance-train --config configs/post_training/dpo_ultrafeedback.yaml --set train.init_from=<sft.pt>
 radiance-rlaif pairs --checkpoint <policy.pt> --output data/rlaif/round1      # on-policy RLAIF round
 radiance-rlaif eval --checkpoint <sft.pt> --checkpoint <dpo.pt>              # judge reward + win rate
+radiance-posttrain --config configs/post_training/pipelines/default.yaml --set base=<base.pt>   # the whole chain
 ```
 
 `--set section.field=value` overrides a config on the command line (as on `radiance-size`), which is how one stage's
@@ -88,7 +89,9 @@ checkpoint is handed to the next. The stage configs set `train.inherit_model_con
 base's `model:` block, and `dpo.reference_checkpoint` defaults to `train.init_from`. `radiance-rlaif` samples from
 the policy, scores with a public reward model (default `Skywork/Skywork-Reward-V2-Qwen3-0.6B`) and writes best-vs-worst
 pairs for DPO — iterated on-policy DPO rather than PPO, so one model is resident at a time. **Nothing post-training
-has a quality A/B yet**; see [docs/post-training.md](docs/post-training.md). Entry point: `radiance.rlaif:main`.
+has a quality A/B yet**; see [docs/post-training.md](docs/post-training.md). `radiance-posttrain` runs a stage list
+(`configs/post_training/pipelines/default.yaml`) end to end, skipping finished stages on a re-run. Entry points:
+`radiance.rlaif:main`, `radiance.posttrain:main`.
 
 ## Running inference
 
@@ -242,6 +245,8 @@ only the model package imports. `model/` and `nvfp4/` are packages whose `__init
 - **`export.py`** — checkpoint -> safetensors + `config.json` export (`radiance-export`) and its inverse `load_export`.
 - **`rlaif.py`** — `radiance-rlaif`: on-policy preference pairs from a policy + public reward model, and
   judge-scored checkpoint comparison.
+- **`posttrain.py`** — `radiance-posttrain`: runs a pipeline YAML's stages (SFT, DPO, RLAIF rounds, judge eval) as
+  `radiance-train`/`radiance-rlaif` subprocesses, wiring each stage's checkpoint into the next.
 - **`eval_harness.py`** — an lm-evaluation-harness `LM` backend (`RadianceLM`) plus the `radiance-eval` CLI; runs
   standard benchmarks in-process against a loaded checkpoint. `eval` dependency group, not core.
 

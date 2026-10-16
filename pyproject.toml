@@ -37,6 +37,7 @@ radiance-size = "radiance.size:main"
 radiance-export = "radiance.export:main"
 radiance-pretokenize = "radiance.pretokenize:main"
 radiance-rlaif = "radiance.rlaif:main"
+radiance-posttrain = "radiance.posttrain:main"
 
 [build-system]
 requires = ["setuptools>=68"]

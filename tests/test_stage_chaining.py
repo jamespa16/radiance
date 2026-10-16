@@ -111,6 +111,7 @@ def test_inherit_requires_init_from(tmp_path):
         load_config(_write(tmp_path, {"train": {"inherit_model_config": True}}))
 
 
+# Only the top level: pipelines/ holds radiance-posttrain stage lists (tests/test_posttrain.py).
 _STAGES = sorted((Path(__file__).parent.parent / "configs" / "post_training").glob("*.yaml"))
 
 
