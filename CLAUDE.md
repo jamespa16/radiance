@@ -81,7 +81,7 @@ radiance-train --config configs/post_training/sft.yaml --set train.init_from=<ba
 radiance-train --config configs/post_training/dpo_ultrafeedback.yaml --set train.init_from=<sft.pt>
 radiance-rlaif pairs --checkpoint <policy.pt> --output data/rlaif/round1      # on-policy RLAIF round
 radiance-rlaif eval --checkpoint <sft.pt> --checkpoint <dpo.pt>              # judge reward + win rate
-radiance-posttrain --config configs/post_training/pipeline.yaml --set base=<base.pt>   # the whole chain
+radiance-posttrain --config configs/post_training/pipelines/default.yaml --set base=<base.pt>   # the whole chain
 ```
 
 `--set section.field=value` overrides a config on the command line (as on `radiance-size`), which is how one stage's
@@ -90,7 +90,7 @@ base's `model:` block, and `dpo.reference_checkpoint` defaults to `train.init_fr
 the policy, scores with a public reward model (default `Skywork/Skywork-Reward-V2-Qwen3-0.6B`) and writes best-vs-worst
 pairs for DPO — iterated on-policy DPO rather than PPO, so one model is resident at a time. **Nothing post-training
 has a quality A/B yet**; see [docs/post-training.md](docs/post-training.md). `radiance-posttrain` runs a stage list
-(`configs/post_training/pipeline.yaml`) end to end, skipping finished stages on a re-run. Entry points:
+(`configs/post_training/pipelines/default.yaml`) end to end, skipping finished stages on a re-run. Entry points:
 `radiance.rlaif:main`, `radiance.posttrain:main`.
 
 ## Running inference

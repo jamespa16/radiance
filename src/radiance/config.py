@@ -983,6 +983,13 @@ def apply_overrides(raw: dict, assignments: list[str]) -> dict:
                 )
             raw[section] = _override_value(None, section, value)
             continue
+        # Checked here because nothing downstream would: _config_from_raw never reads a section
+        # it doesn't know, so `--set trian.lr=...` was silently dropped.
+        if section not in sections:
+            raise ValueError(f"--set {key!r}: unknown section {section!r}; expected one of {sorted(sections)}")
+        section_type = _field_type(Config, section)
+        if _field_type(globals().get(section_type, section_type), field_name) is None:
+            raise ValueError(f"--set {key!r}: {section} has no field {field_name!r}")
         # `or {}`: a bare `sft:` line in the YAML loads as None, not as an empty section.
         raw[section] = raw.get(section) or {}
         raw[section][field_name] = _override_value(section, field_name, value)

@@ -31,24 +31,37 @@ radiance-rlaif eval --checkpoint $SFT --checkpoint checkpoints/post_training/dpo
 ```
 
 **Or all of it in one command.** `radiance-posttrain` (`posttrain.py`) runs a stage list from
-`configs/post_training/pipeline.yaml`: each stage names a stage config above and the stage it starts `from`, and the
+`configs/post_training/pipelines/default.yaml`: each stage names a stage config above and the stage it starts `from`, and the
 pipeline supplies the `--set` hand-off (`train.init_from`, `train.output_dir: <output_dir>/<name>`,
 `run_name: <run_name>-<name>`, `train.resume_from: auto`, and for a stage with a `pairs:` block `dpo.dataset`) —
 so the stage configs are used unchanged. The shipped list is the first A/B under [Status](#status).
 
 ```bash
-radiance-posttrain --config configs/post_training/pipeline.yaml --set base=$BASE --dry-run   # the plan
-radiance-posttrain --config configs/post_training/pipeline.yaml --set base=$BASE
+radiance-posttrain --config configs/post_training/pipelines/default.yaml --set base=$BASE --dry-run   # the plan
+radiance-posttrain --config configs/post_training/pipelines/default.yaml --set base=$BASE
 ```
 
 Each step is its own `radiance-train`/`radiance-rlaif` subprocess, not a call into `train()`, so every stage starts
 with a clean CUDA allocator, no `torch.compile` caches holding the previous stage's graphs, and fresh W&B state.
-Re-running the same command continues: a stage with a checkpoint at its `max_steps` is skipped, an interrupted one
-resumes, and an RLAIF round whose `rlaif_manifest.json` exists is not resampled (a pairs directory without one is a
-crashed run, and is deleted and resampled). A stage that *ends* short of `max_steps` — `train()` stops early on an
+Re-running the same command continues: a stage whose latest checkpoint reached the `max_steps` *recorded in that
+checkpoint* is skipped (so a `train.tokens_per_param`-derived count is the one compared, not the YAML's), an
+interrupted one resumes, and an RLAIF round whose `rlaif_manifest.json` exists is not resampled (a pairs directory
+without one is a crashed run, and is deleted and resampled). A stage that *ends* short — `train()` stops early on an
 unrecoverable OOM — stops the pipeline, since the next stage would otherwise fine-tune from a half-trained checkpoint.
-`--set` routes by key: `base=`/`output_dir=`/`run_name=` set the pipeline's fields, `<stage>.section.field=value`
-overrides one stage, and anything else (`wandb.mode=offline`) every stage. `tests/test_posttrain.py`.
+
+Continuing is only right while the inputs are the same, so each stage directory gets a `posttrain_inputs.json`: the
+resolved config (minus `wandb` and `run_name`), the path/size/mtime of the checkpoint it started from, and its
+`pairs` flags. A re-run that differs refuses the stage and names the differing fields, rather than resuming a smoke
+run's `--set sft.train.max_steps=100` optimizer state as the full run, or handing back stages trained from an old
+base. Retraining a stage changes its checkpoint's mtime, so every stage downstream of it is refused the same way;
+delete those directories (or use a fresh `output_dir`) to retrain them. The eval re-scores automatically instead,
+whenever the checkpoints or args it would use differ from `eval_inputs.json`.
+
+`--set` routes by the key's depth (a Config key never has more than two components): `base=`/`output_dir=`/`run_name=`
+set the pipeline's fields, three components `<stage>.section.field=value` override one stage, and anything else
+(`wandb.mode=offline`, `sft.seq_len=1024` — the `sft` *section*, despite the stage of that name) every stage. Every
+override and `pairs:`/`eval.args` flag is validated when the pipeline loads, not when its stage starts.
+Pipelines live in `configs/post_training/pipelines/`, stage paths relative to the pipeline file. `tests/test_posttrain.py`.
 
 Three pieces make that work without hand-editing:
 

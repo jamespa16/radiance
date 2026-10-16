@@ -503,7 +503,9 @@ def _add_shared_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--seed", type=int, default=0)
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """radiance-rlaif's CLI; radiance-posttrain parses a pipeline's `pairs:`/`eval.args` flags
+    through it at load time, so a typo fails before the first stage trains rather than after."""
     parser = argparse.ArgumentParser(description="On-policy RLAIF preference data and judge-scored evaluation.")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -519,7 +521,11 @@ def main() -> None:
     ev.add_argument("--output", default=None, help="optional JSON report path")
     _add_shared_args(ev)
     ev.set_defaults(split="test_prefs", max_prompts=500)
+    return parser
 
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
     if args.command == "pairs":
         if args.num_samples < 2:
