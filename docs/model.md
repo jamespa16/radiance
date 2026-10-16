@@ -26,7 +26,7 @@ d_model)`, so it drops into `DenseTransformer` without touching the rest of the 
 
 ## Structure
 
-`DenseTransformer`: token + learned positional embeddings, `n_layers` pre-norm `TransformerBlock`s, final LayerNorm,
+`DenseTransformer`: token embeddings with RoPE in attention, `n_layers` pre-norm `TransformerBlock`s, final RMSNorm,
 weight-tied LM head. Each block is `CausalSelfAttention` (`F.scaled_dot_product_attention` with `is_causal=True`, no
 manual mask construction) followed by `FeedForward`.
 

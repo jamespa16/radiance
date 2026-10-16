@@ -225,8 +225,8 @@ only the model package imports. `model/` and `nvfp4/` are packages whose `__init
 - **`data.py`** — tokenizer, dataloaders, causal-LM packing, streaming, disk cache. The SFT pipeline (chat
   formatting/packing, `format_chat_prompt`) is in **`sft_data.py`**; the DPO pipeline (pair packing, reference
   logprobs) is in **`dpo_data.py`**.
-- **`model/`** — `DenseTransformer` (`transformer.py`): token + learned positional embeddings, a stack of pre-norm
-  `TransformerBlock`s (`block.py`), final LayerNorm, weight-tied LM head. `blocks[0]` runs once; `blocks[1:]` is a
+- **`model/`** — `DenseTransformer` (`transformer.py`): token embeddings with RoPE in attention, a stack of pre-norm
+  `TransformerBlock`s (`block.py`), final RMSNorm, weight-tied LM head. `blocks[0]` runs once; `blocks[1:]` is a
   **shared-weight loop body** re-run a fixed or learned number of times per forward, which is the central
   architectural idea here and what most features exist to support. Shared dataclasses (`ModelOutput`, `LoopContext`)
   in `core.py`, attention + KV cache in `attention.py`, document masking in `masking.py`, dense/MoE feed-forward in
