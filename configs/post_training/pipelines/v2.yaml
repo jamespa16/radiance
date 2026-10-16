@@ -1,0 +1,49 @@
+# Post-training for Radiance V2: the default.yaml chain, pinned to V2's finished base.
+#
+#   radiance-posttrain --config configs/post_training/pipelines/v2.yaml --dry-run   # the plan
+#   radiance-posttrain --config configs/post_training/pipelines/v2.yaml
+#
+# The base is V2's final checkpoint. Under lr_schedule: wsd (wsd_decay_ratio 0.3) the main run's
+# last step is the end of its decay, so it is already annealed: no --decay-from branch needed. To
+# post-train an earlier branch instead, pass --set base=checkpoints/v2/decay_from_<N>/step_<M>.pt
+# with a fresh --set output_dir=...; with this output_dir, every stage would be refused as stale.
+#
+# The stages and their order are default.yaml's: SFT, then offline DPO on UltraFeedback against one
+# on-policy RLAIF round over the same prompt pool, both from SFT, judged against SFT. That is the
+# first A/B docs/post-training.md proposes. The stage configs' learning rates and step counts are
+# starting points, not measurements (docs/post-training.md); nothing post-training is swept at
+# this scale yet. Check the SFT stage's val/loss curve before reading anything into the DPO results.
+
+base: checkpoints/v2/step_68688.pt
+output_dir: checkpoints/post_training/v2
+run_name: post-training-v2
+set: []
+
+stages:
+  - name: sft
+    config: ../sft.yaml
+    from: base
+
+  - name: dpo_ultrafeedback
+    config: ../dpo_ultrafeedback.yaml
+    from: sft
+
+  - name: rlaif_round1
+    config: ../dpo_rlaif.yaml
+    from: sft
+    pairs:
+      prompts: HuggingFaceH4/ultrafeedback_binarized
+      split: train_prefs
+      max_prompts: 8000
+
+  # A second round starts from the first round's policy; a different seed draws different prompts.
+  # Uncomment it (and add it to eval.compare) once round 1 beats SFT.
+  # - name: rlaif_round2
+  #   config: ../dpo_rlaif.yaml
+  #   from: rlaif_round1
+  #   pairs: {prompts: HuggingFaceH4/ultrafeedback_binarized, split: train_prefs, max_prompts: 8000, seed: 1}
+
+eval:
+  baseline: sft
+  compare: [dpo_ultrafeedback, rlaif_round1]
+  args: {}

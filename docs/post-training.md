@@ -41,6 +41,9 @@ radiance-posttrain --config configs/post_training/pipelines/default.yaml --set b
 radiance-posttrain --config configs/post_training/pipelines/default.yaml --set base=$BASE
 ```
 
+`pipelines/v2.yaml` is the same chain with `base` pinned to V2's final checkpoint (`checkpoints/v2/step_68688.pt`,
+annealed by WSD's own decay) and its own `output_dir`, so it needs no `--set`.
+
 Each step is its own `radiance-train`/`radiance-rlaif` subprocess, not a call into `train()`, so every stage starts
 with a clean CUDA allocator, no `torch.compile` caches holding the previous stage's graphs, and fresh W&B state.
 Re-running the same command continues: a stage whose latest checkpoint reached the `max_steps` *recorded in that
