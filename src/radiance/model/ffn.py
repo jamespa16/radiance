@@ -208,12 +208,6 @@ class MoEFeedForward(nn.Module):
         self.register_buffer("expert_bias", torch.zeros(cfg.n_experts), persistent=True)
         self.register_buffer("expert_load", torch.zeros(cfg.n_experts), persistent=False)
 
-        self.aux_loss_accum: torch.Tensor | None = None
-        self._aux_loss_calls = 0
-        # False between DenseTransformer collecting the aux loss and the next forward's reset —
-        # which is exactly when grad_checkpoint re-runs this forward during backward. See
-        # seal_aux_loss.
-        self._accumulating = True
         self._register_load_state_dict_pre_hook(self._upgrade_legacy_expert_keys, with_module=False)
 
     def _upgrade_legacy_expert_keys(self, state_dict, prefix, *args) -> None:
@@ -249,26 +243,24 @@ class MoEFeedForward(nn.Module):
         counts in full."""
         return sum(p.numel() for p in self.experts.parameters()) // self.cfg.n_experts
 
-    def reset_aux_loss(self) -> None:
-        self.aux_loss_accum = None
-        self._aux_loss_calls = 0
-        self._accumulating = True
-
-    def seal_aux_loss(self) -> None:
-        """Stop storing balance stats until the next reset_aux_loss().
-
-        grad_checkpoint re-runs this forward during backward to recompute activations. Unsealed,
-        that re-run appended a second aux term whose graph reached back through the recomputed
-        block, pinning every block's recomputed activations until the next forward — ~11GB at a
-        1.4B-total MoE, batch 8 x 1024, which is most of what checkpointing exists to free. It
-        also counted every token into expert_load twice.
-
-        Sealing gates only the *stores*, never the computation: non-reentrant checkpoint matches
-        recomputed saved tensors to the original ones by position, so the re-run must execute the
-        same ops in the same order or every later tensor is unpacked into the wrong slot."""
-        self._accumulating = False
-
     def forward(self, x: torch.Tensor, variant: int = 0) -> torch.Tensor:
+        """The layer's output alone, for callers outside DenseTransformer's forward (tests,
+        standalone use). The model calls forward_with_stats, via run_ffn."""
+        return self.forward_with_stats(x, variant)[0]
+
+    def forward_with_stats(
+        self, x: torch.Tensor, variant: int = 0
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns (output, aux_loss, load): this call's Switch load-balancing term and its
+        per-expert load under cfg.moe_balance_signal, for DenseTransformer to aggregate.
+
+        Returned rather than accumulated onto the module because this forward runs inside
+        torch.utils.checkpoint under grad_checkpoint, and must have no side effects there. A
+        mutation of module state inside the checkpointed region (1) makes torch.compile refuse to
+        trace it — the whole block falls back to eager, ~2x slower at a 1.4B-total MoE — and (2)
+        is replayed when eager checkpointing recomputes the block during backward: a re-appended
+        aux term whose graph pinned every recomputed activation until the next forward (~11GB at
+        batch 8 x 1024), and every token counted into expert_load twice."""
         orig_shape = x.shape
         d_model = orig_shape[-1]
         flat_x = x.reshape(-1, d_model)
@@ -286,27 +278,19 @@ class MoEFeedForward(nn.Module):
         weight = probs.new_zeros(n_tokens, self.cfg.n_experts).scatter_(1, topk_idx, topk_probs)
 
         assigned = weight > 0  # (n_tokens, n_experts)
-        if self._bias_balancing and self.training:
-            # Accumulated here, consumed by update_expert_bias() after the optimizer step — outside
-            # the compiled graph, so no graph break in the forward.
-            #
-            # cfg.moe_balance_signal picks *what* is being balanced. "count" is one per routed
-            # token; "weight" is that token's gate weight, i.e. how much of its FFN output this
-            # expert actually supplies. The two differ whenever an expert is selected often but
-            # weakly, and "weight" is the better proxy for the thing the bias exists to prevent —
-            # an expert starved of gradient — because the gradient reaching an expert's weights
-            # scales with the gate weight it was applied at, not with how many tokens listed it.
-            # Both are pre-drop, matching each other and the previous behaviour.
-            signal = assigned if self.cfg.moe_balance_signal == "count" else weight
-            load = signal.detach().sum(dim=0).float()
-            if self._accumulating:
-                self.expert_load += load
+        # Consumed by record_load() and then update_expert_bias() after the optimizer step.
+        #
+        # cfg.moe_balance_signal picks *what* is being balanced. "count" is one per routed token;
+        # "weight" is that token's gate weight, i.e. how much of its FFN output this expert actually
+        # supplies. The two differ whenever an expert is selected often but weakly, and "weight" is
+        # the better proxy for the thing the bias exists to prevent — an expert starved of
+        # gradient — because the gradient reaching an expert's weights scales with the gate weight
+        # it was applied at, not with how many tokens listed it. Both are pre-drop.
+        signal = assigned if self.cfg.moe_balance_signal == "count" else weight
+        load = signal.detach().sum(dim=0).float()
         f_i = assigned.float().mean(dim=0).detach()  # fraction of tokens routed to expert i (non-diff)
         p_i = probs.mean(dim=0)  # mean full-softmax prob mass on expert i (differentiable)
         aux_loss = self.cfg.n_experts * (f_i * p_i).sum()
-        if self._accumulating:  # computed regardless — see seal_aux_loss
-            self.aux_loss_accum = aux_loss if self.aux_loss_accum is None else self.aux_loss_accum + aux_loss
-            self._aux_loss_calls += 1
 
         # Outside training, size capacity to the real load so nothing is dropped — see _moe_capacity.
         full_capacity = self.cfg.moe_eval_full_capacity and not self.training
@@ -341,7 +325,12 @@ class MoEFeedForward(nn.Module):
         # including the discarded ones, which is what the counterfactual signal reads.
         probe_out = self.experts(gathered)
         expert_out = probe_out * valid.unsqueeze(-1).to(x.dtype)
-        w = (weight.t().gather(1, token_idx) * valid.to(weight.dtype)).to(x.dtype)
+        # No `* valid`: `weight` is zero wherever a token isn't assigned, so the gathered padding
+        # rows are already exactly zero (and capacity-dropped tokens never enter token_idx). The
+        # redundant mask also tripped an Inductor codegen bug (torch 2.13: a reduction-loop
+        # temporary used after its loop, "NameError: tmpN is not defined") once grad_checkpoint
+        # fused this forward's recompute into the backward.
+        w = weight.t().gather(1, token_idx).to(x.dtype)
 
         # index_add, not index_copy: a token can receive nonzero contributions from more than one
         # expert (top_k >= 2 by default), and even at top_k=1 one expert's zero capacity-padding can
@@ -358,7 +347,14 @@ class MoEFeedForward(nn.Module):
         if self.shared_expert is not None:
             # Unconditional, ungated, no capacity limit: every token gets this.
             delta = delta + self.shared_expert(flat_x)
-        return delta.view(orig_shape)
+        return delta.view(orig_shape), aux_loss, load
+
+    @torch.no_grad()
+    def record_load(self, load: torch.Tensor) -> None:
+        """Add one call's `load` (from forward_with_stats) to the counter update_expert_bias()
+        reads. Only while training under bias balancing: eval traffic must not steer routing."""
+        if self._bias_balancing and self.training:
+            self.expert_load += load
 
     @property
     def _bias_balancing(self) -> bool:
@@ -456,3 +452,15 @@ class MoEFeedForward(nn.Module):
         mean_load = self.expert_load.mean()
         self.expert_bias -= self.cfg.moe_bias_update_rate * torch.sign(self.expert_load - mean_load)
         self.expert_load.zero_()
+
+
+def run_ffn(
+    ffn: FeedForward | MoEFeedForward, h: torch.Tensor, variant: int = 0
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+    """Call either FFN kind, returning (output, moe_stats): moe_stats is MoEFeedForward's
+    (aux_loss, load), or None for a dense FeedForward. Every FFN call inside DenseTransformer goes
+    through here so the stats travel out as return values — see MoEFeedForward.forward_with_stats."""
+    if isinstance(ffn, MoEFeedForward):
+        out, aux_loss, load = ffn.forward_with_stats(h, variant)
+        return out, (aux_loss, load)
+    return ffn(h, variant), None

@@ -40,7 +40,7 @@ def _kv_by_block(model, x, cos, sin, frozen, iterations=2):
             kv_dim = block.attn.n_kv_heads * block.attn.head_dim
             _, k, v = qkv.split([d_model, kv_dim, kv_dim], dim=-1)
             records[(iteration, index)] = (k.detach().clone(), v.detach().clone())
-            h, _, _ = block(h, cos, sin, LoopContext(iteration=iteration))
+            h, _, _, _ = block(h, cos, sin, LoopContext(iteration=iteration))
         # The ACT freeze: halted positions keep their state, still-running ones advance.
         state = torch.where(frozen.unsqueeze(-1), state, h)
     return records
@@ -56,7 +56,7 @@ def _setup(n_layers=4):
     ids = torch.randint(0, TINY_VOCAB, (1, 12), generator=torch.Generator().manual_seed(1))
     x = model.token_emb(ids)
     cos, sin = model.rope(12)
-    x, _, _ = model.blocks[0](x, cos, sin, LoopContext())
+    x, _, _, _ = model.blocks[0](x, cos, sin, LoopContext())
     return model, x, cos, sin
 
 

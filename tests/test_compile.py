@@ -35,6 +35,15 @@ to discover:
     and split-provenance inputs, not an unlowerable data-dependent tensor). Plain attention is
     unaffected: it only ever issues one flex_attention call per layer.
 
+  * grad_checkpoint + MoE: MoEFeedForward used to accumulate its aux loss and expert load onto the
+    module. That mutation inside torch.utils.checkpoint made dynamo refuse to trace the region
+    ("Mutating a variable from outside the scope of this HOP") and run every checkpointed block
+    eagerly — no error, ~2x slower end to end at a 1.4B-total MoE. Once the stats became return
+    values and the block compiled, Inductor hit a codegen bug in the backward that fused the
+    recompute (a reduction-loop temporary used after its loop, "NameError: tmpN is not defined"),
+    triggered by a redundant `* valid` on the gate weights. tests/test_moe.py pins the graph-break
+    half on CPU; the test below pins that the compiled backward builds and matches eager.
+
 These are slow (each compiles), so they're marked and kept few.
 """
 
@@ -167,6 +176,30 @@ def test_grad_checkpoint_compiles_under_grad_accum():
                 loss = out.logits.float().square().mean() + out.moe_aux_loss + out.ponder_cost
             loss.backward()
         assert torch.isfinite(model.token_emb.weight.grad).all()
+
+
+@slow
+@requires_cuda
+def test_checkpointed_moe_compiles_and_matches_eager():
+    """Fine-grained MoE (top-4 of 8, quarter-width experts, two-deep) under grad_checkpoint, the
+    shape that hit the Inductor codegen bug above. Compiled gradients must match eager's."""
+    model = _build(
+        grad_checkpoint=True, ffn_depth=2, doc_attention_mask=False,
+        use_moe=True, n_experts=8, moe_top_k=4, moe_expert_ffn_mult=0.25, moe_n_shared=0,
+    ).train()
+    ids = torch.randint(0, TINY_VOCAB, (2, 64), device="cuda", generator=torch.Generator("cuda").manual_seed(0))
+
+    def grads(fn):
+        model.zero_grad(set_to_none=True)
+        out = fn(ids)
+        (out.logits.float().square().mean() + out.moe_aux_loss).backward()
+        return {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
+
+    eager = grads(model)
+    compiled = grads(torch.compile(model, mode=None))
+    assert eager.keys() == compiled.keys()
+    for name in eager:
+        torch.testing.assert_close(compiled[name], eager[name], rtol=1e-3, atol=1e-5, msg=name)
 
 
 # The remaining tests need no GPU and no compile: they pin the *decision* about which compile mode
