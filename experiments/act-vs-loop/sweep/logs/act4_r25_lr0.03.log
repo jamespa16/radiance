@@ -1,0 +1,33 @@
+[radiance] padding vocab 50,257 -> 50,304 (multiple of 128) for tensor-core-aligned lm_head matmuls
+[radiance] doc_attention_mask on, so compiling without CUDA graphs (mode=None instead of 'reduce-overhead').
+[radiance] optimizer=muon (muon_lr=0.02 over 43 tensors, adamw lr=0.03 over the rest)
+[radiance] step     50/1000 loss 4.5854 lm 4.5535 lr 5.100e-03 mem 6.23GB
+[radiance] step    100/1000 loss 3.2751 lm 3.2404 lr 1.010e-02 mem 6.23GB 243.0k tok/s
+[radiance] step    100 val/loss 3.1968 ± 0.0394 bpb 1.1260
+[radiance] step    150/1000 loss 2.7280 lm 2.6940 lr 1.510e-02 mem 6.23GB 242.7k tok/s
+[radiance] step    200/1000 loss 2.6122 lm 2.5783 lr 2.000e-02 mem 6.23GB 242.9k tok/s
+[radiance] step    200 val/loss 2.6117 ± 0.0402 bpb 0.9199
+[radiance] step    250/1000 loss 2.4303 lm 2.3965 lr 1.983e-02 mem 6.23GB 242.8k tok/s
+[radiance] step    300/1000 loss 2.3663 lm 2.3321 lr 1.931e-02 mem 6.23GB 243.0k tok/s
+[radiance] step    300 val/loss 2.3649 ± 0.0410 bpb 0.8329
+[radiance] step    350/1000 loss 2.2662 lm 2.2320 lr 1.848e-02 mem 6.23GB 242.7k tok/s
+[radiance] step    400/1000 loss 2.4135 lm 2.3798 lr 1.736e-02 mem 6.23GB 242.8k tok/s
+[radiance] step    400 val/loss 2.2286 ± 0.0402 bpb 0.7849
+[radiance] step    450/1000 loss 2.1624 lm 2.1285 lr 1.600e-02 mem 6.23GB 242.9k tok/s
+[radiance] step    500/1000 loss 2.0031 lm 1.9689 lr 1.444e-02 mem 6.23GB 242.8k tok/s
+[radiance] step    500 val/loss 2.1190 ± 0.0405 bpb 0.7463
+[radiance] step    550/1000 loss 2.0204 lm 1.9864 lr 1.276e-02 mem 6.23GB 242.8k tok/s
+[radiance] step    600/1000 loss 2.0450 lm 2.0109 lr 1.100e-02 mem 6.23GB 242.7k tok/s
+[radiance] step    600 val/loss 2.0332 ± 0.0405 bpb 0.7161
+[radiance] step    650/1000 loss 1.9553 lm 1.9209 lr 9.244e-03 mem 6.23GB 242.8k tok/s
+[radiance] step    700/1000 loss 1.8203 lm 1.7860 lr 7.556e-03 mem 6.23GB 242.9k tok/s
+[radiance] step    700 val/loss 1.9585 ± 0.0409 bpb 0.6898
+[radiance] step    750/1000 loss 1.9376 lm 1.9037 lr 6.000e-03 mem 6.23GB 242.7k tok/s
+[radiance] step    800/1000 loss 1.8277 lm 1.7935 lr 4.636e-03 mem 6.23GB 242.9k tok/s
+[radiance] step    800 val/loss 1.8939 ± 0.0408 bpb 0.6670
+[radiance] step    850/1000 loss 1.8330 lm 1.7989 lr 3.517e-03 mem 6.23GB 242.8k tok/s
+[radiance] step    900/1000 loss 1.8554 lm 1.8215 lr 2.685e-03 mem 6.23GB 242.9k tok/s
+[radiance] step    900 val/loss 1.8485 ± 0.0410 bpb 0.6511
+[radiance] step    950/1000 loss 1.8499 lm 1.8159 lr 2.173e-03 mem 6.23GB 242.1k tok/s
+[radiance] step   1000/1000 loss 1.7921 lm 1.7581 lr 2.000e-03 mem 6.23GB 243.0k tok/s
+[radiance] step   1000 val/loss 1.8192 ± 0.0411 bpb 0.6408

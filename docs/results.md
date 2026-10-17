@@ -105,6 +105,24 @@ A throughput change rather than a quality one, so it is measured separately. On 
 `act_capacity_ratio: 0.5` and **3.0728** at `0.25` — indistinguishable. See [model.md](model.md) for what it buys in
 time and memory, and why a short run's wall-clock understates it.
 
+## ACT vs a fixed loop — the router learns to be shallow and loses
+
+Same 16.4M tokens per arm (1000 steps x 32 x 512), loop-vs-depth's TinyStories shape, each arm LR-swept and its best
+LR repeated to n=3. Full tables in [experiments/act-vs-loop/](../experiments/act-vs-loop/).
+
+| arm | executed blocks | `val/loss` @1000, mean of 3 | vs dense |
+|---|---|---|---|
+| dense | 6 | 1.8153 | — |
+| **fixed `loop_count: 3`** | 16 | **1.8006** | **−0.0147** |
+| ACT `max_loops: 4`, `act_capacity_ratio: 0.5` | 16 | 1.8144 | −0.0009 |
+| ACT `max_loops: 4`, `act_capacity_ratio: 0.25` | 13.5 | 1.8192 | +0.0039 |
+
+Repeat spread 0.0006-0.0042. At **equal compute** (16 blocks) the fixed loop beats ACT by 0.014. The mechanism is
+measured, not inferred: under the default `ponder_weight: 0.01` the trained router halts tokens after **1.85 / 4**
+(r0.5) and **1.69 / 4** (r0.25) iterations on average, so ACT is a ~1.8-iteration loop that pays for 2 + 2 x
+capacity. A smaller `ponder_weight` is the untested arm; 1000 steps likely understates the fixed loop, whose gain
+grew with horizon in the loop-vs-depth A/B.
+
 ## NSA — negative, and since removed
 
 A/B'd against the *real* default it would replace: `use_nsa` required `doc_attention_mask: false`, so the fair

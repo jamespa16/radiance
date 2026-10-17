@@ -1,0 +1,17 @@
+[driver] === act4_r25_lr0.03_r2 ===
+[driver] act4_r25_lr0.03_r2 done in 89s :: [radiance] step   1000 val/loss 1.8182 ± 0.0411 bpb 0.6404
+[driver] === act4_r25_lr0.03_r3 ===
+[driver] act4_r25_lr0.03_r3 done in 88s :: [radiance] step   1000 val/loss 1.8202 ± 0.0411 bpb 0.6411
+[driver] === act4_r50_lr0.03_r2 ===
+[driver] act4_r50_lr0.03_r2 done in 85s :: [radiance] step   1000 val/loss 1.8146 ± 0.0409 bpb 0.6391
+[driver] === act4_r50_lr0.03_r3 ===
+[driver] act4_r50_lr0.03_r3 done in 85s :: [radiance] step   1000 val/loss 1.8140 ± 0.0410 bpb 0.6389
+[driver] === dense_lr0.01_r2 ===
+[driver] dense_lr0.01_r2 done in 46s :: [radiance] step   1000 val/loss 1.8138 ± 0.0406 bpb 0.6389
+[driver] === dense_lr0.01_r3 ===
+[driver] dense_lr0.01_r3 done in 47s :: [radiance] step   1000 val/loss 1.8162 ± 0.0407 bpb 0.6397
+[driver] === loop3_lr0.03_r2 ===
+[driver] loop3_lr0.03_r2 done in 76s :: [radiance] step   1000 val/loss 1.8034 ± 0.0407 bpb 0.6352
+[driver] === loop3_lr0.03_r3 ===
+[driver] loop3_lr0.03_r3 done in 76s :: [radiance] step   1000 val/loss 1.7992 ± 0.0406 bpb 0.6337
+[driver] ALL DONE

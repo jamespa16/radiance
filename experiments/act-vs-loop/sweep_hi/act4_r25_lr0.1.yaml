@@ -1,0 +1,45 @@
+run_name: act4_r25_lr0.1
+
+data:
+  dataset: roneneldan/TinyStories
+  text_column: text
+  tokenizer: gpt2
+  seq_len: 512
+  num_workers: 4
+  cache_dir: .cache/radiance/tokenized
+
+model:
+  d_model: 256
+  head_dim: 64
+  n_layers: 6
+  use_router: true
+  max_loops: 4
+  act_capacity_ratio: 0.25
+  ffn_mult: 4.0
+  ffn_depth: 3
+  dropout: 0.0
+  max_seq_len: 512
+
+train:
+  batch_size: 16
+  grad_accum_steps: 2
+  auto_batch_size: false
+  lr: 0.1
+  muon_lr: 0.02
+  weight_decay: 0.01
+  warmup_ratio: 0.2
+  max_steps: 1000
+  grad_clip: 1.0
+  log_every: 50
+  eval_every: 100
+  save_every: 1000000
+  output_dir: /tmp/claude-1000/-home-james-dev-radiance/a861baf7-c145-496b-8c1b-4667fb192e34/scratchpad/actloop_ckpt/act4_r25_lr0.1
+  seed: 42
+  device: auto
+  compile: true
+  dtype: bf16
+
+wandb:
+  project: radiance
+  entity: null
+  mode: disabled
