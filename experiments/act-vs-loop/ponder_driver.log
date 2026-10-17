@@ -1,0 +1,9 @@
+[driver] === act4_r25_p001_lr0.01 ===
+[driver] act4_r25_p001_lr0.01 done in 88s :: [radiance] step   1000 val/loss 1.8245 ± 0.0407 bpb 0.6426
+[driver] === act4_r25_p001_lr0.03 ===
+[driver] act4_r25_p001_lr0.03 done in 88s :: [radiance] step   1000 val/loss 1.8161 ± 0.0411 bpb 0.6397
+[driver] === act4_r50_p001_lr0.01 ===
+[driver] act4_r50_p001_lr0.01 done in 85s :: [radiance] step   1000 val/loss 1.8222 ± 0.0409 bpb 0.6418
+[driver] === act4_r50_p001_lr0.03 ===
+[driver] act4_r50_p001_lr0.03 done in 85s :: [radiance] step   1000 val/loss 1.8123 ± 0.0410 bpb 0.6383
+[driver] ALL DONE

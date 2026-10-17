@@ -28,6 +28,10 @@ ARMS = {
     "loop3": "  loop_count: 3\n",
     "act4_r50": "  use_router: true\n  max_loops: 4\n  act_capacity_ratio: 0.5\n",
     "act4_r25": "  use_router: true\n  max_loops: 4\n  act_capacity_ratio: 0.25\n",
+    # Follow-up: the arms above use the default ponder_weight 0.01, under which the router learned
+    # to halt at ~1.7-1.85 of 4 iterations. A 10x smaller penalty lets it use more depth.
+    "act4_r50_p001": "  use_router: true\n  max_loops: 4\n  act_capacity_ratio: 0.5\n  ponder_weight: 0.001\n",
+    "act4_r25_p001": "  use_router: true\n  max_loops: 4\n  act_capacity_ratio: 0.25\n  ponder_weight: 0.001\n",
 }
 
 TEMPLATE = """\
@@ -80,7 +84,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", required=True, type=pathlib.Path)
     parser.add_argument("--ckpt", required=True, help="checkpoint dir (scratch; models are not kept)")
-    parser.add_argument("--arms", nargs="+", default=list(ARMS))
+    parser.add_argument("--arms", nargs="+", default=["dense", "loop3", "act4_r50", "act4_r25"])
     parser.add_argument("--lrs", nargs="+", default=["0.003", "0.01", "0.03"])
     parser.add_argument("--repeat", type=int, default=1, help="runs per (arm, lr); repeats get suffix _r2, _r3")
     parser.add_argument("--first-repeat", type=int, default=1)

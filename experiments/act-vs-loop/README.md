@@ -39,3 +39,20 @@ fixed overhead that only amortises on wider models (docs/model.md).
 Caveats: 1000 steps only (the loop's gain over dense *grew* from 1000 to 3000 steps in
 loop-vs-depth, so 1000 likely understates loop3); one `ponder_weight` (a smaller one would let ACT
 use more depth and is the obvious next arm); TinyStories at d256.
+
+## Follow-up: `ponder_weight: 0.001` (10x below default)
+
+Same harness, `lr` swept over {0.01, 0.03} (0.003 and 0.1 lost clearly above), best repeated to n=3.
+
+| arm | `lr` 0.01 | `lr` 0.03 (n=3) | mean | vs dense | vs same arm at 0.01 | `mean_loop_depth` |
+|---|---|---|---|---|---|---|
+| ACT r0.5, `ponder_weight` 0.001 | 1.8222 | 1.8123 / 1.8139 / 1.8125 | 1.8129 | −0.0024 | −0.0015 | 2.00 / 4 (was 1.85) |
+| ACT r0.25, `ponder_weight` 0.001 | 1.8245 | 1.8161 / 1.8160 / 1.8154 | 1.8158 | +0.0005 | −0.0034 | 2.02 / 4 (was 1.69) |
+
+A small gain (clear for r0.25, marginal for r0.5), and the fixed loop still wins by 0.012-0.015 at equal or lower
+compute. **The penalty was not what kept ACT shallow.** At 0.001 the ponder term is ~0.002 of loss, yet depth only
+rose to ~2.0. Nor is it the init: `ACTRouter.proj.bias` starts at Graves' −1.0 (halting prob ~0.27/iteration, so
+~4 iterations at init), so training actively pulls depth *down* to ~2. A plausible mechanism, not verified here:
+later iterations get little output weight, so little gradient, so they stay worse, so the router keeps halting
+early — a rich-get-richer collapse. Discriminating next arms: `ponder_weight: 0` (does depth still collapse with no
+penalty at all?) and a fixed `loop_count: 2` control (is ACT just an expensive loop2?).

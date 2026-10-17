@@ -120,8 +120,12 @@ LR repeated to n=3. Full tables in [experiments/act-vs-loop/](../experiments/act
 Repeat spread 0.0006-0.0042. At **equal compute** (16 blocks) the fixed loop beats ACT by 0.014. The mechanism is
 measured, not inferred: under the default `ponder_weight: 0.01` the trained router halts tokens after **1.85 / 4**
 (r0.5) and **1.69 / 4** (r0.25) iterations on average, so ACT is a ~1.8-iteration loop that pays for 2 + 2 x
-capacity. A smaller `ponder_weight` is the untested arm; 1000 steps likely understates the fixed loop, whose gain
-grew with horizon in the loop-vs-depth A/B.
+capacity. 1000 steps likely understates the fixed loop, whose gain grew with horizon in the loop-vs-depth A/B.
+
+**Lowering `ponder_weight` 10x (0.001) does not fix it**: 1.8129 (r0.5) and 1.8158 (r0.25), n=3 each — a 0.002-0.003
+gain, the fixed loop still ahead by 0.012-0.015 — and depth rises only to ~2.0 / 4. The router starts at ~4
+iterations (Graves' −1.0 halting bias) and training pulls it down to ~2 whether the penalty is 0.01 or nearly
+nothing, so the shallowness comes from ACT's own gradient dynamics, not the ponder cost.
 
 ## NSA — negative, and since removed
 
