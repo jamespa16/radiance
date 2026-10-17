@@ -18,7 +18,7 @@ from .act import ACTRouter, _act_select, _ffn_capacity, _sparse_ffn_delta
 from .attention import KVCache, RotaryEmbedding, _FLEX_MIN_HEAD_DIM
 from .block import TransformerBlock
 from .core import LoopContext, ModelOutput
-from .ffn import MoEFeedForward
+from .ffn import MoEFeedForward, run_ffn
 from .masking import _sparse_attn_mask, build_block_mask, document_ids
 from .mtp import MTPHead, _shift_left
 from .norms import RMSNorm
@@ -44,6 +44,7 @@ def _run_loop_body(
     still_running: torch.Tensor | None = None,
     grad_checkpoint: bool = False,
     record_kv: list | None = None,
+    moe_stats: list | None = None,
 ) -> torch.Tensor:
     """Runs `blocks` once. Attention is always fully dense. When still_running is given (and
     ctx.capacity is set), each block's FFN is dispatched through the fixed-capacity sparse path
@@ -54,10 +55,14 @@ def _run_loop_body(
 
     grad_checkpoint recomputes each block's activations during backward instead of storing them —
     see DenseTransformer.forward for why this matters disproportionately here.
+
+    Each MoE block's (ffn, stats) is appended to `moe_stats` here, *outside* the checkpointed call:
+    the checkpointed function must stay free of side effects — see
+    MoEFeedForward.forward_with_stats.
     """
     for index, block in enumerate(blocks):
         if still_running is None:
-            x, _, recorded = _maybe_checkpoint(block, x, cos, sin, ctx, v_first, enabled=grad_checkpoint)
+            x, _, recorded, stats = _maybe_checkpoint(block, x, cos, sin, ctx, v_first, enabled=grad_checkpoint)
             if record_kv is not None:
                 record_kv[index] = recorded
         else:
@@ -67,9 +72,10 @@ def _run_loop_body(
                 if block.hyper_attn is None:
                     attn_out, _, _ = block.attn(block.ln1(x, variant), cos, sin, ctx, v_first)
                     x = x + attn_out
-                    return x + _sparse_ffn_delta(
+                    delta, stats = _sparse_ffn_delta(
                         block.ffn, block.ln2(x, variant), still_running, ctx.capacity, variant
                     )
+                    return x + delta, stats
                 # Same structure with the residual writes replaced by hyper-connection read/write
                 # pairs — see TransformerBlock.forward. _sparse_ffn_delta returns a delta over the
                 # (batch, seq, d_model) sublayer output, which is exactly what write() expects.
@@ -77,14 +83,16 @@ def _run_loop_body(
                 attn_out, _, _ = block.attn(block.ln1(h, variant), cos, sin, ctx, v_first)
                 x = block.hyper_attn.write(x, attn_out, coeffs)
                 h, coeffs = block.hyper_ffn.read(x, variant)
-                delta = _sparse_ffn_delta(
+                delta, stats = _sparse_ffn_delta(
                     block.ffn, block.ln2(h, variant), still_running, ctx.capacity, variant
                 )
-                return block.hyper_ffn.write(x, delta, coeffs)
+                return block.hyper_ffn.write(x, delta, coeffs), stats
 
-            x = _maybe_checkpoint(
+            x, stats = _maybe_checkpoint(
                 run_sparse, x, cos, sin, v_first, still_running, enabled=grad_checkpoint
             )
+        if stats is not None and moe_stats is not None:
+            moe_stats.append((block.ffn, stats))
     return x
 
 
@@ -99,6 +107,7 @@ def _run_loop_body_sparse(
     valid: torch.Tensor,
     kv_store: list,
     attn_mask: torch.Tensor,
+    moe_stats: list | None = None,
 ) -> torch.Tensor:
     """One ACT loop iteration that computes only `capacity` positions per sequence.
 
@@ -144,7 +153,9 @@ def _run_loop_body_sparse(
         )
         h = h + attn_out if hc_attn is None else hc_attn.write(h, attn_out, coeffs)
         ffn_in, coeffs = (h, None) if hc_ffn is None else hc_ffn.read(h, variant)
-        ffn_out = block.ffn(block.ln2(ffn_in, variant), variant)
+        ffn_out, stats = run_ffn(block.ffn, block.ln2(ffn_in, variant), variant)
+        if stats is not None and moe_stats is not None:
+            moe_stats.append((block.ffn, stats))
         h = h + ffn_out if hc_ffn is None else hc_ffn.write(h, ffn_out, coeffs)
 
     # Capacity padding rows (selected only to keep the shape static) must not overwrite anything,
@@ -687,10 +698,6 @@ class DenseTransformer(nn.Module):
             return hidden
         return hidden.mean(dim=-2)
 
-    def _reset_moe_aux_loss(self) -> None:
-        for moe_ffn in self._moe_layers:
-            moe_ffn.reset_aux_loss()
-
     def update_expert_bias(self) -> None:
         """Apply the loss-free load-balancing update to every MoE layer. Called by train() after
         optimizer.step(), so the buffer mutation stays outside the compiled graph."""
@@ -707,7 +714,12 @@ class DenseTransformer(nn.Module):
             sum(m.expert_bias.std().item() for m in self._moe_layers) / len(self._moe_layers)
         )
 
-    def _collect_moe_aux_loss(self, x: torch.Tensor) -> torch.Tensor:
+    def _collect_moe_aux_loss(self, x: torch.Tensor, moe_stats: list) -> torch.Tensor:
+        """Fold this forward's per-call MoE stats — (ffn, (aux_loss, load)) pairs gathered by the
+        loop-body runners — into the aux loss, and hand each call's load to its layer's balancing
+        counter. Runs once per forward, after the loop and outside any checkpointed region."""
+        for moe_ffn, (_, load) in moe_stats:
+            moe_ffn.record_load(load)
         # "bias" balances load without a gradient term, so the aux loss is simply not applied —
         # returning zero here rather than weighting it by zero keeps it out of the graph entirely.
         if not self._moe_layers or self.cfg.moe_balance == "bias":
@@ -715,9 +727,10 @@ class DenseTransformer(nn.Module):
         # Averaged per-layer over its call count (once for loop_count/non-router mode, up to
         # max_loops times for ACT mode) so the aux loss magnitude doesn't scale with loop depth,
         # consistent with ponder_cost/mean_loop_depth also being mean-reduced, not summed.
-        return sum(
-            moe_ffn.aux_loss_accum / moe_ffn._aux_loss_calls for moe_ffn in self._moe_layers
-        )
+        per_layer: dict[MoEFeedForward, list[torch.Tensor]] = {}
+        for moe_ffn, (aux_loss, _) in moe_stats:
+            per_layer.setdefault(moe_ffn, []).append(aux_loss)
+        return sum((sum(terms) / len(terms) for terms in per_layer.values()), x.new_zeros(()))
 
     def forward(
         self,
@@ -762,8 +775,6 @@ class DenseTransformer(nn.Module):
         if kv_cache is not None:
             kv_cache.begin_step()
 
-        self._reset_moe_aux_loss()
-
         # Gradient checkpointing is a backward-pass optimization, so it's pointless (and, with a
         # kv_cache, actively wrong — recomputation would re-append to the cache) whenever there's no
         # graph to build. Gate on both, so eval/generation always take the plain path.
@@ -783,7 +794,8 @@ class DenseTransformer(nn.Module):
             iteration=0, kv_cache=kv_cache, block_mask=self._mask_for_iteration(doc_masks, 1),
             key_padding_mask=key_padding_mask, key_positions=key_positions,
         )
-        x, v_first, _ = _maybe_checkpoint(self.blocks[0], x, cos, sin, ctx, None, enabled=grad_checkpoint)
+        # blocks[0] is always dense (see ModelConfig.use_moe), so it has no MoE stats to keep.
+        x, v_first, _, _ = _maybe_checkpoint(self.blocks[0], x, cos, sin, ctx, None, enabled=grad_checkpoint)
         if not self.cfg.value_residual:
             v_first = None
 
@@ -803,6 +815,7 @@ class DenseTransformer(nn.Module):
         if not self.cfg.use_router:
             # remaining n_layers - 1 blocks are looped, sharing weights across iterations
             n_loops = self.resolved_loop_count(loop_count)
+            moe_stats: list = []
             for n in range(1, n_loops + 1):
                 if n > 1 and self.input_injection is not None:
                     # Re-anchor the recursion. From the second iteration on only: the first is
@@ -823,11 +836,12 @@ class DenseTransformer(nn.Module):
                         ),
                         v_first,
                         grad_checkpoint=grad_checkpoint,
+                        moe_stats=moe_stats,
                     )
             x = self.ln_f(self._reduce_streams(x))
             logits = self._project_logits(x)
             zero = x.new_zeros(())
-            moe_aux_loss = self._collect_moe_aux_loss(x)
+            moe_aux_loss = self._collect_moe_aux_loss(x, moe_stats)
             mtp_hidden = self._run_mtp_heads(x, input_ids, cos, sin, kv_cache)
             if kv_cache is not None:
                 kv_cache.seq_len += seq_len
@@ -916,6 +930,7 @@ class DenseTransformer(nn.Module):
         block_capacity = max(1, min(seq_len, round(self.cfg.act_capacity_ratio * seq_len)))
         # Seeded by the first (dense) iteration, then updated in place by each sparse one.
         kv_store: list = [None] * len(self.blocks[1:])
+        moe_stats: list = []
         sparse_mask_doc_ids = doc_ids if self.cfg.doc_attention_mask else None
 
         for n in range(1, max_loops + 1):
@@ -943,17 +958,19 @@ class DenseTransformer(nn.Module):
                 attn_mask = _sparse_attn_mask(token_idx, seq_len, sparse_mask_doc_ids)
                 new_x = _run_loop_body_sparse(
                     self.blocks[1:], frozen_x, cos, sin, ctx, v_first,
-                    token_idx, valid, kv_store, attn_mask,
+                    token_idx, valid, kv_store, attn_mask, moe_stats,
                 )
             elif not sparse_enabled or is_first_or_last:
                 new_x = _run_loop_body(
                     self.blocks[1:], frozen_x, cos, sin, ctx, v_first,
                     grad_checkpoint=grad_checkpoint,
                     record_kv=kv_store if ctx.record_kv else None,
+                    moe_stats=moe_stats,
                 )
             else:
                 new_x = _run_loop_body(
-                    self.blocks[1:], frozen_x, cos, sin, ctx, v_first, still_running, grad_checkpoint
+                    self.blocks[1:], frozen_x, cos, sin, ctx, v_first, still_running, grad_checkpoint,
+                    moe_stats=moe_stats,
                 )
             # The router halts *positions*, so it reads the reduced hidden state rather than one
             # arbitrary stream — same tensor ln_f eventually sees.
@@ -979,7 +996,7 @@ class DenseTransformer(nn.Module):
         logits = self._project_logits(x)
         ponder_cost = (n_updates + remainder_sum).mean()
         mean_loop_depth = n_updates.mean()
-        moe_aux_loss = self._collect_moe_aux_loss(x)
+        moe_aux_loss = self._collect_moe_aux_loss(x, moe_stats)
         mtp_hidden = self._run_mtp_heads(x, input_ids, cos, sin, kv_cache)
         return ModelOutput(logits, ponder_cost, mean_loop_depth, moe_aux_loss, mtp_hidden)
 

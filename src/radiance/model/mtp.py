@@ -36,7 +36,7 @@ class MTPHead(nn.Module):
         )
         # Fresh LoopContext: the head is outside the recursion, and passing the trunk's kv_cache
         # would let it claim cache slots that belong to the trunk's blocks.
-        out, _, _ = self.block(fused, cos, sin, LoopContext())
+        out, _, _, _ = self.block(fused, cos, sin, LoopContext())
         return out
 
 

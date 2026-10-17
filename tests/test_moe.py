@@ -83,11 +83,44 @@ def test_aux_loss_is_near_ideal_at_init():
     at top_k=2 against an ideal of 2.0."""
     model = _build(loop_count=1).train()
     torch.manual_seed(0)
-    model(torch.randint(0, TINY_VOCAB, (8, 32))).logits.sum().backward()
+    x = torch.randint(0, TINY_VOCAB, (8, 32))
+    per_layer = model(x).moe_aux_loss / len(_moe_layers(model))
+    assert 1.8 < per_layer.item() < 2.4, f"per-layer aux loss {per_layer.item()} far from ideal 2.0"
 
-    for layer in _moe_layers(model):
-        per_layer = layer.aux_loss_accum / layer._aux_loss_calls
-        assert 1.8 < per_layer.item() < 2.4, f"per-layer aux loss {per_layer.item()} far from ideal 2.0"
+
+def test_grad_checkpoint_leaves_identical_balance_state_and_gradients():
+    """grad_checkpoint re-runs each block's forward during backward. When MoEFeedForward
+    accumulated its stats onto the module, that re-run appended a second aux term — whose graph
+    pinned every block's recomputed activations until the next forward (~11GB at a 1.4B-total MoE,
+    batch 8x1024) — and counted every token into expert_load twice. Checkpointed and plain runs
+    must agree on all of it."""
+    x = torch.randint(0, TINY_VOCAB, (4, 32), generator=torch.Generator().manual_seed(0))
+    runs = []
+    for grad_checkpoint in (False, True):
+        model = _build(loop_count=2, grad_checkpoint=grad_checkpoint).train()
+        out = model(x)
+        (out.logits.sum() + out.moe_aux_loss).backward()
+        runs.append((out.moe_aux_loss.detach(), model))
+    (plain_aux, plain), (ckpt_aux, ckpt) = runs
+    torch.testing.assert_close(ckpt_aux, plain_aux, rtol=0, atol=0)
+    for plain_layer, ckpt_layer in zip(_moe_layers(plain), _moe_layers(ckpt)):
+        torch.testing.assert_close(ckpt_layer.expert_load, plain_layer.expert_load, rtol=0, atol=0)
+    for (name, p_plain), p_ckpt in zip(plain.named_parameters(), ckpt.parameters()):
+        torch.testing.assert_close(p_ckpt.grad, p_plain.grad, msg=name)
+
+
+def test_checkpointed_moe_traces_without_unexpected_graph_breaks():
+    """The checkpointed region must be free of side effects, or torch.compile refuses to trace it
+    ("Mutating a variable from outside the scope of this HOP") and runs the whole block eager —
+    measured ~2x slower end to end at a 1.4B-total MoE. That is silent: training still works."""
+    for use_router in (False, True):
+        model = _build(loop_count=2, grad_checkpoint=True, use_router=use_router).train()
+        x = torch.randint(0, TINY_VOCAB, (2, 16))
+        reasons = torch._dynamo.explain(model)(x).break_reasons
+        # _doc_masks is deliberately torch.compiler.disable()d (see its docstring); anything else
+        # is a break this test exists to catch.
+        unexpected = [r.reason for r in reasons if "torch.compiler.disable" not in r.reason]
+        assert not unexpected, (use_router, unexpected)
 
 
 def test_expert_bias_starts_at_zero_and_is_not_a_parameter():
@@ -417,8 +450,8 @@ def test_balance_signal_count_and_weight_measure_what_they_say():
 
     by_count = _layer(moe_balance="bias", moe_balance_signal="count")
     by_weight = _layer(moe_balance="bias", moe_balance_signal="weight")
-    by_count(x)
-    by_weight(x)
+    for layer in (by_count, by_weight):
+        layer.record_load(layer.forward_with_stats(x)[2])
 
     torch.testing.assert_close(by_count.expert_load, assigned.sum(0).float())
     torch.testing.assert_close(by_weight.expert_load, weight.sum(0))
@@ -439,7 +472,7 @@ def test_weight_signal_sees_the_low_confidence_load_that_count_calls_full():
         with torch.no_grad():
             layer.router.proj.bias[0] = -8.0  # expert 0 is what the router actually wants: nothing
             layer.expert_bias[0] = 20.0  # ...but the balancer forces it into every top-k anyway
-        layer(x)
+        layer.record_load(layer.forward_with_stats(x)[2])
         layers[signal] = layer
 
     assert layers["count"].expert_load[0] == 32, "every token routed to expert 0"

@@ -26,7 +26,7 @@ d_model)`, so it drops into `DenseTransformer` without touching the rest of the 
 
 ## Structure
 
-`DenseTransformer`: token + learned positional embeddings, `n_layers` pre-norm `TransformerBlock`s, final LayerNorm,
+`DenseTransformer`: token embeddings with RoPE in attention, `n_layers` pre-norm `TransformerBlock`s, final RMSNorm,
 weight-tied LM head. Each block is `CausalSelfAttention` (`F.scaled_dot_product_attention` with `is_causal=True`, no
 manual mask construction) followed by `FeedForward`.
 
@@ -294,6 +294,19 @@ micro-batch 16 fit at all (19.7 GB) where the uncheckpointed model OOMs above 4;
 torch.is_grad_enabled() and kv_cache is None`, since recomputation under a KV cache would re-append to that cache.
 `activation_bytes_per_token` models the checkpointed regime too (one `d_model` tensor per block boundary plus the
 largest single block's transient recompute), so `auto_batch_size` spends the freed memory automatically.
+
+**A checkpointed block's forward must not mutate module state.** Under `torch.compile`, dynamo refuses to trace a
+checkpoint region that writes to anything outside it ("Mutating a variable from outside the scope of this HOP") and
+silently runs the whole block eager; under eager checkpointing the write is *replayed* when backward recomputes the
+block. `MoEFeedForward` used to accumulate its aux loss and `expert_load` onto itself and hit both: the replayed aux
+term's graph pinned every recomputed activation until the next forward (~11 GB at V2's shape with 32 top-8
+quarter-width experts, batch 8x1024 — enough to OOM), and the eager fallback ran at 13.4k tok/s. It now returns
+`(output, aux_loss, load)` from `forward_with_stats` (via `run_ffn`), the loop runners collect those outside the
+checkpointed call, and `_collect_moe_aux_loss` folds them in once per forward: 27.5-28.3k tok/s at the same shape.
+Compiled checkpointing keeps more than the eager fallback did (29.5 GB peak allocated at micro-batch 8 against
+24.6 GB), so that shape wants micro-batch 4 on a 32 GB card (24.6 GB, 23.9k tok/s). `tests/test_moe.py` asserts no
+unexpected graph breaks with checkpointing on (CPU, via `torch._dynamo.explain`); `tests/test_compile.py` pins the
+compiled backward against eager.
 
 ## Hyper-connections: `n` residual streams instead of one
 
