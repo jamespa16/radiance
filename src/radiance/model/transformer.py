@@ -708,6 +708,10 @@ class DenseTransformer(nn.Module):
         )
 
     def _collect_moe_aux_loss(self, x: torch.Tensor) -> torch.Tensor:
+        # Sealed first, whatever moe_balance is: any MoE call after this point is grad_checkpoint
+        # recomputing a block during backward, and must not touch aux_loss_accum or expert_load.
+        for moe_ffn in self._moe_layers:
+            moe_ffn.seal_aux_loss()
         # "bias" balances load without a gradient term, so the aux loss is simply not applied —
         # returning zero here rather than weighting it by zero keeps it out of the graph entirely.
         if not self._moe_layers or self.cfg.moe_balance == "bias":

@@ -90,6 +90,23 @@ def test_aux_loss_is_near_ideal_at_init():
         assert 1.8 < per_layer.item() < 2.4, f"per-layer aux loss {per_layer.item()} far from ideal 2.0"
 
 
+def test_grad_checkpoint_recompute_does_not_reaccumulate_balance_stats():
+    """grad_checkpoint re-runs each block's forward during backward. That re-run used to append a
+    second aux term to aux_loss_accum — whose graph pinned every block's recomputed activations
+    until the next forward (~11GB at a 1.4B-total MoE, batch 8x1024) — and count every token into
+    expert_load twice. Checkpointed and plain runs must leave identical balance state behind."""
+    x = torch.randint(0, TINY_VOCAB, (4, 32), generator=torch.Generator().manual_seed(0))
+    states = []
+    for grad_checkpoint in (False, True):
+        model = _build(loop_count=2, grad_checkpoint=grad_checkpoint).train()
+        out = model(x)
+        (out.logits.sum() + out.moe_aux_loss).backward()
+        states.append([(layer._aux_loss_calls, layer.expert_load.clone()) for layer in _moe_layers(model)])
+    for (plain_calls, plain_load), (ckpt_calls, ckpt_load) in zip(*states):
+        assert ckpt_calls == plain_calls
+        torch.testing.assert_close(ckpt_load, plain_load, rtol=0, atol=0)
+
+
 def test_expert_bias_starts_at_zero_and_is_not_a_parameter():
     """It's updated by an explicit rule, never by gradient — that's what makes it 'loss-free'."""
     model = _build()

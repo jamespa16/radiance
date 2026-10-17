@@ -210,6 +210,10 @@ class MoEFeedForward(nn.Module):
 
         self.aux_loss_accum: torch.Tensor | None = None
         self._aux_loss_calls = 0
+        # False between DenseTransformer collecting the aux loss and the next forward's reset —
+        # which is exactly when grad_checkpoint re-runs this forward during backward. See
+        # seal_aux_loss.
+        self._accumulating = True
         self._register_load_state_dict_pre_hook(self._upgrade_legacy_expert_keys, with_module=False)
 
     def _upgrade_legacy_expert_keys(self, state_dict, prefix, *args) -> None:
@@ -248,6 +252,21 @@ class MoEFeedForward(nn.Module):
     def reset_aux_loss(self) -> None:
         self.aux_loss_accum = None
         self._aux_loss_calls = 0
+        self._accumulating = True
+
+    def seal_aux_loss(self) -> None:
+        """Stop storing balance stats until the next reset_aux_loss().
+
+        grad_checkpoint re-runs this forward during backward to recompute activations. Unsealed,
+        that re-run appended a second aux term whose graph reached back through the recomputed
+        block, pinning every block's recomputed activations until the next forward — ~11GB at a
+        1.4B-total MoE, batch 8 x 1024, which is most of what checkpointing exists to free. It
+        also counted every token into expert_load twice.
+
+        Sealing gates only the *stores*, never the computation: non-reentrant checkpoint matches
+        recomputed saved tensors to the original ones by position, so the re-run must execute the
+        same ops in the same order or every later tensor is unpacked into the wrong slot."""
+        self._accumulating = False
 
     def forward(self, x: torch.Tensor, variant: int = 0) -> torch.Tensor:
         orig_shape = x.shape
@@ -279,12 +298,15 @@ class MoEFeedForward(nn.Module):
             # scales with the gate weight it was applied at, not with how many tokens listed it.
             # Both are pre-drop, matching each other and the previous behaviour.
             signal = assigned if self.cfg.moe_balance_signal == "count" else weight
-            self.expert_load += signal.detach().sum(dim=0).float()
+            load = signal.detach().sum(dim=0).float()
+            if self._accumulating:
+                self.expert_load += load
         f_i = assigned.float().mean(dim=0).detach()  # fraction of tokens routed to expert i (non-diff)
         p_i = probs.mean(dim=0)  # mean full-softmax prob mass on expert i (differentiable)
         aux_loss = self.cfg.n_experts * (f_i * p_i).sum()
-        self.aux_loss_accum = aux_loss if self.aux_loss_accum is None else self.aux_loss_accum + aux_loss
-        self._aux_loss_calls += 1
+        if self._accumulating:  # computed regardless — see seal_aux_loss
+            self.aux_loss_accum = aux_loss if self.aux_loss_accum is None else self.aux_loss_accum + aux_loss
+            self._aux_loss_calls += 1
 
         # Outside training, size capacity to the real load so nothing is dropped — see _moe_capacity.
         full_capacity = self.cfg.moe_eval_full_capacity and not self.training
