@@ -137,14 +137,14 @@ def test_streams_diverge_once_static_weights_move(tiny_ids):
         cos, sin = model.rope(ids.size(1))
         from radiance.model import LoopContext
 
-        at_init, _, _ = model.blocks[1](hidden, cos, sin, LoopContext(iteration=1))
+        at_init, _, _, _ = model.blocks[1](hidden, cos, sin, LoopContext(iteration=1))
         assert (at_init - at_init[..., :1, :]).abs().max() == 0.0
 
         before = model(ids).logits
         for name, param in model.named_parameters():
             if "hyper" in name and "dyn" not in name:
                 param.add_(torch.randn_like(param) * 0.3)
-        trained, _, _ = model.blocks[1](hidden, cos, sin, LoopContext(iteration=1))
+        trained, _, _, _ = model.blocks[1](hidden, cos, sin, LoopContext(iteration=1))
         after = model(ids).logits
 
     assert (trained - trained[..., :1, :]).abs().max() > 1e-5, "streams stayed identical"

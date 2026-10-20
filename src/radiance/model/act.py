@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from radiance.config import ModelConfig
 
-from .ffn import FeedForward
+from .ffn import FeedForward, run_ffn
 from .norms import RMSNorm
 
 # _ffn_capacity/_sparse_ffn_delta/_act_select below are consumed by transformer.py's halting/
@@ -50,10 +50,11 @@ def _ffn_capacity(cfg: ModelConfig, batch: int, seq_len: int) -> int:
 
 def _sparse_ffn_delta(
     ffn: FeedForward, h: torch.Tensor, still_running: torch.Tensor, capacity: int, variant: int = 0
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
     """h: (batch, seq_len, d_model) pre-FFN (post-ln2) input. still_running: (batch, seq_len) bool.
     Returns a same-shaped delta with FFN output scattered to at most `capacity` selected running
-    positions and zero elsewhere (both underflow padding and overflow-dropped positions).
+    positions and zero elsewhere (both underflow padding and overflow-dropped positions), plus
+    run_ffn's MoE stats.
     """
     batch, seq_len, d_model = h.shape
     n_tokens = batch * seq_len
@@ -80,10 +81,11 @@ def _sparse_ffn_delta(
     valid = flat_running.index_select(0, token_idx)  # (capacity,) bool
 
     gathered = flat_h.index_select(0, token_idx)  # (capacity, d_model)
-    ffn_out = ffn(gathered, variant) * valid.unsqueeze(-1).to(h.dtype)  # zero out padding slots
+    ffn_out, moe_stats = run_ffn(ffn, gathered, variant)
+    ffn_out = ffn_out * valid.unsqueeze(-1).to(h.dtype)  # zero out padding slots
 
     delta_flat = flat_h.new_zeros(n_tokens, d_model).index_copy(0, token_idx, ffn_out)
-    return delta_flat.view(batch, seq_len, d_model)
+    return delta_flat.view(batch, seq_len, d_model), moe_stats
 
 
 def _act_select(still_running: torch.Tensor, capacity: int, training: bool) -> tuple[torch.Tensor, torch.Tensor]:

@@ -7,7 +7,7 @@ from radiance.config import ModelConfig
 
 from .attention import CausalSelfAttention
 from .core import LoopContext
-from .ffn import FeedForward, MoEFeedForward
+from .ffn import FeedForward, MoEFeedForward, run_ffn
 from .hyper_connections import HyperConnection
 from .norms import RMSNorm
 class TransformerBlock(nn.Module):
@@ -49,9 +49,15 @@ class TransformerBlock(nn.Module):
         sin: torch.Tensor,
         ctx: LoopContext,
         v_first: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
-        """Returns (hidden state, this block's own attention values, optional recorded (k, v)) —
-        see CausalSelfAttention.forward for why the latter two come back out.
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        tuple[torch.Tensor, torch.Tensor] | None,
+        tuple[torch.Tensor, torch.Tensor] | None,
+    ]:
+        """Returns (hidden state, this block's own attention values, optional recorded (k, v),
+        MoE stats) — see CausalSelfAttention.forward for why the middle two come back out, and
+        run_ffn for the last (None for a dense FFN).
 
         `x` is (batch, seq, d_model) normally and (batch, seq, n_streams, d_model) when this block
         carries hyper-connections; the sublayers themselves always see the plain shape, which is
@@ -61,12 +67,13 @@ class TransformerBlock(nn.Module):
         if self.hyper_attn is None:
             attn_out, v_own, recorded = self.attn(self.ln1(x, variant), cos, sin, ctx, v_first)
             x = x + attn_out
-            x = x + self.ffn(self.ln2(x, variant), variant)
-            return x, v_own, recorded
+            ffn_out, moe_stats = run_ffn(self.ffn, self.ln2(x, variant), variant)
+            return x + ffn_out, v_own, recorded, moe_stats
 
         h, coeffs = self.hyper_attn.read(x, variant)
         attn_out, v_own, recorded = self.attn(self.ln1(h, variant), cos, sin, ctx, v_first)
         x = self.hyper_attn.write(x, attn_out, coeffs)
         h, coeffs = self.hyper_ffn.read(x, variant)
-        x = self.hyper_ffn.write(x, self.ffn(self.ln2(h, variant), variant), coeffs)
-        return x, v_own, recorded
+        ffn_out, moe_stats = run_ffn(self.ffn, self.ln2(h, variant), variant)
+        x = self.hyper_ffn.write(x, ffn_out, coeffs)
+        return x, v_own, recorded, moe_stats
