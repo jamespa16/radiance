@@ -127,8 +127,9 @@ gain, the fixed loop still ahead by 0.012-0.015 — and depth rises only to ~2.0
 iterations (Graves' −1.0 halting bias) and training pulls it down to ~2 whether the penalty is 0.01 or nearly
 nothing, so the shallowness comes from ACT's own gradient dynamics, not the ponder cost.
 
-These arms ran with the old hardcoded `-1.0` halting bias. `act_halt_bias_init` now defaults to starting at half of
-`max_loops`, so a re-run under defaults starts from a different point; pin `-1.0` to reproduce.
+These arms ran with the old hardcoded `-1.0` halting bias. `act_halt_bias_init` now defaults to aiming tokens at
+pass `max(2, max_loops // 2)` (all at pass 2 for these `max_loops: 4` arms; [model.md](model.md) has the measured
+init spread at other depths), so a re-run under defaults starts from a different point; pin `-1.0` to reproduce.
 
 ### At scale the router goes the other way: the showcase never halts
 

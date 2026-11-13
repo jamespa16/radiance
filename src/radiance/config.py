@@ -193,11 +193,16 @@ class ModelConfig:
     use_router: bool = False  # opt-in: replace fixed loop_count with per-token ACT halting
     max_loops: int = 6  # hard cap on loop iterations when use_router=True; independent of loop_count
     ponder_weight: float = 1.0e-2  # tau: coefficient on the ponder-cost loss term
-    halt_epsilon: float = 0.01  # ACT epsilon: a position halts once cumulative halting prob >= 1 - halt_epsilon
+    halt_epsilon: float = 0.01  # ACT epsilon: a position halts once cumulative halting prob >= 1 - halt_epsilon.
+    # Must be strictly inside (0, 1); checked when a router model is built.
     act_halt_bias_init: float | None = None  # initial ACT router proj.bias. None (default) starts
-    # tokens at about half of max_loops: the bias is chosen so a constant halting prob sigmoid(bias)
-    # halts at pass ceil(max_loops / 2), centred in logit space between the neighbouring passes (see
-    # model/act.py's initial_halt_bias). Before this field the bias was hardcoded to Graves' -1.0,
+    # tokens at about half of max_loops, never pass 1 (where the router gets no gradient): the bias
+    # is chosen so a constant halting prob sigmoid(bias) halts at pass max(2, max_loops // 2),
+    # centred in logit space between the neighbouring passes (see model/act.py's initial_halt_bias).
+    # Measured on fresh models: every token starts at pass 2 for max_loops 2-5; from max_loops 6 the
+    # target interval is comparable to the init noise and tokens spread over neighbouring passes,
+    # increasingly with d_model (max_loops 6: ~96% at pass 3 for d_model 64, ~52% for d_model 1024).
+    # Before this field the bias was hardcoded to Graves' -1.0,
     # which at max_loops 4 / halt_epsilon 0.01 halts nobody before the cap (3 * 0.27 < 0.99): the
     # showcase run never left max depth, and its intermediate passes were never trained to be
     # decodable (forced to 2 or 3 passes, val loss was ~0.9 nats worse than at 4; docs/results.md).
@@ -461,8 +466,10 @@ class TrainConfig:
     # chosen+rejected width). Chinchilla-optimal is ~20 tokens/param.
     tokens_per_param_basis: str = "total"  # which parameter count tokens_per_param multiplies:
     # "total" (num_parameters, every expert counted) or "active" (num_active_parameters, only
-    # moe_top_k experts per MoE layer; the pre-field behaviour). Identical without MoE. Both count
-    # a weight-shared loop body once, not once per pass.
+    # moe_top_k experts per MoE layer, and no MTP heads; the pre-field behaviour). The two differ
+    # under MoE and under mtp_heads > 1; identical for a plain dense config. Both count a
+    # weight-shared loop body once, not once per pass. Resuming under a different basis
+    # re-derives max_steps (and so the LR schedule), so a run sized on "active" must pin it.
     auto_batch_size: bool = True  # overwrite batch_size/grad_accum_steps at startup, computed from free
     # VRAM + model size (see train.py's estimate_batch_size) instead of the values configured above.
     # Defaults to True — a deliberate behavior change for every existing config, not the usual
@@ -553,6 +560,14 @@ class TrainConfig:
     # model.fp4_linear (FP4's own quality margin assumes fp32 masters — see nvfp4/linear.py).
     # Needs empirical validation (a loss-curve comparison against the fp32-master baseline)
     # before trusting it for a real run — see docs/optim.md.
+
+    def __post_init__(self):
+        # Here rather than in `_apply_dtype_sugar` so a TrainConfig built directly (tests,
+        # export._config_from_json) is checked too, not just one that came through load_config.
+        if self.tokens_per_param_basis not in ("total", "active"):
+            raise ValueError(
+                f"train.tokens_per_param_basis must be 'total' or 'active', got {self.tokens_per_param_basis!r}"
+            )
 
     @property
     def embed_lr_resolved(self) -> float:
@@ -856,10 +871,6 @@ def _apply_dtype_sugar(cfg: Config) -> Config:
     live here — `DenseTransformer.__init__`, where this repo's other incompatibility errors live,
     only ever receives a `ModelConfig`.
     """
-    if cfg.train.tokens_per_param_basis not in ("total", "active"):
-        raise ValueError(
-            f"train.tokens_per_param_basis must be 'total' or 'active', got {cfg.train.tokens_per_param_basis!r}"
-        )
     if cfg.train.dtype == "nvfp4":
         cfg.model.fp4_linear = True
         print("[radiance] train.dtype: nvfp4 -> model.fp4_linear: true, with bf16 autocast underneath")

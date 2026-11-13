@@ -33,7 +33,7 @@ class ACTRouter(nn.Module):
         # Per-iteration halting bias (cfg.loop_iter_conditioning). Without it the halting unit has
         # to infer "how deep am I" from the hidden state alone — and the RMSNorm above deliberately
         # strips the norm growth that would be its only cue. Zero-initialised, so halting behaviour
-        # at init is exactly the pre-conditioning model's (proj.bias still carries Graves' -1.0).
+        # at init is set by proj.bias alone (initial_halt_bias, applied by DenseTransformer).
         self.iter_bias = None
         if cfg.loop_iter_conditioning != "none" and cfg.max_loops > 1:
             self.iter_bias = nn.Parameter(torch.zeros(cfg.max_loops))
@@ -50,20 +50,41 @@ def initial_halt_bias(cfg: ModelConfig) -> float:
 
     Derived: a position whose halting prob is a constant p halts at the first pass k with
     k * p >= t (t = 1 - halt_epsilon), so it halts at exactly pass k for p in [t/k, t/(k-1)).
-    Aim k at ceil(max_loops / 2) and put the bias at the midpoint of that interval *in logit
-    space*, since the router's weight term adds roughly symmetric logit noise per token at init.
-    k == 1 has no upper edge (p < 1), so it takes the same 2-nat margin above logit(t) instead.
+    The bias is the midpoint of that interval *in logit space*, since the router's weight term
+    adds roughly symmetric per-token logit noise at init (sd ~0.02 * sqrt(d_model): measured 0.16,
+    0.34, 0.6 at d_model 64, 256, 1024).
+
+    The target is k = max(2, max_loops // 2):
+
+    - Never pass 1. A token halting at pass 1 gets weight 1 - 0 = 1, a constant, so neither the
+      output nor ponder_cost depends on p_1 and the router gets no gradient at all — depth would
+      be stuck at 1 for the whole run. Halting at any k >= 2 weights the earlier passes by p_i and
+      the halting pass by 1 - sum(p_i), which does carry gradient. At max_loops 2 this targets the
+      cap: every token whose p_1 < t runs both passes, and the pass-2 midpoint leaves p_1 2.3 nats
+      below the threshold.
+    - About half depth, rounding *down* for odd max_loops: the interval narrows with k (half-width
+      in logits ~2.31 for k 2, ~0.34 for k 3, ~0.20 for k 4 at halt_epsilon 0.01), so of two
+      passes equally near half depth the lower one has the larger margin.
+
+    What that buys, measured on fresh models (tests/test_act_halt_init.py): for max_loops 2-5
+    (k == 2) every token starts at pass 2, up to d_model 1024. From max_loops 6 (k >= 3) the margin
+    is comparable to the init noise (or smaller, at width) and tokens spread over neighbouring
+    passes, more so with width: at max_loops 6 ~96% at pass 3 for d_model 64 but ~52% for d_model 1024 (the rest on 2, 4, 5).
+    The early passes are weighted from step 0 either way, which is what the derivation is for.
     """
+    eps = cfg.halt_epsilon
+    if not 0.0 < eps < 1.0:
+        # 0 makes the threshold 1.0 (in effect nothing halts before the cap; the derivation divides by
+        # zero in logit); >= 1 makes it <= 0, so every token halts at pass 1 with constant weight.
+        raise ValueError(f"model.halt_epsilon must be strictly between 0 and 1, got {eps!r}")
     if cfg.act_halt_bias_init is not None:
         return float(cfg.act_halt_bias_init)
-    t = 1.0 - cfg.halt_epsilon
-    k = max(1, (cfg.max_loops + 1) // 2)
+    t = 1.0 - eps
+    k = max(2, cfg.max_loops // 2)
 
     def logit(p: float) -> float:
         return math.log(p / (1.0 - p))
 
-    if k == 1:
-        return logit(t) + 2.0
     return 0.5 * (logit(t / k) + logit(t / (k - 1)))
 
 

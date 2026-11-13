@@ -74,7 +74,13 @@ def run_tokens(cfg: Config, n_vocab: int) -> int:
     if cfg.train.tokens_per_param is not None:
         # Same basis train() uses: size_config's "total" / "active" are its num_parameters() /
         # num_active_parameters().
-        params = size_config(cfg, n_vocab)[cfg.train.tokens_per_param_basis]
+        sizes = size_config(cfg, n_vocab)
+        if cfg.train.tokens_per_param_basis == "total":
+            params = sizes["total"]
+        elif cfg.train.tokens_per_param_basis == "active":
+            params = sizes["active"]
+        else:
+            raise ValueError(f"unknown train.tokens_per_param_basis {cfg.train.tokens_per_param_basis!r}")
         steps = max(1, round(cfg.train.tokens_per_param * params / tokens_per_step))
     else:
         steps = cfg.train.max_steps

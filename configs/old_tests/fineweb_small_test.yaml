@@ -42,6 +42,7 @@ model:
   max_loops: 8 # hard cap on loop iterations in router mode
   ponder_weight: 1.0e-2 # ACT ponder-cost coefficient
   halt_epsilon: 0.01 # a position halts once cumulative halting prob >= 1 - halt_epsilon
+  act_halt_bias_init: -1.0 # pinned: the pre-PR-#65 init (the default now derives a half-depth bias)
   ffn_mult: 3.0 # ffn_dim = 768
   ffn_depth: 2
   dropout: 0.01

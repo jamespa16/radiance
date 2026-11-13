@@ -314,8 +314,13 @@ once the model is built, `train()` overwrites `cfg.train.max_steps` with `round(
 `data.seq_len`, SFT/DPO use their active `seq_len` override, and DPO counts both chosen and rejected rows — e.g. `20`
 for a Chinchilla-optimal budget, and prints/logs the resulting step count. So the same config keeps tracking the
 "right" number of steps as `model.*` fields change instead of needing `max_steps` hand-recomputed.
-`num_active_parameters()` differs from the flat `num_parameters()` only under `use_moe`, excluding each MoE layer's
-inactive experts, so the basis only matters for MoE. On the showcase shape it is 3.7B tokens (active, 156M) vs 13.6B
+`num_active_parameters()` differs from the flat `num_parameters()` in two ways: it excludes each MoE layer's
+inactive experts, and it excludes the MTP heads (`mtp_heads > 1`, which never run at inference). So the basis matters
+for MoE *and* for dense MTP configs (e.g. `configs/old_tests/tinystories_mtp.yaml`), and is a no-op only for a plain
+dense config. When the two counts differ, `train()` prints one extra `[radiance] note:` line naming the basis, the
+ratio to the other basis, and a reminder to pin it; the derived `max_steps` is on the line above. Resuming a run
+under a different basis re-derives `max_steps`, which moves the LR schedule, so a run sized on `active` must pin
+`tokens_per_param_basis: active`. On the showcase shape it is 3.7B tokens (active, 156M) vs 13.6B
 (total, 567M). Neither counts a weight-shared loop body more than once. `active` was the only behaviour before the
 field existed; the MoE configs sized under it pin `tokens_per_param_basis: active`. `radiance-pretokenize` sizes its
 token budget on the same basis. `estimate_batch_size`'s

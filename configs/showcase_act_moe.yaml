@@ -67,6 +67,7 @@ model:
   # either way; it is ACT's own dynamics, not the penalty.
   ponder_weight: 1.0e-3
   halt_epsilon: 0.01
+  act_halt_bias_init: -1.0 # pinned: the init behind the documented step_28516 run (docs/results.md); the default now derives a half-depth bias
   act_capacity_ratio: 0.5
   loop_iter_conditioning: norm_gains # per-iteration norm gains + per-iteration ACT/MoE router bias
   loop_input_injection: true

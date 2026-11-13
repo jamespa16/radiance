@@ -433,22 +433,36 @@ def train(cfg: Config, hud: bool | None = None) -> None:
         # rows it actually forwards.
         tokens_per_step = cfg.train.effective_batch_size * cfg.resolved_row_tokens
         # cfg.train.tokens_per_param_basis picks the count: "total" (every expert) or "active"
-        # (moe_top_k experts per MoE layer). The two agree when no MoE layers exist.
-        basis_params = (
-            raw_model.num_active_parameters()
-            if cfg.train.tokens_per_param_basis == "active"
-            else raw_model.num_parameters()
-        )
+        # (moe_top_k experts per MoE layer, and no MTP heads). They differ under MoE and under
+        # mtp_heads > 1; for a plain dense config they agree.
+        total_params = raw_model.num_parameters()
+        active_params = raw_model.num_active_parameters()
+        if cfg.train.tokens_per_param_basis == "active":
+            basis_params = active_params
+        elif cfg.train.tokens_per_param_basis == "total":
+            basis_params = total_params
+        else:
+            raise ValueError(f"unknown train.tokens_per_param_basis {cfg.train.tokens_per_param_basis!r}")
         target_tokens = cfg.train.tokens_per_param * basis_params
         cfg.train.max_steps = max(1, round(target_tokens / tokens_per_step))
         print(
             f"[radiance] tokens_per_param={cfg.train.tokens_per_param} over "
             f"{basis_params:,} {cfg.train.tokens_per_param_basis} params "
-            f"({raw_model.num_active_parameters():,} active / {raw_model.num_parameters():,} total) "
+            f"({active_params:,} active / {total_params:,} total) "
             f"-> max_steps={cfg.train.max_steps:,} ({target_tokens:,.0f} tokens at {tokens_per_step:,} tokens/step, "
             f"batch_size={cfg.train.batch_size} x grad_accum_steps={cfg.train.grad_accum_steps} "
             f"= effective_batch_size={cfg.train.effective_batch_size})"
         )
+        if active_params != total_params:
+            ratio = (total_params / active_params) if cfg.train.tokens_per_param_basis == "total" else (
+                active_params / total_params
+            )
+            print(
+                f"[radiance] note: the active and total parameter counts differ, so "
+                f"tokens_per_param_basis={cfg.train.tokens_per_param_basis} matters here: max_steps is "
+                f"derived from {basis_params:,} params, {ratio:.2f}x what the other basis would give. "
+                f"Pin train.tokens_per_param_basis (or max_steps) to keep a resumed run's schedule fixed."
+            )
 
     optimizer = build_optimizer(model, cfg, device)
     scheduler = build_lr_scheduler(optimizer, cfg)
