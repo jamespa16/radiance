@@ -197,9 +197,10 @@ def test_capacity_padding_does_not_corrupt_unselected_positions(tiny_ids):
     with a recomputed value."""
     ids = tiny_ids(batch=2, seq=32)
     # halt_epsilon this large forces everything to halt on the first iteration, so every interior
-    # iteration is pure padding and must be a complete no-op.
-    model = _build(act_capacity_ratio=0.5, halt_epsilon=0.99).train()
-    dense = _build(halt_epsilon=0.99).train()
+    # iteration is pure padding and must be a complete no-op. The bias is pinned because the derived
+    # default (initial_halt_bias) compensates for halt_epsilon and would keep tokens running.
+    model = _build(act_capacity_ratio=0.5, halt_epsilon=0.99, act_halt_bias_init=-1.0).train()
+    dense = _build(halt_epsilon=0.99, act_halt_bias_init=-1.0).train()
 
     torch.manual_seed(11)
     sparse_logits = model(ids).logits

@@ -197,6 +197,17 @@ sees a stable key/value for it. Because this is dense, fully-batched compute, ro
 save wall-clock over running `max_loops` iterations for every token — the adaptivity shows up in the loss signal
 (`ponder_cost`) and in what gets accumulated, not in runtime. See `configs/tinystories_router.yaml`.
 
+**Where the router starts.** `cfg.model.act_halt_bias_init` sets the router's initial `proj.bias`. The default,
+`null`, derives it (`act.initial_halt_bias`) so tokens start at about half of `max_loops` — exactly pass 2 at
+`max_loops: 4`. A token whose halting probability is a constant `p` halts at pass `k` for `p` in
+`[t/k, t/(k-1))`, `t = 1 - halt_epsilon`, and the bias sits at the middle of that interval in logit space, so the
+router's per-token weight noise at init doesn't spill tokens onto neighbouring passes. The old hardcoded value was
+Graves' `-1.0`. At `max_loops: 4` it halts nobody before the cap, and the showcase run (`configs/showcase_act_moe.yaml`)
+never left max depth: its intermediate passes were never weighted, so they never learned to be decodable, and halting
+early stayed ~0.9 nats too expensive to start ([results.md](results.md)). Set `-1.0` to reproduce a pre-change run.
+Because the derived bias compensates for `halt_epsilon`, a large epsilon no longer forces immediate halting by itself;
+tests that relied on that pin the bias.
+
 ### `cfg.model.act_capacity_ratio` is what changes that
 
 Below 1.0, each interior ACT iteration computes only that fraction of each sequence's positions — the

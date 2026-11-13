@@ -309,13 +309,16 @@ combined. A fixed batch count also keeps `val/loss` comparable across configs wh
 
 `cfg.train.tokens_per_param` (opt-in, default `null`) derives `max_steps` from model size instead of pinning it:
 once the model is built, `train()` overwrites `cfg.train.max_steps` with `round(tokens_per_param *
-raw_model.num_active_parameters() / (effective_batch_size * the resolved per-row token width))` — pretraining uses
+<params> / (effective_batch_size * the resolved per-row token width))`, where `<params>` is picked by
+`cfg.train.tokens_per_param_basis`: `total` (default, `num_parameters()`) or `active` (`num_active_parameters()`) — pretraining uses
 `data.seq_len`, SFT/DPO use their active `seq_len` override, and DPO counts both chosen and rejected rows — e.g. `20`
 for a Chinchilla-optimal budget, and prints/logs the resulting step count. So the same config keeps tracking the
 "right" number of steps as `model.*` fields change instead of needing `max_steps` hand-recomputed.
 `num_active_parameters()` differs from the flat `num_parameters()` only under `use_moe`, excluding each MoE layer's
-inactive experts — Chinchilla-style scaling assumes every parameter multiplies against every token, which is false
-for MoE, so the flat count would inflate `max_steps` by roughly `n_experts / moe_top_k`. `estimate_batch_size`'s
+inactive experts, so the basis only matters for MoE. On the showcase shape it is 3.7B tokens (active, 156M) vs 13.6B
+(total, 567M). Neither counts a weight-shared loop body more than once. `active` was the only behaviour before the
+field existed; the MoE configs sized under it pin `tokens_per_param_basis: active`. `radiance-pretokenize` sizes its
+token budget on the same basis. `estimate_batch_size`'s
 optimizer-state sizing still uses the flat count, since every expert parameter gets a gradient and optimizer state
 regardless. `warmup_ratio` is read as a live property off whatever `max_steps` ends up being, so warmup scales along
 with it. See `configs/fineweb_500m.yaml`; leave `tokens_per_param: null` and set `max_steps` directly for pinned runs.

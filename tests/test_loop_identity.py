@@ -150,9 +150,10 @@ def test_act_injection_preserves_frozen_state(tiny_ids):
     """In ACT mode, injecting into an already-halted position would change the key/value that
     still-running positions attend to — the frozen-state invariant the whole mechanism rests on.
     Verified indirectly: with halt_epsilon forcing immediate halting, output must not depend on
-    the injection weights at all."""
+    the injection weights at all. The bias is pinned: the derived default (initial_halt_bias)
+    compensates for halt_epsilon and would keep tokens running."""
     ids = tiny_ids(batch=2, seq=16)
-    model = _build(use_router=True, max_loops=4, halt_epsilon=0.99).eval()
+    model = _build(use_router=True, max_loops=4, halt_epsilon=0.99, act_halt_bias_init=-1.0).eval()
     with torch.no_grad():
         before = model(ids).logits
         torch.nn.init.normal_(model.input_injection.weight, std=0.5)

@@ -100,6 +100,7 @@ train:
   wsd_decay_ratio: 0.3
 
   tokens_per_param: 24 # on active params: ~3.7B tokens
+  tokens_per_param_basis: active # pinned: the run was sized on active params (the default is now total)
 
   log_every: 20
   eval_every: 500

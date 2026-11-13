@@ -127,6 +127,27 @@ gain, the fixed loop still ahead by 0.012-0.015 — and depth rises only to ~2.0
 iterations (Graves' −1.0 halting bias) and training pulls it down to ~2 whether the penalty is 0.01 or nearly
 nothing, so the shallowness comes from ACT's own gradient dynamics, not the ponder cost.
 
+These arms ran with the old hardcoded `-1.0` halting bias. `act_halt_bias_init` now defaults to starting at half of
+`max_loops`, so a re-run under defaults starts from a different point; pin `-1.0` to reproduce.
+
+### At scale the router goes the other way: the showcase never halts
+
+`configs/showcase_act_moe.yaml` (d1024, 7-block loop body, MoE, `max_loops: 4`, `ponder_weight: 1e-3`, 3.7B fineweb
+tokens) finished at `mean_loop_depth` 4.00 in training and eval. The halting bias moved from −1.0 to −3.4: deeper,
+not shallower. Forcing the loop to stop at k passes on `step_28516` (full 1,444-block held-out set, eager):
+
+| passes | 1 | 2 | 3 | **4** (trained) | 5 | 6 |
+|---|---|---|---|---|---|---|
+| `val/loss` | 4.812 | 4.018 | 4.050 | **3.118** | 3.174 | 3.224 |
+
+Pass 3 is *worse* than pass 2. Pass 4 became a specialised read-out iteration: it has its own norm gains and router
+bias, it is always dense under `act_capacity_ratio`, and it held nearly all the ACT weight. The earlier passes'
+states were never weighted, so they never learned to be predictions. Halting early therefore costs ~0.9 nats against
+a ponder penalty of at most 0.001, and the trap reinforces itself. A `ponder_weight` sweep is unlikely to escape it
+smoothly. What should is starting the router shallow, so early passes are weighted from step 0; that is now the
+default (`act_halt_bias_init`, [model.md](model.md)). Untested at scale as of 2026-11-12. The eager forced-4 reading
+(3.118) is 0.016 above the run's logged compiled 3.102; the cause is unchecked.
+
 ## NSA — negative, and since removed
 
 A/B'd against the *real* default it would replace: `use_nsa` required `doc_attention_mask: false`, so the fair

@@ -14,7 +14,7 @@ from radiance.config import ModelConfig
 # _act_select/_ffn_capacity/_sparse_ffn_delta: ACT's capacity/selection helpers, package-private
 # to model/ but owned jointly with the halting/dispatch loop below — see act.py's module docstring
 # and tests/test_act_kv_invariance.py before changing either side.
-from .act import ACTRouter, _act_select, _ffn_capacity, _sparse_ffn_delta
+from .act import ACTRouter, initial_halt_bias, _act_select, _ffn_capacity, _sparse_ffn_delta
 from .attention import KVCache, RotaryEmbedding, _FLEX_MIN_HEAD_DIM
 from .block import TransformerBlock
 from .core import LoopContext, ModelOutput
@@ -336,9 +336,8 @@ class DenseTransformer(nn.Module):
         self._init_inert_gates()
         self._scale_residual_init()
         if self.router is not None:
-            # Bias the halting unit against halting immediately (Graves ACT): sigmoid(-1) ≈ 0.27,
-            # encouraging some early pondering rather than collapsing to a single pass at init.
-            nn.init.constant_(self.router.proj.bias, -1.0)
+            # Start tokens at about half of max_loops (cfg.act_halt_bias_init; see initial_halt_bias).
+            nn.init.constant_(self.router.proj.bias, initial_halt_bias(self.cfg))
 
     def _convert_linears_to_fp4(self) -> None:
         """Swap the eligible `nn.Linear`s for `FP4Linear`, in place.

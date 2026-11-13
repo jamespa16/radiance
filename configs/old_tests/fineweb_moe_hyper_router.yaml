@@ -148,8 +148,10 @@ train:
   warmup_ratio: 0.05
 
   tokens_per_param: 5 # as requested — well below Chinchilla-optimal (~20); max_steps derives from
+
   # num_active_parameters() (~288M), giving ~5,500 steps at effective_batch_size=256, seq_len=1024
   # (printed/logged at run start once the real active-parameter count is known)
+  tokens_per_param_basis: active # pinned: the run was sized on active params (the default is now total)
 
   grad_clip: 1.0
   log_every: 10

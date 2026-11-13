@@ -432,14 +432,19 @@ def train(cfg: Config, hud: bool | None = None) -> None:
         # dpo.seq_len override and counts DPO's chosen+rejected concatenation as the two packed
         # rows it actually forwards.
         tokens_per_step = cfg.train.effective_batch_size * cfg.resolved_row_tokens
-        # Active (not flat) param count: Chinchilla-style scaling assumes every parameter multiplies
-        # against every token, which is false for MoE — most expert params aren't touched by most
-        # tokens. num_active_parameters() equals num_parameters() when no MoE layers exist.
-        target_tokens = cfg.train.tokens_per_param * raw_model.num_active_parameters()
+        # cfg.train.tokens_per_param_basis picks the count: "total" (every expert) or "active"
+        # (moe_top_k experts per MoE layer). The two agree when no MoE layers exist.
+        basis_params = (
+            raw_model.num_active_parameters()
+            if cfg.train.tokens_per_param_basis == "active"
+            else raw_model.num_parameters()
+        )
+        target_tokens = cfg.train.tokens_per_param * basis_params
         cfg.train.max_steps = max(1, round(target_tokens / tokens_per_step))
         print(
             f"[radiance] tokens_per_param={cfg.train.tokens_per_param} over "
-            f"{raw_model.num_active_parameters():,} active params ({raw_model.num_parameters():,} total) "
+            f"{basis_params:,} {cfg.train.tokens_per_param_basis} params "
+            f"({raw_model.num_active_parameters():,} active / {raw_model.num_parameters():,} total) "
             f"-> max_steps={cfg.train.max_steps:,} ({target_tokens:,.0f} tokens at {tokens_per_step:,} tokens/step, "
             f"batch_size={cfg.train.batch_size} x grad_accum_steps={cfg.train.grad_accum_steps} "
             f"= effective_batch_size={cfg.train.effective_batch_size})"

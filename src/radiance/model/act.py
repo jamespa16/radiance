@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -41,6 +43,28 @@ class ACTRouter(nn.Module):
         if self.iter_bias is not None:
             logits = logits + self.iter_bias[min(variant, self.iter_bias.size(0) - 1)]
         return torch.sigmoid(logits)
+
+
+def initial_halt_bias(cfg: ModelConfig) -> float:
+    """The ACT router's initial proj.bias (cfg.act_halt_bias_init, or derived when it is None).
+
+    Derived: a position whose halting prob is a constant p halts at the first pass k with
+    k * p >= t (t = 1 - halt_epsilon), so it halts at exactly pass k for p in [t/k, t/(k-1)).
+    Aim k at ceil(max_loops / 2) and put the bias at the midpoint of that interval *in logit
+    space*, since the router's weight term adds roughly symmetric logit noise per token at init.
+    k == 1 has no upper edge (p < 1), so it takes the same 2-nat margin above logit(t) instead.
+    """
+    if cfg.act_halt_bias_init is not None:
+        return float(cfg.act_halt_bias_init)
+    t = 1.0 - cfg.halt_epsilon
+    k = max(1, (cfg.max_loops + 1) // 2)
+
+    def logit(p: float) -> float:
+        return math.log(p / (1.0 - p))
+
+    if k == 1:
+        return logit(t) + 2.0
+    return 0.5 * (logit(t / k) + logit(t / (k - 1)))
 
 
 def _ffn_capacity(cfg: ModelConfig, batch: int, seq_len: int) -> int:

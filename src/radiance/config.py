@@ -194,6 +194,14 @@ class ModelConfig:
     max_loops: int = 6  # hard cap on loop iterations when use_router=True; independent of loop_count
     ponder_weight: float = 1.0e-2  # tau: coefficient on the ponder-cost loss term
     halt_epsilon: float = 0.01  # ACT epsilon: a position halts once cumulative halting prob >= 1 - halt_epsilon
+    act_halt_bias_init: float | None = None  # initial ACT router proj.bias. None (default) starts
+    # tokens at about half of max_loops: the bias is chosen so a constant halting prob sigmoid(bias)
+    # halts at pass ceil(max_loops / 2), centred in logit space between the neighbouring passes (see
+    # model/act.py's initial_halt_bias). Before this field the bias was hardcoded to Graves' -1.0,
+    # which at max_loops 4 / halt_epsilon 0.01 halts nobody before the cap (3 * 0.27 < 0.99): the
+    # showcase run never left max depth, and its intermediate passes were never trained to be
+    # decodable (forced to 2 or 3 passes, val loss was ~0.9 nats worse than at 4; docs/results.md).
+    # Set -1.0 to reproduce runs from before the change. Only affects fresh initialisation.
     act_capacity_ratio: float = 1.0  # fraction of each sequence's positions that an interior ACT
     # loop iteration actually computes — attention *and* FFN, i.e. the whole block. This is what
     # makes router mode save wall-clock: below 1.0, iterations past the first process only the
@@ -446,11 +454,15 @@ class TrainConfig:
     # (V1's) be annealed without an LR jump.
     max_steps: int = 5000  # ignored (overwritten once the model is built) if tokens_per_param is set
     tokens_per_param: float | None = None  # opt-in: derive max_steps from model size instead of a fixed
-    # step count — max_steps = round(tokens_per_param * num_active_parameters /
+    # step count — max_steps = round(tokens_per_param * <tokens_per_param_basis params> /
     # (effective_batch_size * resolved_row_tokens)), computed in train.py once the model is built
     # (num_active_parameters excludes unused MoE expert params when model.use_moe is set, and
     # resolved_row_tokens honors any active sft.seq_len / dpo.seq_len override plus DPO's
     # chosen+rejected width). Chinchilla-optimal is ~20 tokens/param.
+    tokens_per_param_basis: str = "total"  # which parameter count tokens_per_param multiplies:
+    # "total" (num_parameters, every expert counted) or "active" (num_active_parameters, only
+    # moe_top_k experts per MoE layer; the pre-field behaviour). Identical without MoE. Both count
+    # a weight-shared loop body once, not once per pass.
     auto_batch_size: bool = True  # overwrite batch_size/grad_accum_steps at startup, computed from free
     # VRAM + model size (see train.py's estimate_batch_size) instead of the values configured above.
     # Defaults to True — a deliberate behavior change for every existing config, not the usual
@@ -844,6 +856,10 @@ def _apply_dtype_sugar(cfg: Config) -> Config:
     live here — `DenseTransformer.__init__`, where this repo's other incompatibility errors live,
     only ever receives a `ModelConfig`.
     """
+    if cfg.train.tokens_per_param_basis not in ("total", "active"):
+        raise ValueError(
+            f"train.tokens_per_param_basis must be 'total' or 'active', got {cfg.train.tokens_per_param_basis!r}"
+        )
     if cfg.train.dtype == "nvfp4":
         cfg.model.fp4_linear = True
         print("[radiance] train.dtype: nvfp4 -> model.fp4_linear: true, with bf16 autocast underneath")
