@@ -1,0 +1,121 @@
+# Radiance showcase: learned loop depth (ACT) over a mixture-of-experts loop body.
+#
+# Chosen to be interesting, not to win. The goal is to show off the ideas this repo was built
+# for, and docs/results.md says plainly that a dense stack beats it per FLOP: the weight-shared
+# loop is dominated (loop-vs-depth A/B), and ACT's router halts at about 1.8 of 4 iterations
+# and ties dense (ACT-vs-loop A/B). Don't present this as better than V2. What it shows is
+# *where* each token spends its compute and *which* experts it uses on each pass.
+#
+# What it shows:
+#   - blocks[0] runs once. blocks[1:8] (7 blocks) are one weight-shared loop body that runs up to
+#     max_loops: 4 times, so up to 1 + 7*4 = 29 blocks per token. Each token's ACT router
+#     decides when to stop.
+#   - act_capacity_ratio: 0.5 means a halted token really skips the work. Iterations after the
+#     first send only the top 50% of still-running positions through the loop body. The average
+#     is 1 + 7*(2 + 2*0.5) = 22 blocks per token, the same as V2's 22 layers, so the compute is
+#     roughly the same and only how it is spent differs.
+#   - Every loop-body FFN is a 16-expert top-2 MoE with no shared expert, so a token's whole FFN
+#     is whatever the router picks. loop_iter_conditioning: norm_gains (the default) gives the
+#     MoE router a separate bias on each iteration, so one token can use different experts on
+#     pass 1 and pass 3. That is the "loop depth across MoE routing" this config is about.
+#   - Expert width 0.5 x ffn_dim at top-2 gives one dense FFN's worth of active compute per block.
+#
+# Size (radiance-size): 567M total / 156M active / 51.5M embed. "Active" counts unique weights.
+# The loop runs the 7 shared blocks up to 4 times, so the compute per token is that of a much
+# larger dense model.
+#
+# Left out on purpose:
+#   - use_diff_attn: the only measured architecture win, but it raises with
+#     act_capacity_ratio < 1.0 (forward_sparse has no differential variant). Real per-token
+#     compute savings are the better story for this model.
+#   - hyper_conn_streams > 1: neutral to negative (docs/results.md), and it costs activation memory
+#     that this config needs for max_loops.
+#   - grad_checkpoint: refused with act_capacity_ratio < 1.0, and not needed (sparsity cuts
+#     activation memory). The sizing below was measured without it.
+#
+# Data, tokenizer, held-out set, optimizer, LR and schedule are V2's, so val/bits_per_byte
+# compares directly with checkpoints/v2 (V2 is the "ordinary transformer" baseline for the talk).
+
+run_name: showcase-act-moe
+
+data:
+  dataset: HuggingFaceFW/fineweb
+  text_column: text
+  tokenizer: gpt2
+  eval_split_size: 2000
+  shuffle_buffer_size: 10000
+  pretokenized_dir: .cache/radiance/pretokenized/v2-fineweb-gpt2 # V2's, already on disk
+  seq_len: 1024
+  num_workers: 8
+  prefetch_factor: 4
+
+model:
+  d_model: 1024
+  head_dim: 64
+  n_layers: 8 # blocks[0] + a 7-block shared loop body
+  ffn_mult: 2.0
+  ffn_depth: 2
+  dropout: 0.0
+  max_seq_len: 1024
+  mup_base_d_model: 256
+
+  # Learned loop depth.
+  use_router: true
+  max_loops: 4
+  # 10x below the default. The ACT-vs-loop follow-up measured this as slightly better (n=3) and
+  # slightly deeper (about 2.0 of 4 iterations vs 1.85). Expect the router to settle around 2
+  # either way; it is ACT's own dynamics, not the penalty.
+  ponder_weight: 1.0e-3
+  halt_epsilon: 0.01
+  act_capacity_ratio: 0.5
+  loop_iter_conditioning: norm_gains # per-iteration norm gains + per-iteration ACT/MoE router bias
+  loop_input_injection: true
+
+  # MoE in every loop-body block.
+  use_moe: true
+  n_experts: 16
+  moe_top_k: 2
+  moe_expert_ffn_mult: 0.5
+  moe_n_shared: 0
+  moe_capacity_factor: 1.25
+  moe_aux_loss_weight: 1.0e-3 # moe_balance "both": the bias term does most of the balancing
+
+train:
+  # Measured 2026-11-06 on the 5090 (idle machine), compiled, 1000 steps: 23.5 GB peak allocated,
+  # flat; 34.1k tok/s; no OOM warnings. ~8 GB headroom, but don't double it without re-measuring.
+  # At 3.74B tokens that is ~31h plus evals. Eval graph-breaks on ffn.py's
+  # moe_eval_full_capacity .item(). That is expected (eval only) and does not affect training.
+  batch_size: 8
+  grad_accum_steps: 16 # 131k tokens per optimizer step, V2's
+  auto_batch_size: false
+
+  optimizer: muon
+  lr: 1.0e-2
+  muon_lr: 0.02
+  weight_decay: 0.01
+  warmup_ratio: 0.02
+  grad_clip: 1.0
+
+  lr_schedule: wsd # any kept checkpoint can be annealed with --decay-from if the showcase arrives early
+  wsd_decay_ratio: 0.3
+
+  tokens_per_param: 24 # on active params: ~3.7B tokens
+
+  log_every: 20
+  eval_every: 500
+  eval_max_batches: null
+  save_every: 500
+  keep_every: 2500
+  output_dir: checkpoints/showcase_act_moe
+  resume_from: auto
+
+  seed: 42
+  device: auto
+  compile: true
+  dtype: bf16
+  peak_tflops: 209.5
+
+wandb:
+  project: radiance
+  entity: null
+  mode: online

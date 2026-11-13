@@ -160,6 +160,34 @@ in-process (batched forward passes against the loaded model, not through `radian
 [docs/eval.md](docs/eval.md) for why). `lm-eval` is a separate `eval` dependency group (`uv run --group eval ...`),
 not a core dependency. Entry point: `radiance.eval_harness:main` — `radiance-eval` console script after install.
 
+## Visualizing ACT depth and MoE routing
+
+```bash
+uv run radiance-viz --checkpoint checkpoints/showcase_act_moe/step_5000.pt \
+    --prompt "Once upon a time" --generate 80 --val-sequences 16 --output viz/showcase.html
+```
+
+Writes one self-contained HTML page: the text shaded by how many loop passes each token ran before its ACT router
+stopped it (hover/click a token for its blocks x passes expert grid; `#pin=N` in the URL opens with token N
+pinned), plus aggregates over that text and `--val-sequences` held-out rows: depth histogram, per-block expert load
+on each pass, top-1 expert persistence across passes, deepest/shallowest tokens. The trace comes from forward hooks
+on the routers, with no model changes. Halting is replayed from the recorded probabilities and checked against the
+forward's own `mean_loop_depth`, so a change to `_forward_act`'s halting rule makes it fail loudly. The checkpoint is
+read on CPU and only the weights move to `--device`, so it can run beside a training job. Entry point:
+`radiance.viz:main`.
+
+```bash
+uv run radiance-viz --checkpoint checkpoints/showcase_act_moe/step_28516.pt --serve   # http://127.0.0.1:8100/
+```
+
+`--serve` runs the same view as a live chat page instead (`viz_chat.py`): each reply token streams in already
+shaded by its depth, with a per-token depth strip, the same pass x expert grid on hover/click, and the traced
+context the reply was conditioned on. Replies come from `viz.generate_traced`, a KV-cached decode with the router
+hooks armed on every step; `tests/test_viz.py` pins it position-for-position to one full `trace_routing` forward
+over the finished text. A checkpoint with `sft`/`dpo` enabled is prompted through `chat_prompt_ids`; a base
+checkpoint has no template, so the conversation is one running document the user and model take turns extending.
+"Max passes" on the page is `--loops` per reply. Single-user, no auth, one reply at a time, binds `127.0.0.1`.
+
 ## Sizing a model without training it
 
 ```bash
@@ -247,6 +275,8 @@ only the model package imports. `model/` and `nvfp4/` are packages whose `__init
   judge-scored checkpoint comparison.
 - **`posttrain.py`** — `radiance-posttrain`: runs a pipeline YAML's stages (SFT, DPO, RLAIF rounds, judge eval) as
   `radiance-train`/`radiance-rlaif` subprocesses, wiring each stage's checkpoint into the next.
+- **`viz.py`** — `radiance-viz`: per-token ACT halting depth and per-pass MoE expert choice, as an HTML page;
+  **`viz_chat.py`** is its `--serve` chat page.
 - **`eval_harness.py`** — an lm-evaluation-harness `LM` backend (`RadianceLM`) plus the `radiance-eval` CLI; runs
   standard benchmarks in-process against a loaded checkpoint. `eval` dependency group, not core.
 
