@@ -19,6 +19,7 @@ model:
   head_dim: 64
   n_layers: 6
   use_router: true
+  act_halt_bias_init: -1.0 # pinned: the pre-PR-#65 init (the default now derives a half-depth bias)
   use_moe: true
   n_experts: 4
   moe_top_k: 2

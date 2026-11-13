@@ -14,7 +14,7 @@ from radiance.config import ModelConfig
 # _act_select/_ffn_capacity/_sparse_ffn_delta: ACT's capacity/selection helpers, package-private
 # to model/ but owned jointly with the halting/dispatch loop below — see act.py's module docstring
 # and tests/test_act_kv_invariance.py before changing either side.
-from .act import ACTRouter, _act_select, _ffn_capacity, _sparse_ffn_delta
+from .act import ACTRouter, initial_halt_bias, _act_select, _ffn_capacity, _sparse_ffn_delta
 from .attention import KVCache, RotaryEmbedding, _FLEX_MIN_HEAD_DIM
 from .block import TransformerBlock
 from .core import LoopContext, ModelOutput
@@ -309,7 +309,13 @@ class DenseTransformer(nn.Module):
 
         self.router = None
         if cfg.use_router:
-            assert cfg.max_loops >= 1
+            if cfg.max_loops < 2:
+                # One pass means every token halts at pass 1 with weight 1, a constant: the router
+                # would never affect the output or ponder_cost, and so never receive a gradient.
+                raise ValueError(
+                    f"model.use_router needs model.max_loops >= 2, got {cfg.max_loops}: with a single "
+                    "pass the router has no effect and never trains. Use loop_count for a fixed loop."
+                )
             self.router = ACTRouter(cfg)
 
         # muP output multiplier: logits are scaled by 1/width_mult so their scale is invariant to
@@ -336,9 +342,9 @@ class DenseTransformer(nn.Module):
         self._init_inert_gates()
         self._scale_residual_init()
         if self.router is not None:
-            # Bias the halting unit against halting immediately (Graves ACT): sigmoid(-1) ≈ 0.27,
-            # encouraging some early pondering rather than collapsing to a single pass at init.
-            nn.init.constant_(self.router.proj.bias, -1.0)
+            # Start tokens at about half of max_loops, never pass 1 (cfg.act_halt_bias_init; see
+            # initial_halt_bias, which also validates halt_epsilon).
+            nn.init.constant_(self.router.proj.bias, initial_halt_bias(self.cfg))
 
     def _convert_linears_to_fp4(self) -> None:
         """Swap the eligible `nn.Linear`s for `FP4Linear`, in place.
@@ -990,7 +996,8 @@ class DenseTransformer(nn.Module):
         """Like num_parameters(), but counts only moe_top_k experts' worth of FFN parameters per
         MoE layer instead of all n_experts — the parameter count actually multiplied against any
         given token's activation, which is the right basis for Chinchilla-style tokens_per_param
-        sizing (see train.py). Identical to num_parameters() when no MoE layers exist."""
+        sizing (see train.py). Also excludes the MTP heads, so it equals num_parameters() only for a
+        dense model with mtp_heads == 1."""
         total = self.num_parameters()
         for moe_ffn in self._moe_layers:
             per_expert_params = moe_ffn.per_expert_parameter_count()

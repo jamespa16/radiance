@@ -88,6 +88,7 @@ Only the fields you need to change — everything else falls back to the datacla
 - **`wsd_decay_ratio`** — fraction of `max_steps` spent in the final decay phase when `lr_schedule: "wsd"`.
 - **`max_steps`** — training step count; ignored if `tokens_per_param` is set.
 - **`tokens_per_param`** — derive `max_steps` from model size instead; Chinchilla-optimal is ~20. Overwrites `max_steps` once the model is built, using `resolved_row_tokens` so active `sft.seq_len`/`dpo.seq_len` overrides and DPO's chosen+rejected width are reflected.
+- **`tokens_per_param_basis`** — `total` (default) or `active`: which parameter count `tokens_per_param` multiplies. Differs under MoE (inactive experts) and under `mtp_heads > 1` (MTP heads); identical for a plain dense config. `train()` logs a note when the two counts differ. Resuming under a different basis changes `max_steps` and the LR schedule, so pin it.
 - **`auto_batch_size`** — compute `batch_size`/`grad_accum_steps` from free VRAM and model size at startup. Defaults on; makes the actual micro-batch safer, never bigger. Also enables OOM backoff. CUDA-only.
 - **`target_effective_batch_size`** — effective batch size `auto_batch_size` solves for; `None` preserves the configured `batch_size * grad_accum_steps`.
 - **`vram_safety_margin`** — fraction of estimated VRAM budget to use when `auto_batch_size` is on; lower is more conservative.

@@ -86,3 +86,13 @@ because it had become simply wrong (`3.0e-4` -> `1.0e-2`; see [optim.md](optim.m
 It reaches only configs that **omit** `lr`, which today means the `sweep*`/`super*` ones — every worked example in
 `configs/` pins `lr: 3.0e-4` and so still trains at the old value until edited. And the 400-step baselines in
 [results.md](results.md) predate it, so reproducing them means pinning `lr: 3.0e-4` explicitly.
+
+Two more defaults changed in the same spirit (PR #65), both tuned-quantity changes that reason 3 would normally forbid.
+`model.act_halt_bias_init` went from a hardcoded `-1.0` to a derived half-depth bias: at `max_loops: 4` the old value
+halted nobody before the cap (the showcase run never left 4/4), and forcing early stops showed the unweighted
+intermediate passes were undecodable ([results.md](results.md)). **The half-depth init is not yet A/B'd at scale**; a
+showcase pilot is the next step. `train.tokens_per_param_basis` went from `active` to `total` so the token budget tracks every parameter the run
+trains rather than only the ones a token touches; the cost is a much longer MoE run (showcase shape: 13.6B tokens on
+`total` vs 3.7B on `active`, roughly n_experts/top_k more), and it also differs for dense configs with `mtp_heads > 1`.
+`train()` logs a note whenever the two counts differ. Both reach only configs that **omit** the field, and every
+existing config whose behaviour would change pins the old value (`-1.0` / `active`).

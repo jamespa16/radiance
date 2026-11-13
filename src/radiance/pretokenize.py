@@ -72,8 +72,16 @@ def run_tokens(cfg: Config, n_vocab: int) -> int:
     """Tokens `train()` will draw for this config, derived the same way it derives max_steps."""
     tokens_per_step = cfg.train.effective_batch_size * cfg.resolved_row_tokens
     if cfg.train.tokens_per_param is not None:
-        active = size_config(cfg, n_vocab)["active"]
-        steps = max(1, round(cfg.train.tokens_per_param * active / tokens_per_step))
+        # Same basis train() uses: size_config's "total" / "active" are its num_parameters() /
+        # num_active_parameters().
+        sizes = size_config(cfg, n_vocab)
+        if cfg.train.tokens_per_param_basis == "total":
+            params = sizes["total"]
+        elif cfg.train.tokens_per_param_basis == "active":
+            params = sizes["active"]
+        else:
+            raise ValueError(f"unknown train.tokens_per_param_basis {cfg.train.tokens_per_param_basis!r}")
+        steps = max(1, round(cfg.train.tokens_per_param * params / tokens_per_step))
     else:
         steps = cfg.train.max_steps
     return steps * tokens_per_step

@@ -16,6 +16,7 @@ model:
   max_loops: 6
   ponder_weight: 1.0e-2
   halt_epsilon: 0.01
+  act_halt_bias_init: -1.0 # pinned: the pre-PR-#65 init (the default now derives a half-depth bias)
   ffn_mult: 5.0
   ffn_depth: 2
   dropout: 0.03
