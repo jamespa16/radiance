@@ -208,6 +208,11 @@ class MoEFeedForward(nn.Module):
         self.register_buffer("expert_bias", torch.zeros(cfg.n_experts), persistent=True)
         self.register_buffer("expert_load", torch.zeros(cfg.n_experts), persistent=False)
 
+        # Off by default; radiance-viz turns it on to read back the selection forward() really made
+        # as (topk_idx, gates, kept), each (n_tokens, top_k). `kept` is False where capacity dropped it.
+        self.record_route = False
+        self.last_route: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+
         self.aux_loss_accum: torch.Tensor | None = None
         self._aux_loss_calls = 0
         self._register_load_state_dict_pre_hook(self._upgrade_legacy_expert_keys, with_module=False)
@@ -249,6 +254,19 @@ class MoEFeedForward(nn.Module):
         self.aux_loss_accum = None
         self._aux_loss_calls = 0
 
+    def _select_experts(self, probs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Top-k expert indices and their renormalised gate weights, each (n_tokens, top_k).
+
+        Selection uses probs + expert_bias; the gating *weights* come from the unbiased probs.
+        That separation is what makes the bias loss-free: it can steer which experts a token goes
+        to without distorting how much each contributes, so it never fights the LM objective.
+        """
+        selection_scores = probs + self.expert_bias if self._bias_balancing else probs
+        topk_idx = selection_scores.topk(self.cfg.moe_top_k, dim=-1).indices
+        topk_probs = probs.gather(1, topk_idx)
+        topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True)  # renormalize over selected k
+        return topk_idx, topk_probs
+
     def forward(self, x: torch.Tensor, variant: int = 0) -> torch.Tensor:
         orig_shape = x.shape
         d_model = orig_shape[-1]
@@ -257,13 +275,7 @@ class MoEFeedForward(nn.Module):
 
         probs = self.router(flat_x, variant)  # (n_tokens, n_experts) fp32
 
-        # Selection uses probs + expert_bias; the gating *weights* come from the unbiased probs.
-        # That separation is what makes the bias loss-free: it can steer which experts a token goes
-        # to without distorting how much each contributes, so it never fights the LM objective.
-        selection_scores = probs + self.expert_bias if self._bias_balancing else probs
-        topk_idx = selection_scores.topk(self.cfg.moe_top_k, dim=-1).indices
-        topk_probs = probs.gather(1, topk_idx)
-        topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True)  # renormalize over selected k
+        topk_idx, topk_probs = self._select_experts(probs)
         weight = probs.new_zeros(n_tokens, self.cfg.n_experts).scatter_(1, topk_idx, topk_probs)
 
         assigned = weight > 0  # (n_tokens, n_experts)
@@ -313,6 +325,11 @@ class MoEFeedForward(nn.Module):
         priority = assigned.float() * 2.0 + torch.where(assigned, weight, probs).detach().float()
         token_idx = priority.topk(capacity, dim=0).indices.t().contiguous()  # (n_experts, capacity)
         valid = assigned.t().gather(1, token_idx)  # (n_experts, capacity) bool
+        if self.record_route:  # radiance-viz: what this call selected, and what survived capacity
+            kept = torch.zeros_like(assigned)
+            expert_of_row = torch.arange(self.cfg.n_experts, device=x.device)[:, None].expand_as(token_idx)
+            kept[token_idx[valid], expert_of_row[valid]] = True
+            self.last_route = (topk_idx.detach(), topk_probs.detach(), kept.gather(1, topk_idx))
         gathered = flat_x[token_idx]  # (n_experts, capacity, d_model)
 
         # Kept unmasked: `probe_out` holds every expert's output for every row it computed,

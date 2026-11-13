@@ -63,8 +63,8 @@ def _storage_dtype(ckpt: dict) -> torch.dtype | None:
 
 
 def load_transformer_from_checkpoint(
-    path: str, device: str, eos_id: int | None = None
-) -> tuple["DenseTransformer", "Config"]:
+    path: str, device: str, eos_id: int | None = None, return_step: bool = False
+) -> tuple["DenseTransformer", "Config"] | tuple["DenseTransformer", "Config", int | None]:
     """Reconstruct a DenseTransformer + its embedded Config from a train.py checkpoint.
 
     `path` is either a `.pt` checkpoint or a `radiance-export` directory — `read_checkpoint`
@@ -78,6 +78,9 @@ def load_transformer_from_checkpoint(
 
     eos_id defaults to None, preserving generate.load_checkpoint's exact prior behavior (doc
     masking off during generation, since a single prompt is one document anyway regardless).
+
+    `return_step` appends the checkpoint's saved training step (None if it recorded none) to the
+    result, so a caller that wants it does not read the file a second time.
     """
     ckpt = read_checkpoint(path, map_location=device)
     cfg = ckpt["config"]
@@ -94,6 +97,8 @@ def load_transformer_from_checkpoint(
     model.load_state_dict(ckpt["model"])
     model.to(device)
     model.eval()
+    if return_step:
+        return model, cfg, ckpt.get("step")
     return model, cfg
 
 

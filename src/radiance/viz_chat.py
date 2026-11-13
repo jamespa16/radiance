@@ -25,6 +25,7 @@ import asyncio
 import html
 import json
 import logging
+import re
 import threading
 import time
 from typing import Literal
@@ -38,7 +39,7 @@ from radiance.config import Config
 from radiance.model import DenseTransformer
 from radiance.sft_data import chat_prompt_ids
 from radiance.viz import _INK_DARK, _INK_LIGHT, _RAMP_DARK, _RAMP_LIGHT, _STYLE, RoutingTrace, \
-    _stream_payload, _stream_texts, generate_traced
+    IncrementalText, _stream_payload, _stream_texts, generate_traced
 
 logger = logging.getLogger("radiance.viz")
 
@@ -56,32 +57,22 @@ class ChatRequest(BaseModel):
     loops: int | None = Field(None, ge=1, le=64)
 
 
-class _IncrementalText:
-    """`viz._stream_texts`, one token at a time: each token gets the text it completes, and a
-    token that ends partway through a multi-byte character gets "" until the one that finishes it."""
-
-    def __init__(self, tokenizer):
-        self.tokenizer, self.ids, self.prev = tokenizer, [], ""
-
-    def push(self, token_id: int) -> str:
-        self.ids.append(token_id)
-        cur = self.tokenizer.decode(self.ids)
-        if cur.startswith(self.prev) and not cur.endswith("�"):
-            delta, self.prev = cur[len(self.prev):], cur
-            return delta
-        return ""
-
-    def tail(self) -> str:
-        """Anything a final flush would add (an odd tokenizer), so no text is ever dropped."""
-        full = self.tokenizer.decode(self.ids) if self.ids else ""
-        return full[len(self.prev):] if full.startswith(self.prev) else ""
-
-
 def build_prompt(messages: list[dict], tokenizer, cfg: Config) -> list[int]:
     if cfg.sft.enabled or cfg.dpo.enabled:
         return chat_prompt_ids(messages, tokenizer, cfg)
-    # Base checkpoint: the conversation is one document, so the turns are simply concatenated.
-    return tokenizer("".join(m["content"] for m in messages))["input_ids"]
+    # Base checkpoint: the conversation is one document. A reply was sampled as the direct
+    # continuation of the text before it, so it is appended as is; the next thing the user writes
+    # starts a new paragraph, or it would be glued onto the model's last word.
+    doc = "".join(("\n\n" if i and m["role"] != "assistant" else "") + m["content"] for i, m in enumerate(messages))
+    return tokenizer(doc)["input_ids"]
+
+
+def prompt_ids(req: ChatRequest, tokenizer, cfg: Config) -> list[int]:
+    """The conversation as token ids. Raises ValueError if there is nothing to read."""
+    ids = build_prompt([m.model_dump() for m in req.messages], tokenizer, cfg)
+    if not ids:
+        raise ValueError("the conversation tokenizes to nothing")
+    return ids
 
 
 def _payload(trace: RoutingTrace, texts: list[str]) -> dict:
@@ -90,21 +81,18 @@ def _payload(trace: RoutingTrace, texts: list[str]) -> dict:
     return p
 
 
-def chat_events(model: DenseTransformer, tokenizer, cfg: Config, req: ChatRequest, device: str,
-                autocast: torch.dtype | None, should_stop=lambda: False):
-    """The NDJSON stream of one reply, as dicts: a "prompt" event (the context, traced), then a
-    "token" event per sampled token, then "done". Separate from the HTTP layer so it is testable."""
+def chat_events(model: DenseTransformer, tokenizer, cfg: Config, req: ChatRequest, ids: list[int],
+                device: str, autocast: torch.dtype | None, should_stop=lambda: False):
+    """The NDJSON stream of one reply, as dicts: a "prompt" event (the context `ids`, traced), then
+    a "token" event per sampled token, then "done". Separate from the HTTP layer so it is testable."""
     max_seq = cfg.model.max_seq_len
-    ids = build_prompt([m.model_dump() for m in req.messages], tokenizer, cfg)
-    if not ids:
-        raise ValueError("the conversation tokenizes to nothing")
     max_tokens = min(req.max_tokens, max_seq - 1)
     room = max_seq - max_tokens
     truncated = len(ids) > room
     ids = ids[-room:]  # keep the end of the conversation, leaving room for the reply
 
     start = time.perf_counter()
-    text = _IncrementalText(tokenizer)
+    text = IncrementalText(tokenizer)
     n_tokens, finish = 0, "length"
     for ev in generate_traced(model, tokenizer, ids, max_tokens, req.temperature, req.top_k,
                               req.loops, autocast, device):
@@ -135,9 +123,8 @@ def create_app(model: DenseTransformer, tokenizer, cfg: Config, device: str,
 
     @app.post("/api/chat")
     async def chat(req: ChatRequest):
-        try:
-            if not build_prompt([m.model_dump() for m in req.messages], tokenizer, cfg):
-                raise ValueError("the conversation tokenizes to nothing")
+        try:  # tokenized once, off the event loop; the worker reuses the ids
+            ids = await asyncio.to_thread(prompt_ids, req, tokenizer, cfg)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         loop = asyncio.get_running_loop()
@@ -147,7 +134,7 @@ def create_app(model: DenseTransformer, tokenizer, cfg: Config, device: str,
         def work():
             try:
                 with lock:
-                    for ev in chat_events(model, tokenizer, cfg, req, device, autocast, stop.is_set):
+                    for ev in chat_events(model, tokenizer, cfg, req, ids, device, autocast, stop.is_set):
                         loop.call_soon_threadsafe(queue.put_nowait, ev)
             except Exception as e:  # surface it on the page rather than as a dead stream
                 logger.exception("reply failed")
@@ -174,8 +161,9 @@ def render_chat_html(title: str, meta: dict) -> str:
     ramp_dark = "".join(f"--r{i}:{c};--r{i}-ink:{_INK_DARK[i]};" for i, c in enumerate(_RAMP_DARK))
     data = json.dumps({"meta": meta, "ramp_steps": len(_RAMP_LIGHT)}, separators=(",", ":")).replace("</", "<\\/")
     style = _STYLE.replace("__RAMP_LIGHT__", ramp_light).replace("__RAMP_DARK__", ramp_dark)
-    return (_CHAT_PAGE.replace("__STYLE__", style + _CHAT_STYLE)
-            .replace("__TITLE__", html.escape(title)).replace("__DATA__", data))
+    # One pass, so markers inside a substituted value (a title containing "__DATA__") stay inert.
+    values = {"__STYLE__": style + _CHAT_STYLE, "__TITLE__": html.escape(title), "__DATA__": data}
+    return re.sub("|".join(values), lambda m: values[m.group(0)], _CHAT_PAGE)
 
 
 _CHAT_STYLE = r"""
@@ -330,7 +318,7 @@ function addUser(text) {
 }
 
 function addReply() {
-  const r = {tokens: [], depth: [], halt: [], weight: [], experts: [], gates: [], ctx: null, n_iters: M.n_iters, done: null};
+  const r = {tokens: [], depth: [], halt: [], weight: [], experts: [], gates: [], ctx: null, dropped: [], n_iters: M.n_iters, done: null};
   const m = document.createElement("div"); m.className = "msg assistant";
   m.innerHTML = `<div class="who">${M.chat ? "Model" : "Model continues"}</div>`;
   r.stream = document.createElement("div"); r.stream.className = "stream cursor"; m.appendChild(r.stream);
@@ -343,7 +331,7 @@ function addReply() {
 }
 
 function append(dst, ev) {
-  for (const k of ["tokens", "depth", "halt", "weight", "experts", "gates"]) if (ev[k]) dst[k].push(...ev[k]);
+  for (const k of ["tokens", "depth", "halt", "weight", "experts", "gates", "dropped"]) if (ev[k]) dst[k].push(...ev[k]);
 }
 
 function footer(r) {
@@ -437,7 +425,8 @@ function detail(r, i, ctx) {
     S.experts[i].forEach((blk, bi) => {
       h += `<tr><th>Block ${M.moe.blocks[bi]} experts</th>` + blk.map((ks, it) => {
         const g = S.gates[i][bi][it];
-        const txt = ks.map((e, j) => `E${e}<span style="color:var(--muted)"> ${pct(g[j])}</span>`).join(" ");
+        const dr = S.dropped && S.dropped.length ? S.dropped[i][bi][it] : null;
+        const txt = ks.map((e, j) => `<span${dr && dr[j] ? ' style="text-decoration:line-through" title="dropped: expert over capacity"' : ""}>E${e}<span style="color:var(--muted)"> ${pct(g[j])}</span></span>`).join(" ");
         return `<td class="cell${it >= d ? " halted" : ""}" title="${it >= d ? "computed but discarded: the token had already stopped" : ""}">${txt}</td>`;
       }).join("") + `</tr>`;
     });
@@ -477,7 +466,7 @@ async function send() {
         const ev = JSON.parse(buf.slice(0, nl)); buf = buf.slice(nl + 1);
         if (ev.type === "prompt") {
           r.n_iters = ev.n_iters; r.truncated = ev.truncated;
-          r.ctx = {tokens: [], depth: [], halt: [], weight: [], experts: [], gates: []}; append(r.ctx, ev);
+          r.ctx = {tokens: [], depth: [], halt: [], weight: [], experts: [], gates: [], dropped: []}; append(r.ctx, ev);
         } else if (ev.type === "token") {
           const i = r.tokens.length; append(r, ev); r.stream.appendChild(tokenSpan(r, i, false));
         } else if (ev.type === "done") {

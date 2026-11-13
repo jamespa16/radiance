@@ -144,7 +144,7 @@ def test_stream_texts_keep_split_characters_whole():
     """A byte-level BPE splits some characters across tokens; the page must not show U+FFFD."""
 
     class Bytes:  # each token is one UTF-8 byte
-        def decode(self, ids):
+        def decode(self, ids, clean_up_tokenization_spaces=True):
             return bytes(ids).decode("utf-8", errors="replace")
 
     ids = list("body’s".encode())
@@ -246,7 +246,8 @@ def test_chat_uses_the_turn_template_when_the_checkpoint_has_one(tiny_cfg):
     cfg = tiny_cfg()
     msgs = [{"role": "user", "content": "hi there"}, {"role": "assistant", "content": "hello"},
             {"role": "user", "content": "bye"}]
-    assert viz_chat.build_prompt(msgs, tok, cfg) == tok("hi therehellobye")["input_ids"]
+    # a reply continues the text before it; the user's next turn starts a new paragraph
+    assert viz_chat.build_prompt(msgs, tok, cfg) == tok("hi therehello\n\nbye")["input_ids"]
     cfg.sft.enabled = True
     from radiance.sft_data import chat_prompt_ids
     assert viz_chat.build_prompt(msgs, tok, cfg) == chat_prompt_ids(msgs, tok, cfg)
@@ -267,3 +268,125 @@ def test_chat_page_is_self_contained(tiny_cfg):
     assert "Routing: &lt;/script&gt; test" in page and "__" not in page.replace("__proto__", "")
     blob = re.search(r'<script id="data" type="application/json">(.*?)</script>', page, re.S).group(1)
     assert json.loads(blob)["meta"]["n_iters"] == 3
+
+
+def test_base_chat_does_not_glue_the_next_turn_onto_the_reply(tiny_cfg):
+    from radiance import viz_chat
+
+    class Echo:  # the prompt text itself, so the join is visible
+        def __call__(self, text):
+            return {"input_ids": [text]}
+
+    msgs = [{"role": "user", "content": "The cat"}, {"role": "assistant", "content": " sat"},
+            {"role": "user", "content": "Then"}]
+    assert viz_chat.build_prompt(msgs, Echo(), tiny_cfg()) == ["The cat sat\n\nThen"]
+
+
+class _Rewriting:
+    """Byte tokens, plus HF-style cleanup: with clean_up_tokenization_spaces on, " 's" becomes "'s",
+    so decoding a prefix is not always a prefix of decoding the longer sequence."""
+
+    def decode(self, ids, clean_up_tokenization_spaces=True):
+        text = bytes(ids).decode("utf-8", errors="replace")
+        return text.replace(" 's", "'s") if clean_up_tokenization_spaces else text
+
+
+def test_text_split_survives_a_decoder_that_rewrites_earlier_text():
+    ids = list("he 's here, and so is the rest of this sentence".encode())
+    texts = viz._stream_texts(_Rewriting(), ids)
+    assert len(texts) == len(ids) and "".join(texts) == "he 's here, and so is the rest of this sentence"
+    assert texts[-1] != "" and all(t for t in texts)  # one odd boundary does not blank the rest
+
+
+def test_text_split_diverging_decode_still_emits_every_later_token():
+    class Rewriter:  # ignores the cleanup flag: a genuinely prefix-unstable decoder
+        def decode(self, ids, clean_up_tokenization_spaces=False):
+            return bytes(ids).decode().replace(" 's", "'s")
+
+    texts = viz._stream_texts(Rewriter(), list(b"he 's fine, really, it is"))
+    assert "".join(texts).endswith("fine, really, it is") and all(t for t in texts[-10:])
+
+
+def test_text_split_is_linear_in_sequence_length():
+    class Counting:
+        n = 0
+
+        def decode(self, ids, clean_up_tokenization_spaces=False):
+            Counting.n += len(ids)
+            return bytes(ids).decode("utf-8", errors="replace")
+
+    viz._stream_texts(Counting(), list(b"a" * 2000))
+    assert Counting.n <= 2 * 2000 * (viz.IncrementalText.CONTEXT + 1)  # a whole-prefix decode is ~4,000,000
+
+
+def test_split_characters_across_a_context_boundary_stay_whole():
+    ids = list(("x" * 20 + "’" + "y" * 20 + "’’").encode())
+    assert "".join(viz._stream_texts(_Rewriting(), ids)) == "x" * 20 + "’" + "y" * 20 + "’’"
+    # a lone dangling byte is never dropped
+    texts = viz._stream_texts(_Rewriting(), list(b"ab") + [0xE2, 0x80])
+    assert "".join(texts) == "ab\ufffd"
+
+
+@pytest.mark.parametrize("n_prompt,n_generate,max_seq,expect", [
+    (5, 10, 32, (5, 10)),      # fits: untouched
+    (30, 10, 32, (22, 10)),    # prompt cut from the left to leave room for what was asked
+    (40, 10, 32, (22, 10)),
+    (5, 100, 32, (1, 31)),     # more than the window: generation capped, one prompt token kept
+    (3, 100, 32, (1, 31)),
+])
+def test_fit_generation_leaves_room(n_prompt, n_generate, max_seq, expect):
+    keep, gen = viz.fit_generation(n_prompt, n_generate, max_seq)
+    assert (keep, gen) == expect and keep + gen <= max_seq and keep <= n_prompt
+
+
+def test_cli_long_prompt_with_generate_keeps_the_end(tmp_path, tiny_cfg, monkeypatch):
+    cfg = tiny_cfg(use_router=True, max_loops=2, use_moe=True, n_experts=4, moe_top_k=2)  # max_seq_len 32
+    torch.manual_seed(0)
+    model = DenseTransformer(cfg.model, vocab_size=TINY_VOCAB)
+    ckpt = tmp_path / "step_3.pt"
+    torch.save({"model": model.state_dict(), "step": 3, "config": cfg}, ckpt)
+    tok = WordTokenizer(TINY_VOCAB)
+    tok.eos_token_id = None
+    monkeypatch.setattr(viz, "build_tokenizer", lambda cfg: tok)
+    out = tmp_path / "page.html"
+    prompt = " ".join(f"w{i}" for i in range(40))
+    monkeypatch.setattr(sys, "argv", ["radiance-viz", "--checkpoint", str(ckpt), "--device", "cpu",
+                                      "--prompt", prompt, "--generate", "6", "--output", str(out)])
+    viz.main()
+    blob = re.search(r'<script id="data" type="application/json">(.*?)</script>', out.read_text(), re.S).group(1)
+    stream = json.loads(blob)["stream"]
+    assert stream["n_prompt"] == 26 and len(stream["tokens"]) == 32  # 26 kept + 6 generated
+    assert stream["tokens"][25].strip() == "w39"  # the end of the prompt, not the head
+
+
+def test_title_containing_template_markers_does_not_corrupt_the_page():
+    meta = {"n_iters": 2, "checkpoint": "x", "step": 1, "act": True, "n_val": 0, "moe": None}
+    summary = {"n_tokens": 1, "mean_depth": 1.0, "depth_hist": [1, 0], "shallowest": [], "deepest": [],
+               "token_table_min_count": 4}
+    stream = {"tokens": ["a"], "depth": [1], "n_prompt": None, "halt": None, "weight": None}
+    page = viz.render_html("run __DATA__ __STYLE__ <b>", meta, stream, summary)
+    assert "run __DATA__ __STYLE__ &lt;b&gt;" in page
+    blob = re.search(r'<script id="data" type="application/json">(.*?)</script>', page, re.S).group(1)
+    assert json.loads(blob)["meta"]["n_iters"] == 2
+    from radiance import viz_chat
+    chat = viz_chat.render_chat_html("c __DATA__", {"n_iters": 3})
+    assert "c __DATA__" in chat and '"n_iters":3' in chat
+
+
+def test_expert_pick_is_what_the_forward_selected_including_capacity_drops(tiny_ids):
+    """The trace reads MoEFeedForward's own selection. With a tight capacity and
+    moe_eval_full_capacity off, picks the dispatch dropped are marked, and are not counted as load."""
+    model = _build(n_experts=4, moe_top_k=2, moe_eval_full_capacity=False, moe_capacity_factor=0.5, max_loops=2)
+    ids = tiny_ids(batch=2, seq=16)
+    trace = viz.trace_routing(model, ids)
+    assert not trace.kept.all() and trace.kept.any()
+    # kept picks per (block, iter, expert) never exceed the per-expert capacity of the dispatch
+    ffn = model.blocks[1].ffn
+    capacity = max(1, min(32, round(0.5 * 32 * 2 / 4)))
+    for it in range(trace.n_iters):
+        e = trace.experts[:, 0, it][trace.kept[:, 0, it]]
+        assert np.bincount(e, minlength=4).max() <= capacity
+    summary = viz.summarize([trace], {})
+    assert np.array(summary["moe"]["load_share"]).sum() < trace.n_iters * len(trace.moe_blocks)
+    assert "dropped" in viz._stream_payload(trace, 0, ["x"] * 16, None)
+    assert not ffn.record_route and ffn.last_route is None  # hooks leave the module as they found it

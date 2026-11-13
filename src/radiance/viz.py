@@ -25,8 +25,9 @@ once per loop iteration with the iteration index as their second positional argu
 then replayed from the recorded p_n with the same arithmetic as `_forward_act`, and the replay is
 checked against the `mean_loop_depth` the forward itself returned — so if that loop's halting
 rule ever changes and this file isn't updated, the tool fails loudly instead of drawing the old
-rule. Expert choice is recomputed the way `MoEFeedForward.forward` selects (router probs plus
-`expert_bias` when bias balancing is on, top-k), with gate weights renormalised over the k picked.
+rule. Expert choice is read back from `MoEFeedForward` itself (`record_route`/`last_route`, set by the
+same `_select_experts` the forward uses), including which picks capacity dropped, so the page never
+re-derives routing that the model may have done differently.
 
 The forward runs in eval mode, where ACT is dense: every position is computed on every
 iteration, and a halted position's later updates are discarded. The page shows those discarded
@@ -44,6 +45,8 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import os
+import re
 from collections import defaultdict
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -71,6 +74,7 @@ class RoutingTrace:
     moe_blocks: list[int] = field(default_factory=list)  # model.blocks indices that are MoE
     experts: np.ndarray | None = None  # (batch, n_moe_blocks, iters, seq, k) int
     gates: np.ndarray | None = None  # (batch, n_moe_blocks, iters, seq, k) float
+    kept: np.ndarray | None = None  # (batch, n_moe_blocks, iters, seq, k) bool; False = dropped by capacity
     n_experts: int = 0
     model_mean_depth: float | None = None  # the forward's own mean_loop_depth, for the check
 
@@ -115,10 +119,10 @@ class _RouterRecorder:
         self.n_tokens = 0
         self.halt_records: list[torch.Tensor] = []
         self.stream_dtype: list[torch.dtype] = []
-        self.moe_records: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        self.moe_records: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
     def __enter__(self) -> "_RouterRecorder":
-        model, top_k = self.model, self.model.cfg.moe_top_k
+        model = self.model
         if model.router is not None:
             def on_halt(module, args, out):
                 self.halt_records.append(out.detach())
@@ -128,28 +132,31 @@ class _RouterRecorder:
         for i in self.moe_blocks:
             ffn = model.blocks[i].ffn
 
-            def on_route(module, args, probs, i=i, ffn=ffn):
+            def on_route(module, args, out, i=i):
+                # A forward hook on the MoE FFN itself (called as ffn(x, variant)): by now forward()
+                # has stashed the selection it really made.
                 variant = args[1] if len(args) > 1 else 0
-                if probs.shape[0] != self.n_tokens:
+                idx, gate, kept = module.last_route
+                if idx.shape[0] != self.n_tokens:
                     raise NotImplementedError(
-                        f"block {i}'s MoE router saw {probs.shape[0]} tokens, not batch*seq = "
+                        f"block {i}'s MoE saw {idx.shape[0]} tokens, not batch*seq = "
                         f"{self.n_tokens}: a sparse FFN dispatch (model.act_ffn_capacity_ratio < 1) "
                         "is routing a subset, which this trace does not map back to positions."
                     )
-                scores = probs + ffn.expert_bias if ffn._bias_balancing else probs
-                idx = scores.topk(top_k, dim=-1).indices
-                gate = probs.gather(1, idx)
-                gate = gate / gate.sum(dim=-1, keepdim=True)
                 if (i, variant) in self.moe_records:
                     raise RuntimeError(f"block {i} routed twice on iteration {variant + 1}")
-                self.moe_records[(i, variant)] = (idx.detach(), gate.detach().float())
-            self.handles.append(ffn.router.register_forward_hook(on_route))
+                self.moe_records[(i, variant)] = (idx, gate.float(), kept)
+                module.last_route = None
+            ffn.record_route = True
+            self.handles.append(ffn.register_forward_hook(on_route))
         return self
 
     def __exit__(self, *exc) -> None:
         for h in self.handles:
             h.remove()
         self.handles.clear()
+        for i in self.moe_blocks:
+            self.model.blocks[i].ffn.record_route = False
 
     def begin(self, input_ids: torch.Tensor) -> None:
         self.n_tokens = input_ids.numel()
@@ -165,8 +172,9 @@ class _RouterRecorder:
             n_updates, weights = _replay_halting(self.halt_records, cfg.halt_epsilon, self.stream_dtype[0])
             model_mean = float(out.mean_loop_depth)
             # Depth counts are small integers, exact in any dtype; their *mean* is not, so take it
-            # in float64 and allow for the rounding of the forward's own mean (bf16 weights put
-            # that at ~1/64 near 4).
+            # in float64. The forward's own n_updates is float32 whatever the stream dtype
+            # (`x.new_zeros(...) + still_running.float()` promotes), so its mean is exact to fp32
+            # rounding; the tolerance allows for that and for summing in a different order.
             replay_mean = float(n_updates.double().mean())
             tolerance = 1e-4 + n_iters * torch.finfo(out.mean_loop_depth.dtype).eps
             if abs(model_mean - replay_mean) > tolerance:
@@ -184,23 +192,25 @@ class _RouterRecorder:
             depth = np.full((batch, seq_len), n_iters, dtype=np.int64)
             model_mean = None
 
-        experts = gates = None
+        experts = gates = kept = None
         if self.moe_blocks:
             k = cfg.moe_top_k
             experts = np.zeros((batch, len(self.moe_blocks), n_iters, seq_len, k), dtype=np.int64)
             gates = np.zeros((batch, len(self.moe_blocks), n_iters, seq_len, k), dtype=np.float32)
+            kept = np.ones((batch, len(self.moe_blocks), n_iters, seq_len, k), dtype=bool)
             for bi, i in enumerate(self.moe_blocks):
                 for it in range(n_iters):
                     # blocks[0] is never MoE, so every MoE block is in the loop body and runs each
                     # iteration once; a missing record means that assumption broke.
-                    idx, gate = self.moe_records[(i, it)]
+                    idx, gate, keep = self.moe_records[(i, it)]
                     experts[:, bi, it] = idx.view(batch, seq_len, k).cpu().numpy()
                     gates[:, bi, it] = gate.view(batch, seq_len, k).cpu().numpy()
+                    kept[:, bi, it] = keep.view(batch, seq_len, k).cpu().numpy()
 
         return RoutingTrace(
             token_ids=input_ids.cpu().numpy(), n_iters=n_iters, halt_probs=halt_probs,
             act_weights=act_weights, depth=depth, moe_blocks=self.moe_blocks, experts=experts,
-            gates=gates, n_experts=cfg.n_experts if self.moe_blocks else 0, model_mean_depth=model_mean,
+            gates=gates, kept=kept, n_experts=cfg.n_experts if self.moe_blocks else 0, model_mean_depth=model_mean,
         )
 
 
@@ -307,7 +317,8 @@ def summarize(traces: list[RoutingTrace], token_texts: dict[int, str], min_count
                 ran[it] += running.sum()
                 for bi in range(n_blocks):
                     picks = t.experts[:, bi, it][running]  # (n_running, k)
-                    load[bi, it] += np.bincount(picks.reshape(-1), minlength=n_experts)
+                    served = t.kept[:, bi, it][running]  # capacity-dropped picks did no work
+                    load[bi, it] += np.bincount(picks[served], minlength=n_experts)
                 if it + 1 < n_iters:
                     cont = t.depth > it + 1
                     both[it] += cont.sum()
@@ -342,6 +353,8 @@ def _stream_payload(trace: RoutingTrace, row: int, texts: list[str], n_prompt: i
         # (seq, blocks, iters, k)
         payload["experts"] = trace.experts[row].transpose(2, 0, 1, 3).tolist()
         payload["gates"] = np.round(trace.gates[row].transpose(2, 0, 1, 3), 3).tolist()
+        # True where capacity dropped the pick (moe_eval_full_capacity: false); all False otherwise.
+        payload["dropped"] = (~trace.kept[row]).transpose(2, 0, 1, 3).tolist()
     return payload
 
 
@@ -371,13 +384,11 @@ def render_html(title: str, meta: dict, stream: dict, summary: dict) -> str:
     ramp_dark = "".join(f"--d{d}:{_RAMP_DARK[s]};--d{d}-ink:{_INK_DARK[s]};" for d, s in enumerate(steps, 1))
     data = json.dumps({"meta": meta, "stream": stream, "summary": summary}, separators=(",", ":"))
     data = data.replace("</", "<\\/")  # never let token text close the <script>
-    return (
-        _PAGE.replace("__STYLE__", _STYLE)
-        .replace("__TITLE__", html.escape(title))
-        .replace("__RAMP_LIGHT__", "".join(ramp_css))
-        .replace("__RAMP_DARK__", ramp_dark)
-        .replace("__DATA__", data)
-    )
+    # One pass over the template, so a marker that appears inside a substituted value (a run_name
+    # containing "__DATA__") is never itself substituted.
+    values = {"__STYLE__": _STYLE.replace("__RAMP_LIGHT__", "".join(ramp_css)).replace("__RAMP_DARK__", ramp_dark),
+              "__TITLE__": html.escape(title), "__DATA__": data}
+    return re.sub("|".join(values), lambda m: values[m.group(0)], _PAGE)
 
 
 _STYLE = r""".viz-root {
@@ -600,7 +611,8 @@ function detail(i) {
     S.experts[i].forEach((blk, bi) => {
       h += `<tr><th>Block ${M.moe.blocks[bi]} experts</th>` + blk.map((ks, it) => {
         const g = S.gates[i][bi][it];
-        const txt = ks.map((e, j) => `E${e}<span style="color:var(--muted)"> ${pct(g[j])}</span>`).join(" ");
+        const dr = S.dropped ? S.dropped[i][bi][it] : null;
+        const txt = ks.map((e, j) => `<span${dr && dr[j] ? ' style="text-decoration:line-through" title="dropped: expert over capacity"' : ""}>E${e}<span style="color:var(--muted)"> ${pct(g[j])}</span></span>`).join(" ");
         return `<td class="cell${it >= d ? " halted" : ""}" title="${it >= d ? "computed but discarded: the token had already stopped" : ""}">${txt}</td>`;
       }).join("") + `</tr>`;
     });
@@ -715,25 +727,68 @@ def _val_sequences(cfg, n_seq: int, seq_len: int) -> list[np.ndarray]:
     return [np.asarray(flat[i * seq_len : (i + 1) * seq_len], dtype=np.int64) for i in range(n_seq)]
 
 
-def _stream_texts(tokenizer, ids: list[int]) -> list[str]:
-    """Per-token text that joins back into the decoded string.
+class IncrementalText:
+    """Per-token display text that joins back into the decoded string, one token at a time.
 
     Decoding token by token breaks characters that a byte-level BPE splits across tokens (a curly
-    apostrophe is two or three GPT-2 tokens), and each fragment renders as U+FFFD. Decoding
-    prefixes instead gives each character to the token that completes it and an empty string to
-    the fragments before it.
+    apostrophe is two or three GPT-2 tokens), and each fragment renders as U+FFFD. So a token's
+    text is the difference between decoding the window of recent tokens with and without it: it
+    gets the characters it completes, and "" while a character is still partial.
+
+    The window is the last `CONTEXT` tokens, not the whole prefix, so each push is constant work
+    (a whole-prefix decode per token made a page quadratic in its length). The context only has to
+    outlast a split character (at most 3 earlier byte tokens) and let a decoder that looks
+    backwards (SentencePiece's leading space) see what it needs; both decodes in a difference use
+    the same window, so whatever the window's own start does to the text cancels out.
+
+    Decoded with `clean_up_tokenization_spaces=False` so appending a token can never rewrite text
+    already shown (" 's" -> "'s"), which would break the prefix relation this relies on.
     """
-    texts, prev = [], ""
-    for i in range(len(ids)):
-        cur = tokenizer.decode(ids[: i + 1])
-        if cur.startswith(prev) and not cur.endswith("\ufffd"):
-            texts.append(cur[len(prev):])
-            prev = cur
-        else:
-            texts.append("")  # an incomplete character: wait for the token that finishes it
-    if texts and prev != tokenizer.decode(ids):  # never drop text, even on an odd tokenizer
-        texts[-1] += tokenizer.decode(ids)[len(prev):]
+
+    CONTEXT = 8
+
+    def __init__(self, tokenizer):
+        self.tokenizer, self.ids, self.held = tokenizer, [], ""
+
+    def _decode(self, ids: list[int]) -> str:
+        return self.tokenizer.decode(ids, clean_up_tokenization_spaces=False) if ids else ""
+
+    def push(self, token_id: int) -> str:
+        start = max(0, len(self.ids) - self.CONTEXT)
+        before = self._decode(self.ids[start:]).rstrip("\ufffd")  # a partial character is not shown yet
+        self.ids.append(token_id)
+        after = self._decode(self.ids[start:])
+        if not after.startswith(before):
+            # The decoder rewrote earlier text anyway. Show from where the two diverge rather than
+            # losing this token (and, as a whole-prefix compare would, every later one).
+            before = before[: len(os.path.commonprefix([before, after]))]
+        delta = after[len(before):]
+        self.held = delta if delta.endswith("\ufffd") else ""
+        return "" if self.held else delta
+
+    def tail(self) -> str:
+        """The trailing partial character a final flush would still owe, so no text is ever dropped."""
+        return self.held
+
+
+def _stream_texts(tokenizer, ids: list[int]) -> list[str]:
+    """Per-token text for a whole sequence: `IncrementalText` pushed once per token."""
+    text = IncrementalText(tokenizer)
+    texts = [text.push(i) for i in ids]
+    if texts and text.tail():
+        texts[-1] += text.tail()
     return texts
+
+
+def fit_generation(n_prompt: int, n_generate: int, max_seq_len: int) -> tuple[int, int]:
+    """(prompt tokens to keep, tokens to generate) so prompt + generation fits max_seq_len.
+
+    The prompt is cut from the *left* (the model should still see the end it is continuing), but
+    only as far as needed: it keeps room for `n_generate` tokens, and when the request is bigger
+    than the whole window the generation is capped instead, leaving at least one prompt token.
+    """
+    n_generate = max(0, min(n_generate, max_seq_len - 1))
+    return min(n_prompt, max_seq_len - n_generate), n_generate
 
 
 def main() -> None:
@@ -769,7 +824,7 @@ def main() -> None:
     torch.manual_seed(args.seed)
     # Read onto the CPU and move only the model: map_location=device would also put the optimizer
     # state a training checkpoint carries on the GPU, next to whatever is training there.
-    model, cfg = load_transformer_from_checkpoint(args.checkpoint, "cpu")
+    model, cfg, step = load_transformer_from_checkpoint(args.checkpoint, "cpu", return_step=True)
     tokenizer = build_tokenizer(cfg)
     model.eos_id = tokenizer.eos_token_id  # doc masking for packed held-out rows, as in training
     if device == "cuda":
@@ -782,9 +837,6 @@ def main() -> None:
         raise SystemExit("this checkpoint has neither an ACT router nor MoE blocks: there is no routing to show")
     autocast = torch.bfloat16 if device == "cuda" else None
     ckpt_path = Path(args.checkpoint)
-    step = None
-    if ckpt_path.suffix == ".pt":  # mmap: reads the header, not the weights a second time
-        step = torch.load(str(ckpt_path), map_location="cpu", weights_only=False, mmap=True).get("step")
     title = f"Routing: {cfg.run_name or ckpt_path.stem}"
 
     if args.serve:
@@ -806,18 +858,26 @@ def main() -> None:
         return
 
     ids = tokenizer(text)["input_ids"]
+    max_seq = cfg.model.max_seq_len
     n_prompt = None
     if args.generate:
         from radiance.generate import generate_tokens
 
+        n_keep, n_generate = fit_generation(len(ids), args.generate, max_seq)
+        if n_keep < len(ids) or n_generate < args.generate:
+            print(f"[radiance-viz] max_seq_len is {max_seq}: keeping the last {n_keep} of {len(ids)} prompt tokens "
+                  f"and generating {n_generate} of the {args.generate} requested")
+        ids = ids[len(ids) - n_keep:]
         n_prompt = len(ids)
         prompt_t = torch.tensor([ids], device=device)
-        with torch.autocast(device_type=device, dtype=autocast or torch.float32, enabled=autocast is not None):
-            new = list(generate_tokens(model, tokenizer, prompt_t, max_new_tokens=args.generate,
+        with _autocast(torch.device(device).type, autocast):
+            new = list(generate_tokens(model, tokenizer, prompt_t, max_new_tokens=n_generate,
                                        temperature=args.temperature, top_k=args.top_k, device=device,
                                        loops=args.loops))
         ids = ids + new
-    ids = ids[: cfg.model.max_seq_len]
+    elif len(ids) > max_seq:
+        print(f"[radiance-viz] max_seq_len is {max_seq}: tracing the first {max_seq} of {len(ids)} tokens")
+        ids = ids[:max_seq]
 
     main_trace = trace_routing(model, torch.tensor([ids], device=device), args.loops, autocast)
     traces = [main_trace]

@@ -31,7 +31,7 @@ class WordTokenizer:
             return {"input_ids": torch.tensor([ids])}
         return {"input_ids": ids}
 
-    def decode(self, ids, skip_special_tokens: bool = True) -> str:
+    def decode(self, ids, skip_special_tokens: bool = True, clean_up_tokenization_spaces: bool = True) -> str:
         if torch.is_tensor(ids):
             ids = ids.tolist()
         words = [
